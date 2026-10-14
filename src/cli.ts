@@ -3,13 +3,13 @@
  * apograph — CLI entrypoint (Layer 5: Orchestration).
  *
  * Commands:
- *   apograph plan [dir]        Generate the authoritative plan from evidence and approve it interactively.
- *   apograph crawl <url>        Headless evidence crawl: screenshots, a11y trees, tokens, mirrored assets.
- *   apograph clone <url>       Full pipeline: harvest -> decompile -> infer -> synthesize -> emit -> verify.
- *   apograph harvest <url>     Capture only; writes session.json / snapshot.json / unpacked scripts.
- *   apograph synthesize <dir>  Rebuild from a previous harvest directory.
- *   apograph doctor            Check environment health (Node, Chromium, LLM, Ollama).
- *   apograph setup             Install the apograph MCP server into your coding agent.
+ *   apograph plan [dir]          Generate the authoritative plan from evidence and approve it interactively.
+ *   apograph crawl <url>         Headless evidence crawl: screenshots, a11y trees, tokens, mirrored assets.
+ *   apograph clone <url>         Full pipeline: crawl -> plan (approval gate) -> modular synthesize -> emit.
+ *   apograph synthesize <dir>    Modular synthesis from an approved apograph-plan.json.
+ *   apograph harvest <url>       Legacy capture only; writes session.json / snapshot.json / unpacked scripts.
+ *   apograph doctor              Check environment health (Node, Chromium, LLM, Ollama).
+ *   apograph setup               Install the apograph MCP server into your coding agent.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -22,15 +22,15 @@ import type {
   DOMSnapshot,
   RecordedRequest,
   DecompiledBundle,
+  EvidenceManifest,
 } from './types.js';
+import type { ApographPlan } from './plan/schema.js';
 import { launchHeadlessChromium, crawlEvidence } from './crawler/engine.js';
 import { NetworkCollector } from './harvester/network.js';
 import { captureDOMSnapshot } from './harvester/dom.js';
 import { harvestAndDecompileScripts } from './legacy/decompile/bundle.js';
-import { clusterEndpoints, enrichRequestsWithRoutePatterns } from './legacy/infer/routes.js';
-import { inferAllSchemas } from './legacy/infer/schema.js';
-import { synthesizeFrontend } from './synthesizer/frontend.js';
-import { synthesizeBackend } from './legacy/synthesizer/backend.js';
+import { enrichRequestsWithRoutePatterns } from './legacy/infer/routes.js';
+import { synthesizeModularProject, copyMirroredAssets } from './synthesizer/modular.js';
 import { emitProject } from './emitter/scaffold.js';
 import { verifyAndSelfHeal } from './verifier/smoke.js';
 import { runDoctor } from './commands/doctor.js';
@@ -38,11 +38,12 @@ import { runSetup } from './commands/setup.js';
 import {
   createPlanFromEvidence,
   loadEvidenceManifest,
+  validatePlan,
   writePlanFile,
   DEFAULT_EVIDENCE_DIR,
   PLAN_FILENAME,
 } from './plan/generator.js';
-import { runApprovalGate } from './plan/gate.js';
+import { runApprovalGate, ApprovalCancelledError } from './plan/gate.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -176,47 +177,107 @@ async function persistHarvest(
   }
 }
 
-/** Runs the synthesis half of the pipeline (steps 10–14 of `clone`). */
-async function runSynthesis(
-  session: HarvestedSession,
-  snapshot: DOMSnapshot,
-  bundles: DecompiledBundle[],
+// ---------------------------------------------------------------------------
+// Plan-driven modular synthesis
+// ---------------------------------------------------------------------------
+
+/** Resolves the plan file from a path that is either the plan itself or its directory. */
+async function resolvePlanPath(planOrEvidenceDir: string): Promise<string> {
+  const direct = resolve(planOrEvidenceDir);
+
+  try {
+    await readFile(direct, 'utf8');
+    return direct;
+  } catch {
+    // Not a readable file — treat as a directory.
+  }
+
+  const inDir = join(direct, PLAN_FILENAME);
+  try {
+    await readFile(inDir, 'utf8');
+    return inDir;
+  } catch {
+    // No plan in the directory.
+  }
+
+  throw new Error(
+    `No plan found at ${direct} (looked for ${inDir}). ` +
+      'Run `apograph crawl <url>` and `apograph plan` first.',
+  );
+}
+
+/** Locates the evidence directory backing a plan file (manifest.json). */
+async function resolveEvidenceDir(planPath: string): Promise<string> {
+  const besidePlan = join(resolve(planPath), '..');
+  try {
+    await readFile(join(besidePlan, 'manifest.json'), 'utf8');
+    return besidePlan;
+  } catch {
+    // Fall through to the default evidence dir.
+  }
+
+  try {
+    await readFile(join(DEFAULT_EVIDENCE_DIR, 'manifest.json'), 'utf8');
+    return DEFAULT_EVIDENCE_DIR;
+  } catch {
+    throw new Error(
+      `No evidence manifest found beside the plan (${besidePlan}) or at ${resolve(DEFAULT_EVIDENCE_DIR)}.`,
+    );
+  }
+}
+
+/** Loads and validates a plan plus its backing evidence bundle. */
+async function loadPlanAndEvidence(
+  planOrEvidenceDir: string,
+): Promise<{ plan: ApographPlan; manifest: EvidenceManifest; evidenceDir: string; planPath: string }> {
+  const planPath = await resolvePlanPath(planOrEvidenceDir);
+  const plan = validatePlan(JSON.parse(await readFile(planPath, 'utf8')));
+  const evidenceDir = await resolveEvidenceDir(planPath);
+  const manifest = await loadEvidenceManifest(evidenceDir);
+  return { plan, manifest, evidenceDir, planPath };
+}
+
+/** Runs the modular synthesis -> emit -> asset copy half of the pipeline. */
+async function runModularSynthesis(
+  plan: ApographPlan,
+  manifest: EvidenceManifest,
+  evidenceDir: string,
   outDir: string,
   verify: boolean,
   passes: number,
 ): Promise<void> {
-  const appName = appNameFromUrl(session.targetUrl);
+  const included = plan.routes.filter((route) => route.included);
 
-  console.log('→ Clustering endpoints and inferring contracts...');
-  const clusters = clusterEndpoints(session.requests);
-  const schemas = inferAllSchemas(session.requests, clusters);
-  console.log(`→ ${clusters.length} endpoint clusters, ${schemas.length} contracts inferred.`);
-
-  console.log('→ Synthesizing frontend and backend...');
-  const [frontendFiles, backendFiles] = await Promise.all([
-    synthesizeFrontend([snapshot], bundles),
-    synthesizeBackend(schemas),
-  ]);
+  console.log(
+    `→ Synthesizing project for ${included.length} route(s) ` +
+      '(4-stage modular pipeline)...',
+  );
+  const result = await synthesizeModularProject({ plan, manifest, evidenceDir });
+  console.log(
+    `→ Synthesis: ${result.visionStages.length} stage(s) via vision LLM, ` +
+      `${result.fallbackStages.length} via deterministic fallback.`,
+  );
 
   console.log(`→ Emitting project to ${resolve(outDir)}...`);
-  const { writtenFiles, projectDir } = await emitProject(
-    [...frontendFiles, ...backendFiles],
-    outDir,
-    appName,
-  );
+  const { writtenFiles, projectDir } = await emitProject(result.files, outDir, plan.appName);
   console.log(`→ Wrote ${writtenFiles.length} files to ${projectDir}.`);
+
+  const assetsCopied = await copyMirroredAssets(join(evidenceDir, 'assets'), projectDir);
+  if (assetsCopied > 0) {
+    console.log(`→ Mirrored ${assetsCopied} asset(s) into public/assets/.`);
+  }
 
   if (verify) {
     console.log(`→ Running smoke verification (max ${passes} repair passes)...`);
-    const result = await verifyAndSelfHeal(outDir, passes);
-    if (result.success) {
+    const verdict = await verifyAndSelfHeal(projectDir, passes);
+    if (verdict.success) {
       console.log(
-        `→ Verification passed after ${result.passesRun} pass(es); ` +
-          `${result.repairedFiles.length} file(s) repaired.`,
+        `→ Verification passed after ${verdict.passesRun} pass(es); ` +
+          `${verdict.repairedFiles.length} file(s) repaired.`,
       );
     } else {
       console.warn(
-        `→ Verification FAILED after ${result.passesRun} pass(es). ` +
+        `→ Verification FAILED after ${verdict.passesRun} pass(es). ` +
           'Inspect the project and re-run with --passes for more repair attempts.',
       );
     }
@@ -225,24 +286,7 @@ async function runSynthesis(
   console.log('');
   console.log('✔ Done.');
   console.log(`  Output:  ${projectDir}`);
-  console.log('  Boot it: cd into the project and run `docker compose up`');
-}
-
-/** Loads a prior harvest from disk. */
-async function loadHarvest(dir: string): Promise<HarvestOutcome> {
-  const absolute = resolve(dir);
-
-  const session = JSON.parse(
-    await readFile(join(absolute, 'session.json'), 'utf8'),
-  ) as HarvestedSession;
-
-  const snapshot = JSON.parse(
-    await readFile(join(absolute, 'snapshot.json'), 'utf8'),
-  ) as DOMSnapshot;
-
-  const bundles = await harvestAndDecompileScripts(session.scripts);
-
-  return { session, snapshot, bundles };
+  console.log('  Boot it: cd into the project and run `pnpm install && pnpm dev`');
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +296,10 @@ async function loadHarvest(dir: string): Promise<HarvestOutcome> {
 /** Options for the `clone` command (commander passes numbers as strings). */
 interface CloneOptions {
   out?: string;
+  evidence: string;
+  maxDepth: string;
+  maxPages: string;
+  yes: boolean;
   verify: boolean;
   passes: string;
 }
@@ -341,23 +389,54 @@ program
 
 program
   .command('clone')
-  .description('Full pipeline: harvest, decompile, infer, synthesize, emit, verify')
+  .description('Full pipeline: crawl, plan (approval gate), modular synthesize, emit')
   .argument('<url>', 'target URL to reverse-engineer')
   .option('-o, --out <dir>', 'output directory (defaults to ./output/<hostname>)')
+  .option('-e, --evidence <dir>', 'evidence output directory', '.apograph/evidence')
+  .option('--max-depth <number>', 'max crawl depth', '2')
+  .option('--max-pages <number>', 'max pages to crawl', '10')
+  .option('--yes', 'auto-approve the plan without interactive prompts')
   .option('--no-verify', 'skip smoke verification and self-healing')
   .option('--passes <number>', 'max self-healing repair passes', '2')
   .action(async (url: string, options: CloneOptions) => {
     const outDir = options.out ?? outDirFromUrl(url);
     const passes = parseNumber(options.passes, 2);
 
-    const outcome = await runHarvest(url);
-    await persistHarvest(outDir, outcome);
-    await runSynthesis(outcome.session, outcome.snapshot, outcome.bundles, outDir, options.verify, passes);
+    // Step 1: headless evidence crawl.
+    console.log(`→ Crawling ${url} with headless Chromium...`);
+    await crawlEvidence({
+      rootUrl: url,
+      evidenceDir: options.evidence,
+      maxDepth: parseNumber(options.maxDepth, 2),
+      maxPages: parseNumber(options.maxPages, 10),
+    });
+
+    // Step 2: plan generation + approval gate.
+    const manifest = await loadEvidenceManifest(options.evidence);
+    const plan = createPlanFromEvidence(manifest);
+    const planPath = join(options.evidence, PLAN_FILENAME);
+    await writePlanFile(planPath, plan);
+    console.log(`→ Unapproved plan written to ${resolve(planPath)}`);
+
+    let approved: ApographPlan;
+    try {
+      approved = await runApprovalGate(planPath, { nonInteractive: options.yes });
+    } catch (cause) {
+      if (cause instanceof ApprovalCancelledError) {
+        console.error('✖ Clone aborted: the plan was not approved.');
+        process.exitCode = 1;
+        return;
+      }
+      throw cause;
+    }
+
+    // Steps 3–4: modular synthesis + emission.
+    await runModularSynthesis(approved, manifest, options.evidence, outDir, options.verify, passes);
   });
 
 program
   .command('harvest')
-  .description('Capture only: writes session.json, snapshot.json, and unpacked scripts')
+  .description('Legacy capture only: writes session.json, snapshot.json, and unpacked scripts')
   .argument('<url>', 'target URL to harvest')
   .option('-o, --out <dir>', 'output directory (defaults to ./output/<hostname>)')
   .action(async (url: string, options: HarvestOptions) => {
@@ -369,22 +448,29 @@ program
     console.log('');
     console.log('✔ Harvest saved.');
     console.log(`  Output: ${resolve(outDir)}`);
-    console.log(`  Next:   apograph synthesize ${resolve(outDir)}`);
   });
 
 program
   .command('synthesize')
-  .description('Synthesize a project from a previous harvest directory')
-  .argument('<dir>', 'directory containing session.json and snapshot.json')
-  .option('-o, --out <dir>', 'output directory (defaults to <dir>/app)')
+  .description('Modular synthesis: build a standalone frontend from an approved apograph-plan.json')
+  .argument('<planOrEvidenceDir>', 'directory containing apograph-plan.json (or the plan file itself)')
+  .option('-o, --out <dir>', 'output directory (defaults to ./output/<appName>)')
   .option('--no-verify', 'skip smoke verification and self-healing')
   .option('--passes <number>', 'max self-healing repair passes', '2')
   .action(async (dir: string, options: SynthesizeOptions) => {
-    const outDir = options.out ?? join(resolve(dir), 'app');
     const passes = parseNumber(options.passes, 2);
 
-    const outcome = await loadHarvest(dir);
-    await runSynthesis(outcome.session, outcome.snapshot, outcome.bundles, outDir, options.verify, passes);
+    const { plan, manifest, evidenceDir } = await loadPlanAndEvidence(dir);
+
+    if (!plan.approved) {
+      throw new Error(
+        'The plan is not approved. Run `apograph plan <dir>` and complete ' +
+          'the approval gate (or use --yes) before synthesizing.',
+      );
+    }
+
+    const outDir = options.out ?? join('output', plan.appName);
+    await runModularSynthesis(plan, manifest, evidenceDir, outDir, options.verify, passes);
   });
 
 program

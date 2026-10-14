@@ -3,11 +3,13 @@
  *
  * Structured file generation via `generateObject` with a graceful
  * `generateText` fallback for models that lack native json_schema support,
- * plus a token-frugal code repair helper.
+ * plus a token-frugal code repair helper. Prompts may carry image parts for
+ * multimodal (vision) synthesis — see `src/synthesizer/vision.ts`.
  */
 
 import { generateObject, generateText } from 'ai';
 import { z } from 'zod';
+import type { ImagePart, TextPart } from 'ai';
 import type { ProjectFile } from '../types.js';
 import { getSynthesizerModel, getFastParserModel } from '../config/models.js';
 
@@ -27,6 +29,22 @@ const GeneratedProjectSchema = z.object({
 
 /** The parsed payload of {@link GeneratedProjectSchema}. */
 type GeneratedProject = z.infer<typeof GeneratedProjectSchema>;
+
+/** One prompt part: text or an image (base64 data URL). */
+export type PromptPart = TextPart | ImagePart;
+
+/** Builds prompt parts from a text block plus optional image data URLs. */
+export function buildPromptParts(
+  text: string,
+  images: Array<{ dataUrl: string }>,
+): PromptPart[] {
+  const parts: PromptPart[] = images.map((image) => ({
+    type: 'image' as const,
+    image: image.dataUrl,
+  }));
+  parts.push({ type: 'text' as const, text });
+  return parts;
+}
 
 // ---------------------------------------------------------------------------
 // Fallback detection
@@ -94,15 +112,16 @@ function extractJsonBlock(text: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Generates a set of project files from a prompt using structured output.
+ * Generates a set of project files from a prompt (with optional image parts)
+ * using structured output.
  *
  * Prefers `generateObject` with the `project_files` schema. When the model
  * rejects native `json_schema` structured output (400 / unsupported
  * parameter — typical of local SLMs and OpenAI-compatible proxies), falls
  * back to `generateText` and parses the JSON block out of the raw response.
  */
-export async function generateStructuredFiles(
-  prompt: string,
+export async function generateStructuredFilesFromParts(
+  parts: PromptPart[],
   systemPrompt?: string,
 ): Promise<ProjectFile[]> {
   const model = getSynthesizerModel();
@@ -113,7 +132,7 @@ export async function generateStructuredFiles(
       schema: GeneratedProjectSchema,
       schemaName: 'project_files',
       ...(systemPrompt !== undefined ? { system: systemPrompt } : {}),
-      prompt,
+      messages: [{ role: 'user', content: parts }],
     });
 
     return result.object.files;
@@ -128,11 +147,21 @@ export async function generateStructuredFiles(
     const textResult = await generateText({
       model,
       ...(systemPrompt !== undefined ? { system: systemPrompt } : {}),
-      prompt:
-        `${prompt}\n\n` +
-        'Respond with ONLY a JSON object of the form ' +
-        '{"files": [{"path": "<file path>", "content": "<full file content>"}]}. ' +
-        'No markdown fences, no commentary, no extra keys.',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            ...parts,
+            {
+              type: 'text' as const,
+              text:
+                '\n\nRespond with ONLY a JSON object of the form ' +
+                '{"files": [{"path": "<file path>", "content": "<full file content>"}]}. ' +
+                'No markdown fences, no commentary, no extra keys.',
+            },
+          ],
+        },
+      ],
     });
 
     const parsed: GeneratedProject = GeneratedProjectSchema.parse(
@@ -141,6 +170,20 @@ export async function generateStructuredFiles(
 
     return parsed.files;
   }
+}
+
+/**
+ * Generates a set of project files from a plain text prompt. See
+ * {@link generateStructuredFilesFromParts} for the multimodal variant.
+ */
+export async function generateStructuredFiles(
+  prompt: string,
+  systemPrompt?: string,
+): Promise<ProjectFile[]> {
+  return generateStructuredFilesFromParts(
+    [{ type: 'text', text: prompt }],
+    systemPrompt,
+  );
 }
 
 // ---------------------------------------------------------------------------
