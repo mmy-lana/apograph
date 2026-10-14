@@ -19,10 +19,16 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { chromium } from 'playwright';
 import type { Browser, Page } from 'playwright';
-import type { EvidenceManifest } from '../types.js';
+import type { CrawlScope, EvidenceManifest, RouteMetadata, ViewportMode } from '../types.js';
 import { captureDOMSnapshot } from '../harvester/dom.js';
 import { discoverImageAssets, mirrorAssets } from './assets.js';
-import { isCrawlablePage, isSameOrigin, linkPriority, normalizeUrl } from './urls.js';
+import {
+  createScopeFilter,
+  isCrawlablePage,
+  isSameOrigin,
+  linkPriority,
+  normalizeUrl,
+} from './urls.js';
 
 // ---------------------------------------------------------------------------
 // Options & constants
@@ -38,6 +44,10 @@ export interface CrawlOptions {
   maxDepth?: number;
   /** Max number of pages crawled. Defaults to 10. */
   maxPages?: number;
+  /** Which viewports to screenshot. Defaults to `both`. */
+  viewport?: ViewportMode;
+  /** Same-origin crawl scope. Defaults to `site`. */
+  scope?: CrawlScope;
 }
 
 /** Desktop capture viewport. */
@@ -98,13 +108,18 @@ function slugForPath(pathname: string): string {
  * Returns the persisted manifest.
  */
 export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceManifest> {
-  const rootUrl = normalizeUrl(options.rootUrl);
-  if (rootUrl === null) {
+  const requestedRoot = normalizeUrl(options.rootUrl);
+  if (requestedRoot === null) {
     throw new Error(`Invalid root URL: ${options.rootUrl}`);
   }
 
   const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
   const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
+  const viewportMode: ViewportMode = options.viewport ?? 'both';
+  const scope: CrawlScope = options.scope ?? 'site';
+
+  const captureDesktop = viewportMode !== 'mobile';
+  const captureMobile = viewportMode !== 'desktop';
 
   const evidenceDir = resolve(options.evidenceDir ?? DEFAULT_EVIDENCE_DIR);
   const screenshotsDir = join(evidenceDir, 'screenshots');
@@ -112,7 +127,6 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
   await mkdir(screenshotsDir, { recursive: true });
   await mkdir(assetsDir, { recursive: true });
 
-  const rootOrigin = new URL(rootUrl).origin;
   const startedAt = Date.now();
 
   const browser = await launchHeadlessChromium();
@@ -128,8 +142,10 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
   const visited = new Set<string>();
   const queued = new Set<string>();
   const recordedSkips = new Set<string>();
-  const frontier: FrontierEntry[] = [{ url: rootUrl, depth: 0, priority: 0, order: 0 }];
-  queued.add(rootUrl);
+  const frontier: FrontierEntry[] = [
+    { url: requestedRoot, depth: 0, priority: 0, order: 0 },
+  ];
+  queued.add(requestedRoot);
 
   const bookkeeping: CrawlBookkeeping = {
     visited,
@@ -146,6 +162,9 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
     recordedSkips.add(key);
     diagnostics.skippedUrls.push({ url, reason });
   };
+
+  /** The canonical root: updated to the post-redirect URL on the first page. */
+  let canonicalRoot = requestedRoot;
 
   try {
     const context = await browser.newContext({ viewport: { ...DESKTOP_VIEWPORT } });
@@ -178,19 +197,45 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         continue;
       }
 
+      // Record the post-redirect URL as the canonical root when the initial
+      // request was redirected (e.g. /faq -> /frequently-asked-questions).
+      if (entry.url === requestedRoot) {
+        const finalUrl = normalizeUrl(page.url());
+        if (finalUrl !== null && finalUrl !== entry.url) {
+          canonicalRoot = finalUrl;
+          diagnostics.skippedUrls.push({
+            url: entry.url,
+            reason: `redirected to ${finalUrl} (recorded as canonical root)`,
+          });
+        }
+      }
+
       // DOM snapshot + a11y tree + design tokens (shared harvester logic).
       const snapshot = await captureDOMSnapshot(page, path);
 
-      // Dual-viewport screenshots.
-      const slug = slugForPath(path);
-      const desktopScreenshot = join(screenshotsDir, `${slug}-desktop.png`);
-      const mobileScreenshot = join(screenshotsDir, `${slug}-mobile.png`);
+      // SEO / OpenGraph metadata extraction.
+      const metadata = await extractRouteMetadata(page, title);
 
-      await page.setViewportSize({ ...DESKTOP_VIEWPORT });
-      await page.screenshot({ path: desktopScreenshot, type: 'png' });
-      await page.setViewportSize({ ...MOBILE_VIEWPORT });
-      await page.screenshot({ path: mobileScreenshot, type: 'png' });
-      await page.setViewportSize({ ...DESKTOP_VIEWPORT });
+      // Viewport-gated screenshots.
+      const slug = slugForPath(path);
+      const desktopScreenshot = captureDesktop
+        ? join(screenshotsDir, `${slug}-desktop.png`)
+        : null;
+      const mobileScreenshot = captureMobile
+        ? join(screenshotsDir, `${slug}-mobile.png`)
+        : null;
+
+      if (captureDesktop) {
+        await page.setViewportSize({ ...DESKTOP_VIEWPORT });
+        await page.screenshot({ path: desktopScreenshot as string, type: 'png' });
+      }
+      if (captureMobile) {
+        await page.setViewportSize({ ...MOBILE_VIEWPORT });
+        await page.screenshot({ path: mobileScreenshot as string, type: 'png' });
+      }
+      if (captureDesktop) {
+        await page.setViewportSize({ ...DESKTOP_VIEWPORT });
+      }
 
       routes.push({
         url: entry.url,
@@ -198,12 +243,14 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         title,
         desktopScreenshot,
         mobileScreenshot,
+        metadata,
         a11yTree: snapshot.a11yTree,
         tokens: snapshot.tokens,
       });
 
-      // Link discovery.
-      await enqueueLinks(page, entry, rootUrl, maxDepth, maxPages, bookkeeping, skip);
+      // Link discovery (scoped against the canonical root).
+      const scopeFilter = createScopeFilter(canonicalRoot, scope);
+      await enqueueLinks(page, entry, canonicalRoot, scopeFilter, maxDepth, maxPages, bookkeeping, skip);
 
       // Asset discovery.
       for (const assetUrl of await discoverImageAssets(page)) {
@@ -219,7 +266,8 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
     await browser.close();
   }
 
-  // Asset mirroring pass.
+  // Asset mirroring pass (same-origin against the canonical root).
+  const rootOrigin = new URL(canonicalRoot).origin;
   const { entries: assets, uncaptured } = await mirrorAssets(
     [...assetUrls],
     rootOrigin,
@@ -228,7 +276,7 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
   diagnostics.uncapturedResources.push(...uncaptured);
 
   const manifest: EvidenceManifest = {
-    targetUrl: rootUrl,
+    targetUrl: canonicalRoot,
     crawledAt: new Date().toISOString(),
     stats: {
       pagesCrawled: routes.length,
@@ -253,6 +301,60 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
 }
 
 // ---------------------------------------------------------------------------
+// SEO / OpenGraph metadata extraction
+// ---------------------------------------------------------------------------
+
+/** In-page collector for <head> metadata (title, description, icon, OG tags). */
+function collectHeadMetadata(): {
+  description: string | null;
+  favicon: string | null;
+  ogTitle: string | null;
+  ogDescription: string | null;
+  ogImage: string | null;
+} {
+  const metaContent = (selector: string): string | null => {
+    const el = document.querySelector(selector);
+    const content = el?.getAttribute('content');
+    return content !== null && content !== undefined && content.length > 0 ? content : null;
+  };
+
+  const iconEl = document.querySelector(
+    'link[rel="icon"], link[rel="shortcut icon"], link[rel~="icon"]',
+  );
+  const favicon = iconEl?.getAttribute('href');
+  const description = metaContent('meta[name="description"]');
+
+  return {
+    description,
+    favicon: favicon !== null && favicon !== undefined && favicon.length > 0 ? favicon : null,
+    ogTitle: metaContent('meta[property="og:title"]'),
+    ogDescription: metaContent('meta[property="og:description"]'),
+    ogImage: metaContent('meta[property="og:image"]'),
+  };
+}
+
+/** Extracts SEO metadata from a loaded page, resolving the favicon URL. */
+async function extractRouteMetadata(page: Page, title: string): Promise<RouteMetadata> {
+  const raw = await page.evaluate(collectHeadMetadata);
+  const pageUrl = page.url();
+
+  const metadata: RouteMetadata = { title };
+  if (raw.description !== null) metadata.description = raw.description;
+  if (raw.ogTitle !== null) metadata.ogTitle = raw.ogTitle;
+  if (raw.ogDescription !== null) metadata.ogDescription = raw.ogDescription;
+  if (raw.ogImage !== null) metadata.ogImage = raw.ogImage;
+  if (raw.favicon !== null) {
+    try {
+      metadata.favicon = new URL(raw.favicon, pageUrl).href;
+    } catch {
+      // Malformed favicon href — drop it.
+    }
+  }
+
+  return metadata;
+}
+
+// ---------------------------------------------------------------------------
 // Link enqueueing
 // ---------------------------------------------------------------------------
 
@@ -266,13 +368,15 @@ interface CrawlBookkeeping {
 }
 
 /**
- * Discovers same-origin links on the page and enqueues the crawlable ones,
- * recording skips (off-site, non-page, over-depth, page-cap) as diagnostics.
+ * Discovers same-origin, in-scope links on the page and enqueues the
+ * crawlable ones, recording skips (off-site, out-of-scope, non-page,
+ * over-depth, page-cap) as diagnostics.
  */
 async function enqueueLinks(
   page: Page,
   entry: FrontierEntry,
   rootUrl: string,
+  scopeFilter: (url: string) => boolean,
   maxDepth: number,
   maxPages: number,
   bookkeeping: CrawlBookkeeping,
@@ -291,6 +395,11 @@ async function enqueueLinks(
 
     if (!isSameOrigin(normalized, rootUrl)) {
       skip(normalized, 'off-site (not same-origin)');
+      continue;
+    }
+
+    if (!scopeFilter(normalized)) {
+      skip(normalized, 'out-of-scope');
       continue;
     }
 

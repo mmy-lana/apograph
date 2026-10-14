@@ -3,9 +3,11 @@
  *
  * Pure deterministic helpers used by the headless crawler: canonical URL
  * normalization (tracking-parameter stripping, fragment removal, trailing
- * slash collapsing), same-origin checks, page-asset filtering, and
- * navigation-link prioritization.
+ * slash collapsing), same-origin checks, page-asset filtering, crawl
+ * scoping, and navigation-link prioritization.
  */
+
+import type { CrawlScope } from '../types.js';
 
 /** Query parameters treated as tracking noise. `utm_*` is matched by prefix. */
 const TRACKING_PARAMS = new Set(['fbclid', 'gclid', 'ref']);
@@ -68,7 +70,7 @@ export function isSameOrigin(a: string, b: string): boolean {
   }
 }
 
-/** True when the URL's path looks like a crawlable HTML page (not a raw asset). */
+/** True when a URL's path looks like a crawlable HTML page (not a raw asset). */
 export function isCrawlablePage(url: string): boolean {
   try {
     const { pathname } = new URL(url);
@@ -76,6 +78,63 @@ export function isCrawlablePage(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Crawl scoping
+// ---------------------------------------------------------------------------
+
+/**
+ * True when the URL targets a subpath rather than a site root — e.g.
+ * `domain.com/frequently-asked-questions` (any non-empty pathname).
+ */
+export function urlHasSubpath(url: string): boolean {
+  try {
+    return new URL(url).pathname.replace(/\/+$/, '').length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Builds the same-origin scope filter for a crawl:
+ * - `single`: only the root URL itself (page cap 1);
+ * - `subtree`: pages under the root's path prefix (`/faq`, `/faq/...`);
+ * - `site`: every same-origin page.
+ */
+export function createScopeFilter(
+  rootUrl: string,
+  scope: CrawlScope,
+): (url: string) => boolean {
+  let root: URL;
+  try {
+    root = new URL(rootUrl);
+  } catch {
+    return () => false;
+  }
+
+  const rootPath = root.pathname.replace(/\/+$/, '');
+
+  if (scope === 'single') {
+    return (url) => url === rootUrl;
+  }
+
+  if (scope === 'subtree') {
+    return (url) => {
+      try {
+        const candidate = new URL(url);
+        return (
+          candidate.origin === root.origin &&
+          (candidate.pathname === rootPath ||
+            candidate.pathname.startsWith(`${rootPath}/`))
+        );
+      } catch {
+        return false;
+      }
+    };
+  }
+
+  return (url) => isSameOrigin(url, rootUrl);
 }
 
 /**

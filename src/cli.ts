@@ -8,6 +8,7 @@
  *   apograph clone <url>          Full pipeline: crawl -> plan (approval gate) -> modular synthesize -> emit -> verify.
  *   apograph synthesize <dir>     Modular synthesis from an approved apograph-plan.json.
  *   apograph verify <dir> [dir2]  3-tier verification: build, route smoke, visual comparison.
+ *   apograph config               Configure the LLM provider (stored in ~/.apograph/config.json).
  *   apograph doctor               Check environment health (Node, Chromium, LLM, Ollama).
  *   apograph setup                Install the apograph MCP server into your coding agent.
  */
@@ -15,15 +16,18 @@
 import { Command } from 'commander';
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import type { EvidenceManifest } from './types.js';
+import * as p from '@clack/prompts';
+import type { CrawlScope, EvidenceManifest, ViewportMode } from './types.js';
 import type { ApographPlan } from './plan/schema.js';
 import { crawlEvidence } from './crawler/engine.js';
+import { urlHasSubpath } from './crawler/urls.js';
 import { synthesizeModularProject, copyMirroredAssets } from './synthesizer/modular.js';
 import { emitProject } from './emitter/scaffold.js';
 import { runVerification } from './verifier/engine.js';
 import { printVerificationSummary, writeVerificationReport } from './verifier/report.js';
 import { runDoctor } from './commands/doctor.js';
 import { runSetup } from './commands/setup.js';
+import { runConfigCommand } from './commands/config.js';
 import {
   createPlanFromEvidence,
   loadEvidenceManifest,
@@ -58,6 +62,78 @@ function outDirFromUrl(url: string): string {
 function parseNumber(value: string, fallback: number): number {
   const parsed = Number.parseInt(value, 10);
   return Number.isNaN(parsed) ? fallback : parsed;
+}
+
+/** Parses a --viewport option into a validated ViewportMode. */
+function parseViewportOption(value: string | undefined): ViewportMode {
+  if (value === undefined) return 'both';
+  if (value === 'both' || value === 'desktop' || value === 'mobile') return value;
+  throw new Error(`Invalid --viewport value: ${value} (expected both, desktop, or mobile).`);
+}
+
+/** Parses a --scope option into a validated CrawlScope. */
+function parseScopeOption(value: string | undefined): CrawlScope | undefined {
+  if (value === undefined) return undefined;
+  if (value === 'single' || value === 'subtree' || value === 'site') return value;
+  throw new Error(`Invalid --scope value: ${value} (expected single, subtree, or site).`);
+}
+
+/** True when prompts can be shown (TTY attached and not suppressed). */
+function isInteractive(nonInteractive: boolean): boolean {
+  return !nonInteractive && process.stdout.isTTY === true && process.stdin.isTTY === true;
+}
+
+/**
+ * Resolves the crawl scope for a target URL:
+ * - explicit `--scope` always wins;
+ * - a root URL (no subpath) is always `site`;
+ * - a subpath in interactive mode prompts: [1] single page, [2] subtree,
+ *   [3] full site;
+ * - a subpath non-interactively defaults to `site` (full site).
+ */
+async function resolveCrawlScope(
+  url: string,
+  requested: CrawlScope | undefined,
+  interactive: boolean,
+): Promise<{ scope: CrawlScope; maxPagesCap: number | null }> {
+  if (requested !== undefined) {
+    return { scope: requested, maxPagesCap: requested === 'single' ? 1 : null };
+  }
+
+  if (!urlHasSubpath(url)) {
+    return { scope: 'site', maxPagesCap: null };
+  }
+
+  if (!interactive) {
+    return { scope: 'site', maxPagesCap: null };
+  }
+
+  const choice = await p.select({
+    message: `${url} is a subpage. What should be crawled?`,
+    options: [
+      {
+        value: 'single' as const,
+        label: '1. Single page only',
+        hint: 'capture just this page (cap: 1)',
+      },
+      {
+        value: 'subtree' as const,
+        label: '2. Subtree crawl',
+        hint: 'pages starting with this path',
+      },
+      {
+        value: 'site' as const,
+        label: '3. Full site',
+        hint: 'crawl from the root origin',
+      },
+    ],
+  });
+
+  if (p.isCancel(choice)) {
+    throw new Error('Crawl cancelled at the scope prompt.');
+  }
+
+  return { scope: choice, maxPagesCap: choice === 'single' ? 1 : null };
 }
 
 // ---------------------------------------------------------------------------
@@ -120,13 +196,21 @@ async function loadPlanAndEvidence(
   return { plan, manifest, evidenceDir, planPath };
 }
 
+/** Options for the modular synthesis -> emit -> verify half-pipeline. */
+interface ModularSynthesisOptions {
+  force: boolean;
+  interactive: boolean;
+  verify: boolean;
+  viewport: ViewportMode;
+}
+
 /** Runs the modular synthesis -> emit -> asset copy -> verify half of the pipeline. */
 async function runModularSynthesis(
   plan: ApographPlan,
   manifest: EvidenceManifest,
   evidenceDir: string,
   outDir: string,
-  verify: boolean,
+  options: ModularSynthesisOptions,
 ): Promise<void> {
   const included = plan.routes.filter((route) => route.included);
 
@@ -141,7 +225,11 @@ async function runModularSynthesis(
   );
 
   console.log(`→ Emitting project to ${resolve(outDir)}...`);
-  const { writtenFiles, projectDir } = await emitProject(result.files, outDir, plan.appName);
+  const { writtenFiles, projectDir } = await emitProject(result.files, outDir, plan.appName, {
+    force: options.force,
+    interactive: options.interactive,
+    metadata: manifest.routes[0]?.metadata,
+  });
   console.log(`→ Wrote ${writtenFiles.length} files to ${projectDir}.`);
 
   const assetsCopied = await copyMirroredAssets(join(evidenceDir, 'assets'), projectDir);
@@ -149,9 +237,15 @@ async function runModularSynthesis(
     console.log(`→ Mirrored ${assetsCopied} asset(s) into public/assets/.`);
   }
 
-  if (verify) {
-    console.log('→ Running 3-tier verification (build, routes, visuals)...');
-    const report = await runVerification({ outputDir: projectDir, evidenceDir });
+  if (options.verify) {
+    console.log(
+      `→ Running 3-tier verification (build, routes, ${options.viewport} visuals)...`,
+    );
+    const report = await runVerification({
+      outputDir: projectDir,
+      evidenceDir,
+      viewport: options.viewport,
+    });
     printVerificationSummary(report);
     const reportPath = await writeVerificationReport(projectDir, report);
     console.log(`→ Verification report: ${reportPath}`);
@@ -163,7 +257,7 @@ async function runModularSynthesis(
   console.log('');
   console.log('✔ Done.');
   console.log(`  Output:  ${projectDir}`);
-  console.log('  Boot it: cd into the project and run `pnpm install && pnpm dev`');
+  console.log('  Boot it: cd into the project and run pnpm install && pnpm dev');
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +270,10 @@ interface CloneOptions {
   evidence: string;
   maxDepth: string;
   maxPages: string;
+  viewport: string;
+  scope?: string;
   yes: boolean;
+  force: boolean;
   verify: boolean;
 }
 
@@ -185,6 +282,8 @@ interface CrawlCliOptions {
   evidence: string;
   maxDepth: string;
   maxPages: string;
+  viewport: string;
+  scope?: string;
 }
 
 /** Options for the `plan` command. */
@@ -196,12 +295,15 @@ interface PlanCliOptions {
 /** Options for the `verify` command. */
 interface VerifyCliOptions {
   threshold: string;
+  viewport: string;
 }
 
 /** Options for the `synthesize` command. */
 interface SynthesizeOptions {
   out?: string;
+  force: boolean;
   verify: boolean;
+  viewport: string;
 }
 
 const program = new Command('apograph');
@@ -240,17 +342,32 @@ program
 
 program
   .command('crawl')
-  .description('Headless evidence crawl: dual-viewport screenshots, a11y trees, design tokens, mirrored assets')
+  .description('Headless evidence crawl: viewport screenshots, a11y trees, design tokens, SEO metadata, mirrored assets')
   .argument('<url>', 'root URL to crawl')
   .option('-e, --evidence <dir>', 'evidence output directory', '.apograph/evidence')
   .option('--max-depth <number>', 'max crawl depth', '2')
   .option('--max-pages <number>', 'max pages to crawl', '10')
+  .option('--viewport <mode>', 'viewports to screenshot: both, desktop, or mobile', 'both')
+  .option('--scope <mode>', 'crawl scope for subpath URLs: single, subtree, or site')
   .action(async (url: string, options: CrawlCliOptions) => {
+    const viewport = parseViewportOption(options.viewport);
+    const requestedScope = parseScopeOption(options.scope);
+    const interactive = isInteractive(false);
+
+    const { scope, maxPagesCap } = await resolveCrawlScope(url, requestedScope, interactive);
+    if (maxPagesCap !== null) {
+      console.log('→ Scope: single page (cap: 1).');
+    } else if (requestedScope !== undefined || urlHasSubpath(url)) {
+      console.log(`→ Scope: ${scope}.`);
+    }
+
     const manifest = await crawlEvidence({
       rootUrl: url,
       evidenceDir: options.evidence,
       maxDepth: parseNumber(options.maxDepth, 2),
-      maxPages: parseNumber(options.maxPages, 10),
+      maxPages: maxPagesCap ?? parseNumber(options.maxPages, 10),
+      viewport,
+      scope,
     });
 
     console.log('');
@@ -270,18 +387,27 @@ program
   .option('-e, --evidence <dir>', 'evidence output directory', '.apograph/evidence')
   .option('--max-depth <number>', 'max crawl depth', '2')
   .option('--max-pages <number>', 'max pages to crawl', '10')
+  .option('--viewport <mode>', 'viewports to screenshot and verify: both, desktop, or mobile', 'both')
+  .option('--scope <mode>', 'crawl scope for subpath URLs: single, subtree, or site')
   .option('--yes', 'auto-approve the plan without interactive prompts')
+  .option('--force', 'overwrite the output directory completely instead of merging')
   .option('--no-verify', 'skip the 3-tier verification pass')
   .action(async (url: string, options: CloneOptions) => {
     const outDir = options.out ?? outDirFromUrl(url);
+    const viewport = parseViewportOption(options.viewport);
+    const requestedScope = parseScopeOption(options.scope);
+    const interactive = isInteractive(options.yes);
 
-    // Step 1: headless evidence crawl.
-    console.log(`→ Crawling ${url} with headless Chromium...`);
+    // Step 1: headless evidence crawl (scope-resolved).
+    const { scope, maxPagesCap } = await resolveCrawlScope(url, requestedScope, interactive);
+    console.log(`→ Crawling ${url} with headless Chromium (scope: ${scope}, viewport: ${viewport})...`);
     await crawlEvidence({
       rootUrl: url,
       evidenceDir: options.evidence,
       maxDepth: parseNumber(options.maxDepth, 2),
-      maxPages: parseNumber(options.maxPages, 10),
+      maxPages: maxPagesCap ?? parseNumber(options.maxPages, 10),
+      viewport,
+      scope,
     });
 
     // Step 2: plan generation + approval gate.
@@ -304,7 +430,12 @@ program
     }
 
     // Steps 3–5: modular synthesis + emission + verification.
-    await runModularSynthesis(approved, manifest, options.evidence, outDir, options.verify);
+    await runModularSynthesis(approved, manifest, options.evidence, outDir, {
+      force: options.force,
+      interactive,
+      verify: options.verify,
+      viewport,
+    });
   });
 
 program
@@ -312,6 +443,8 @@ program
   .description('Modular synthesis: build a standalone frontend from an approved apograph-plan.json')
   .argument('<planOrEvidenceDir>', 'directory containing apograph-plan.json (or the plan file itself)')
   .option('-o, --out <dir>', 'output directory (defaults to ./output/<appName>)')
+  .option('--viewport <mode>', 'viewports to verify: both, desktop, or mobile', 'both')
+  .option('--force', 'overwrite the output directory completely instead of merging')
   .option('--no-verify', 'skip the 3-tier verification pass')
   .action(async (dir: string, options: SynthesizeOptions) => {
     const { plan, manifest, evidenceDir } = await loadPlanAndEvidence(dir);
@@ -324,7 +457,12 @@ program
     }
 
     const outDir = options.out ?? join('output', plan.appName);
-    await runModularSynthesis(plan, manifest, evidenceDir, outDir, options.verify);
+    await runModularSynthesis(plan, manifest, evidenceDir, outDir, {
+      force: options.force,
+      interactive: isInteractive(false),
+      verify: options.verify,
+      viewport: parseViewportOption(options.viewport),
+    });
   });
 
 program
@@ -333,6 +471,7 @@ program
   .argument('<outputDir>', 'generated project directory to verify')
   .argument('[evidenceDir]', 'evidence directory (defaults to .apograph/evidence)', DEFAULT_EVIDENCE_DIR)
   .option('--threshold <number>', 'visual mismatch threshold in percent', '15')
+  .option('--viewport <mode>', 'viewports to compare: both, desktop, or mobile', 'both')
   .action(async (outputDir: string, evidenceDir: string, options: VerifyCliOptions) => {
     const thresholdPercent = parseNumber(options.threshold, 15);
 
@@ -340,6 +479,7 @@ program
       outputDir,
       evidenceDir,
       visualThreshold: thresholdPercent / 100,
+      viewport: parseViewportOption(options.viewport),
     });
 
     printVerificationSummary(report);
@@ -351,6 +491,14 @@ program
     if (!report.overall.passed) {
       process.exitCode = 1;
     }
+  });
+
+program
+  .command('config')
+  .description('Configure the LLM provider (ollama, openai, anthropic, or gateway); stored in ~/.apograph/config.json')
+  .option('--show', 'print the current configuration and exit')
+  .action(async (options: { show: boolean }) => {
+    await runConfigCommand(options);
   });
 
 program

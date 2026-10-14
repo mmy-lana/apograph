@@ -1,16 +1,22 @@
 /**
- * apograph — Project scaffolding & emission (Layer 5: Output, Phase 4).
+ * apograph — Project scaffolding & emission (Layer 5: Output, Phase 4+).
  *
  * Emits a pure, standalone multi-page frontend project (React 19.3 + Vite +
  * React Router v7 + Tailwind CSS 4.3 + lucide-react) — zero backend or
  * SQLite generation. The scaffold provides the deterministic root files
  * (package.json, vite.config.ts, index.html, tsconfig.json, README) around
  * the modular synthesis output; synthesized files win on path collisions.
+ *
+ * An overwrite guard protects existing output directories: without `force`,
+ * interactive runs choose between update-in-place, full overwrite, or abort;
+ * non-interactive runs safely merge (generated files overwrite, existing
+ * project files are never deleted).
  */
 
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import type { ProjectFile } from '../types.js';
+import * as p from '@clack/prompts';
+import type { ProjectFile, RouteMetadata } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // Fixed target stack versions
@@ -24,6 +30,48 @@ const LUCIDE_REACT_VERSION = '^0.525.0';
 // ---------------------------------------------------------------------------
 // Root scaffold files
 // ---------------------------------------------------------------------------
+
+/** Escapes a string for safe embedding in HTML attribute/text content. */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** Builds the <head> body lines from extracted SEO / OpenGraph metadata. */
+function buildHeadLines(appName: string, metadata?: RouteMetadata): string[] {
+  const title = metadata?.ogTitle ?? metadata?.title ?? appName;
+  const description = metadata?.ogDescription ?? metadata?.description;
+
+  const lines = [
+    '    <meta charset="UTF-8" />',
+    '    <meta name="viewport" content="width=device-width, initial-scale=1.0" />',
+    `    <title>${escapeHtml(title)}</title>`,
+  ];
+
+  if (description !== undefined) {
+    lines.push(`    <meta name="description" content="${escapeHtml(description)}" />`);
+  }
+  if (metadata?.favicon !== undefined) {
+    lines.push(`    <link rel="icon" href="${escapeHtml(metadata.favicon)}" />`);
+  }
+  if (metadata?.ogTitle !== undefined) {
+    lines.push(`    <meta property="og:title" content="${escapeHtml(metadata.ogTitle)}" />`);
+  }
+  if (metadata?.ogDescription !== undefined) {
+    lines.push(
+      `    <meta property="og:description" content="${escapeHtml(metadata.ogDescription)}" />`,
+    );
+  }
+  if (metadata?.ogImage !== undefined) {
+    lines.push(`    <meta property="og:image" content="${escapeHtml(metadata.ogImage)}" />`);
+  }
+
+  return lines;
+}
 
 /** Emits the project README documenting the standalone frontend setup. */
 export function generateRootReadme(appName: string): ProjectFile {
@@ -64,7 +112,10 @@ export function generateRootReadme(appName: string): ProjectFile {
 }
 
 /** Emits the standalone frontend package.json with the fixed target stack. */
-export function generateFrontendScaffold(appName: string): ProjectFile[] {
+export function generateFrontendScaffold(
+  appName: string,
+  metadata?: RouteMetadata,
+): ProjectFile[] {
   const packageJson = {
     name: appName,
     private: true,
@@ -108,9 +159,7 @@ export function generateFrontendScaffold(appName: string): ProjectFile[] {
     '<!doctype html>',
     '<html lang="en">',
     '  <head>',
-    '    <meta charset="UTF-8" />',
-    '    <meta name="viewport" content="width=device-width, initial-scale=1.0" />',
-    `    <title>${appName}</title>`,
+    ...buildHeadLines(appName, metadata),
     '  </head>',
     '  <body>',
     '    <div id="root"></div>',
@@ -153,6 +202,81 @@ export function generateFrontendScaffold(appName: string): ProjectFile[] {
 // Emitter
 // ---------------------------------------------------------------------------
 
+/** Options for {@link emitProject}. */
+export interface EmitOptions {
+  /** Overwrite the output directory completely without prompting. */
+  force?: boolean;
+  /** Allow interactive prompts when the directory exists. Defaults to false. */
+  interactive?: boolean;
+  /** SEO / OpenGraph metadata populated into index.html <head>. */
+  metadata?: RouteMetadata;
+}
+
+/** Outcome choice for an existing output directory. */
+type ExistingDirAction = 'update' | 'overwrite' | 'abort';
+
+/** Thrown when the user aborts emission at the overwrite guard. */
+export class EmissionAbortedError extends Error {
+  constructor(projectDir: string) {
+    super(`Emission aborted: output directory ${projectDir} already exists.`);
+  }
+}
+
+/** True when a directory exists and contains at least one entry. */
+async function isNonEmptyDir(dir: string): Promise<boolean> {
+  try {
+    const entries = await readdir(dir);
+    return entries.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolves what to do with an existing output directory:
+ * - `force`: overwrite completely, no prompt.
+ * - interactive: [1] Update/Resume (merge), [2] Overwrite completely,
+ *   [3] Abort.
+ * - non-interactive: safe merge (update) — generated files overwrite, but
+ *   existing project files are never deleted.
+ */
+async function resolveExistingDirAction(
+  projectDir: string,
+  options: EmitOptions,
+): Promise<ExistingDirAction> {
+  if (options.force === true) return 'overwrite';
+
+  if (options.interactive === true) {
+    const choice = await p.select({
+      message: `Directory ${projectDir} exists:`,
+      options: [
+        {
+          value: 'update' as const,
+          label: '1. Update/Resume',
+          hint: 'overwrite generated files, keep everything else',
+        },
+        {
+          value: 'overwrite' as const,
+          label: '2. Overwrite completely',
+          hint: 'delete the directory and regenerate from scratch',
+        },
+        {
+          value: 'abort' as const,
+          label: '3. Abort',
+          hint: 'stop without writing anything',
+        },
+      ],
+    });
+
+    if (p.isCancel(choice)) {
+      throw new EmissionAbortedError(projectDir);
+    }
+    return choice;
+  }
+
+  return 'update';
+}
+
 /**
  * Assembles the frontend scaffold plus the synthesized files (synthesized
  * entries win on path collisions) and writes the full standalone project
@@ -163,12 +287,25 @@ export async function emitProject(
   projectFiles: ProjectFile[],
   targetDir: string,
   appName: string = 'apograph-app',
+  options: EmitOptions = {},
 ): Promise<{ writtenFiles: string[]; projectDir: string }> {
   const projectDir = resolve(targetDir);
 
+  // Overwrite guard for existing output directories.
+  if (await isNonEmptyDir(projectDir)) {
+    const action = await resolveExistingDirAction(projectDir, options);
+    if (action === 'abort') {
+      throw new EmissionAbortedError(projectDir);
+    }
+    if (action === 'overwrite') {
+      await rm(projectDir, { recursive: true, force: true });
+    }
+    // 'update': fall through — merge semantics below never delete files.
+  }
+
   const boilerplate: ProjectFile[] = [
     generateRootReadme(appName),
-    ...generateFrontendScaffold(appName),
+    ...generateFrontendScaffold(appName, options.metadata),
   ];
 
   // Merge by path; later entries (synthesized files) take precedence.

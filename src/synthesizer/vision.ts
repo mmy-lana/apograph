@@ -59,8 +59,9 @@ async function loadScreenshotDataUrl(
 
 /**
  * Loads a route's dual-viewport screenshots (desktop + mobile PNGs) from the
- * evidence bundle. Missing files are silently skipped — the prompt then
- * carries only the surviving image(s).
+ * evidence bundle. Missing files and viewports that were not captured
+ * (`null` paths) are silently skipped — the prompt then carries only the
+ * surviving image(s).
  */
 export async function loadRouteScreenshots(
   route: CrawlRoute,
@@ -68,17 +69,21 @@ export async function loadRouteScreenshots(
 ): Promise<ScreenshotImage[]> {
   const images: ScreenshotImage[] = [];
 
-  const desktop = await loadScreenshotDataUrl(
-    resolveScreenshotPath(route.desktopScreenshot, evidenceDir),
-    'desktop',
-  );
-  if (desktop) images.push(desktop);
+  if (route.desktopScreenshot !== null) {
+    const desktop = await loadScreenshotDataUrl(
+      resolveScreenshotPath(route.desktopScreenshot, evidenceDir),
+      'desktop',
+    );
+    if (desktop) images.push(desktop);
+  }
 
-  const mobile = await loadScreenshotDataUrl(
-    resolveScreenshotPath(route.mobileScreenshot, evidenceDir),
-    'mobile',
-  );
-  if (mobile) images.push(mobile);
+  if (route.mobileScreenshot !== null) {
+    const mobile = await loadScreenshotDataUrl(
+      resolveScreenshotPath(route.mobileScreenshot, evidenceDir),
+      'mobile',
+    );
+    if (mobile) images.push(mobile);
+  }
 
   return images;
 }

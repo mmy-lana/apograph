@@ -52,6 +52,22 @@ export interface HarvestedSession {
 // Layer 1b — Headless evidence crawl
 // ---------------------------------------------------------------------------
 
+/** Which viewports to capture during a crawl / verification run. */
+export type ViewportMode = 'both' | 'desktop' | 'mobile';
+
+/** Crawl scope applied to same-origin link discovery. */
+export type CrawlScope = 'single' | 'subtree' | 'site';
+
+/** SEO / social metadata extracted from a page's <head>. */
+export interface RouteMetadata {
+  title?: string;
+  description?: string;
+  favicon?: string;
+  ogTitle?: string;
+  ogDescription?: string;
+  ogImage?: string;
+}
+
 /** One crawled page's recorded evidence. */
 export interface CrawlRoute {
   /** The normalized URL of the page. */
@@ -60,10 +76,12 @@ export interface CrawlRoute {
   path: string;
   /** Document title at capture time. */
   title: string;
-  /** Local path of the desktop (1280x800) screenshot PNG. */
-  desktopScreenshot: string;
-  /** Local path of the mobile (390x844) screenshot PNG. */
-  mobileScreenshot: string;
+  /** Local path of the desktop (1280x800) screenshot PNG (null when not captured). */
+  desktopScreenshot: string | null;
+  /** Local path of the mobile (390x844) screenshot PNG (null when not captured). */
+  mobileScreenshot: string | null;
+  /** SEO / OpenGraph metadata extracted from the page head. */
+  metadata?: RouteMetadata;
   /** Accessibility tree extracted at capture time. */
   a11yTree: A11yNode;
   /** Design tokens extracted at capture time. */

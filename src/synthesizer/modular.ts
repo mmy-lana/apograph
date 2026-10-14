@@ -70,7 +70,13 @@ const SYSTEM_GUIDELINES = [
   '   and content structure faithfully.',
   '5. Reference mirrored images with their local path (/assets/<filename>) —',
   '   never their original remote URLs.',
-  '6. Every file must be complete and compile-ready — no placeholders, no TODOs,',
+  '6. The Navbar must use a sticky blurred header: className must include',
+  '   `sticky top-0 z-50 backdrop-blur bg-background/80 border-b` so content',
+  '   scrolls under a frosted header (bg-background comes from @theme).',
+  '7. Forms must include realistic HTML validation (required, type="email"),',
+  '   a success toast/banner after submit, and mock persistence via',
+  "   localStorage.setItem('apograph_submissions', ...).",
+  '8. Every file must be complete and compile-ready — no placeholders, no TODOs,',
   '   no truncation, no markdown fences inside file contents.',
 ].join('\n');
 
@@ -90,6 +96,8 @@ export function generateIndexCss(designSystem: ApographPlan['designSystem']): st
     '@import "tailwindcss";',
     '',
     '@theme {',
+    '  --color-background: #ffffff;',
+    '  --color-foreground: #171717;',
   ];
 
   const colorValues = [...new Set(Object.values(designSystem.colors))];
@@ -142,7 +150,7 @@ export function generateNavbarTemplate(appName: string, routes: PlanRoute[]): st
     '  const [open, setOpen] = useState(false);',
     '',
     '  return (',
-    '    <header className="sticky top-0 z-40 border-b border-neutral-200 bg-white/90 backdrop-blur">',
+    '    <header className="sticky top-0 z-50 border-b border-neutral-200 bg-background/80 backdrop-blur">',
     '      <nav className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6">',
     '        <Link to="/" className="text-lg font-semibold tracking-tight">',
     `          ${escapeString(appName)}`,
@@ -239,6 +247,9 @@ export function generatePageTemplate(route: PlanRoute): string {
     interactions.includes('accordion') ||
     interactions.includes('form-submit');
   if (needsState) imports.push("import { useState } from 'react';");
+  if (interactions.includes('form-submit')) {
+    imports.push("import type { FormEvent } from 'react';");
+  }
   if (interactions.includes('accordion')) imports.push("import { ChevronDown } from 'lucide-react';");
   if (interactions.includes('form-submit')) imports.push("import { Send } from 'lucide-react';");
 
@@ -250,7 +261,37 @@ export function generatePageTemplate(route: PlanRoute): string {
     state.push('  const [openItem, setOpenItem] = useState<number | null>(null);');
   }
   if (interactions.includes('form-submit')) {
-    state.push("  const [formState, setFormState] = useState<'idle' | 'sent'>('idle');");
+    state.push(
+      "  const [formState, setFormState] = useState<'idle' | 'submitting' | 'sent'>('idle');",
+      '',
+      '  const handleSubmit = (event: FormEvent<HTMLFormElement>): void => {',
+      '    event.preventDefault();',
+      '    const form = event.currentTarget;',
+      '    if (!form.reportValidity()) return;',
+      "    setFormState('submitting');",
+      '',
+      '    const data = new FormData(form);',
+      '    const submission = {',
+      "      name: String(data.get('name') ?? ''),",
+      "      email: String(data.get('email') ?? ''),",
+      "      message: String(data.get('message') ?? ''),",
+      '      submittedAt: new Date().toISOString(),',
+      '    };',
+      '',
+      '    try {',
+      "      const stored = window.localStorage.getItem('apograph_submissions');",
+      '      const existing: unknown = stored === null ? [] : JSON.parse(stored);',
+      '      const submissions = Array.isArray(existing) ? existing : [];',
+      '      submissions.push(submission);',
+      "      window.localStorage.setItem('apograph_submissions', JSON.stringify(submissions));",
+      '    } catch {',
+      '      // localStorage unavailable (private mode, etc.) — mock submit still succeeds.',
+      '    }',
+      '',
+      '    form.reset();',
+      "    setFormState('sent');",
+      '  };',
+    );
   }
 
   const sections: string[] = [];
@@ -311,14 +352,11 @@ export function generatePageTemplate(route: PlanRoute): string {
     sections.push([
       '      <form',
       '        className="mt-12 max-w-lg space-y-4"',
-      '        onSubmit={(event) => {',
-      '          event.preventDefault();',
-      "          setFormState('sent');",
-      '        }}',
+      '        onSubmit={handleSubmit}',
       '      >',
       '        <div>',
       '          <label htmlFor="name" className="block text-sm font-medium text-neutral-800">Name</label>',
-      '          <input id="name" name="name" required className="mt-1 w-full rounded-md border border-neutral-300 px-3 py-2 text-sm" />',
+      '          <input id="name" name="name" required minLength={2} className="mt-1 w-full rounded-md border border-neutral-300 px-3 py-2 text-sm" />',
       '        </div>',
       '        <div>',
       '          <label htmlFor="email" className="block text-sm font-medium text-neutral-800">Email</label>',
@@ -326,14 +364,16 @@ export function generatePageTemplate(route: PlanRoute): string {
       '        </div>',
       '        <div>',
       '          <label htmlFor="message" className="block text-sm font-medium text-neutral-800">Message</label>',
-      '          <textarea id="message" name="message" rows={4} required className="mt-1 w-full rounded-md border border-neutral-300 px-3 py-2 text-sm" />',
+      '          <textarea id="message" name="message" rows={4} required minLength={10} className="mt-1 w-full rounded-md border border-neutral-300 px-3 py-2 text-sm" />',
       '        </div>',
-      "        <button type=\"submit\" disabled={formState === 'sent'} className=\"inline-flex items-center gap-2 rounded-md bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-60\">",
+      "        <button type=\"submit\" disabled={formState === 'submitting'} className=\"inline-flex items-center gap-2 rounded-md bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-60\">",
       "          <Send className=\"h-4 w-4\" />",
-      "          {formState === 'sent' ? 'Message sent' : 'Send message'}",
+      "          {formState === 'submitting' ? 'Sending\u2026' : 'Send message'}",
       '        </button>',
       "        {formState === 'sent' ? (",
-      '          <p className="text-sm text-green-600">Thanks — your message was recorded (mock submission).</p>',
+      '          <div role="status" aria-live="polite" className="rounded-md border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">',
+      '            Thanks — your message was recorded (mock submission).',
+      '          </div>',
       '        ) : null}',
       '      </form>',
     ].join('\n'));
@@ -595,8 +635,10 @@ export async function synthesizeModularProject(
     '',
     'Emit exactly these files:',
     '1. src/components/Navbar.tsx — exported function Navbar; responsive;',
-    '   on <768px a hamburger (lucide-react Menu/X) toggles a client-side',
-    '   drawer with useState; desktop shows inline links.',
+    '   sticky blurred header (className must include "sticky top-0 z-50',
+    '   backdrop-blur bg-background/80 border-b"); on <768px a hamburger',
+    '   (lucide-react Menu/X) toggles a client-side drawer with useState;',
+    '   desktop shows inline links.',
     '2. src/components/Footer.tsx — exported function Footer; matches the',
     '   screenshot footer content and links.',
   ].join('\n');
@@ -640,8 +682,9 @@ export async function synthesizeModularProject(
       'hierarchy faithfully. Implement functional interactions:',
       '- "tabs": clickable tab list switching visible content with useState.',
       '- "accordion": expandable items toggled with useState.',
-      '- "form-submit": a form whose submit handler sets a "sent" state',
-      '  (mock submission — no network calls).',
+      '- "form-submit": a form with realistic HTML validation (required,',
+      '   type="email", minLength), a success toast/banner after submit, and',
+      "   mock persistence via localStorage.setItem('apograph_submissions', ...)",
       '- "mobile-menu": handled by Navbar; ignore here.',
       '- "none": static content only.',
       '',

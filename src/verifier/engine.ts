@@ -31,7 +31,7 @@ import type {
   VerificationReport,
   VisualCheck,
 } from './report.js';
-import type { EvidenceManifest } from '../types.js';
+import type { EvidenceManifest, ViewportMode } from '../types.js';
 import type { ApographPlan, PlanRoute } from '../plan/schema.js';
 import { validatePlan } from '../plan/generator.js';
 
@@ -407,6 +407,7 @@ async function waitForMount(page: Page): Promise<void> {
  * Tier 3: captures desktop and mobile screenshots of every route on the
  * running site, diffs them against the evidence bundle's reference
  * screenshots, and writes diff PNGs to `<outputDir>/.apograph-verification/`.
+ * Only the viewports selected by `viewport` are captured and compared.
  * Routes without a reference screenshot are recorded as skipped.
  */
 export async function verifyVisuals(
@@ -414,8 +415,12 @@ export async function verifyVisuals(
   routes: VisualRouteInput[],
   outputDir: string,
   visualThreshold: number = DEFAULT_VISUAL_THRESHOLD,
+  viewportMode: ViewportMode = 'both',
 ): Promise<VisualCheck[]> {
   if (routes.length === 0) return [];
+
+  const compareDesktop = viewportMode !== 'mobile';
+  const compareMobile = viewportMode !== 'desktop';
 
   const projectDir = resolve(outputDir);
   const diffDir = join(projectDir, '.apograph-verification');
@@ -440,8 +445,8 @@ export async function verifyVisuals(
         await waitForMount(page);
       } catch (cause) {
         const reason = cause instanceof Error ? cause.message : String(cause);
-        checks.push(
-          {
+        if (compareDesktop) {
+          checks.push({
             path: route.path,
             viewport: 'desktop',
             referenceScreenshot: route.referenceDesktop,
@@ -450,8 +455,10 @@ export async function verifyVisuals(
             thresholdPercent,
             passed: null,
             note: `navigation failed: ${reason}`,
-          },
-          {
+          });
+        }
+        if (compareMobile) {
+          checks.push({
             path: route.path,
             viewport: 'mobile',
             referenceScreenshot: route.referenceMobile,
@@ -460,8 +467,8 @@ export async function verifyVisuals(
             thresholdPercent,
             passed: null,
             note: `navigation failed: ${reason}`,
-          },
-        );
+          });
+        }
         continue;
       }
 
@@ -469,10 +476,22 @@ export async function verifyVisuals(
         kind: 'desktop' | 'mobile';
         reference: string | null;
         size: { width: number; height: number };
-      }> = [
-        { kind: 'desktop', reference: route.referenceDesktop, size: { ...DESKTOP_VIEWPORT } },
-        { kind: 'mobile', reference: route.referenceMobile, size: { ...MOBILE_VIEWPORT } },
-      ];
+      }> = [];
+
+      if (compareDesktop) {
+        viewports.push({
+          kind: 'desktop',
+          reference: route.referenceDesktop,
+          size: { ...DESKTOP_VIEWPORT },
+        });
+      }
+      if (compareMobile) {
+        viewports.push({
+          kind: 'mobile',
+          reference: route.referenceMobile,
+          size: { ...MOBILE_VIEWPORT },
+        });
+      }
 
       for (const viewport of viewports) {
         const diffPath = join(diffDir, `${slug}-${viewport.kind}-diff.png`);
@@ -547,6 +566,8 @@ export interface VerificationOptions {
   evidenceDir: string;
   /** Visual mismatch threshold as a fraction (default 0.15 = 15%). */
   visualThreshold?: number;
+  /** Which viewports to compare visually. Defaults to `both`. */
+  viewport?: ViewportMode;
 }
 
 /** True when a file is readable. */
@@ -623,8 +644,14 @@ async function buildRouteInputs(
       if (plan !== null && !included.some((r) => r.path === route.path)) continue;
       visualRoutes.push({
         path: route.path,
-        referenceDesktop: await resolveEvidencePath(route.desktopScreenshot, evidenceDir),
-        referenceMobile: await resolveEvidencePath(route.mobileScreenshot, evidenceDir),
+        referenceDesktop:
+          route.desktopScreenshot !== null
+            ? await resolveEvidencePath(route.desktopScreenshot, evidenceDir)
+            : null,
+        referenceMobile:
+          route.mobileScreenshot !== null
+            ? await resolveEvidencePath(route.mobileScreenshot, evidenceDir)
+            : null,
       });
     }
     return { routePaths: visualRoutes.map((route) => route.path), visualRoutes };
@@ -652,6 +679,7 @@ export async function runVerification(
   const outputDir = resolve(options.outputDir);
   const evidenceDir = resolve(options.evidenceDir);
   const visualThreshold = options.visualThreshold ?? DEFAULT_VISUAL_THRESHOLD;
+  const viewportMode: ViewportMode = options.viewport ?? 'both';
 
   const diagnostics: string[] = [];
 
@@ -703,7 +731,7 @@ export async function runVerification(
         );
       }
 
-      visuals = await verifyVisuals(site, visualRoutes, outputDir, visualThreshold);
+      visuals = await verifyVisuals(site, visualRoutes, outputDir, visualThreshold, viewportMode);
       const failingVisuals = visuals.filter((visual) => visual.passed === false);
       const skippedVisuals = visuals.filter((visual) => visual.passed === null);
       if (failingVisuals.length > 0) {
