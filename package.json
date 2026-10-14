@@ -1,9 +1,30 @@
 {
   "name": "apograph-agents",
   "version": "0.1.0",
-  "description": "Industrial cleanroom reverse-engineering and code synthesis tool",
+  "description": "Industrial cleanroom website recreation engine — headless multi-page crawl, vision-driven React synthesis, and 3-tier verification",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mmy-lana/apograph.git"
+  },
+  "homepage": "https://github.com/mmy-lana/apograph#readme",
+  "bugs": {
+    "url": "https://github.com/mmy-lana/apograph/issues"
+  },
+  "keywords": [
+    "website-cloner",
+    "website-recreation",
+    "ai-agent",
+    "mcp",
+    "mcp-server",
+    "playwright",
+    "react19",
+    "tailwind-v4",
+    "vision-llm",
+    "ollama",
+    "cleanroom"
+  ],
   "files": [
     "dist",
     "README.md",
@@ -19,7 +40,10 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc"
+    "build": "tsc",
+    "bump:patch": "pnpm typecheck && pnpm build && npm version patch",
+    "bump:minor": "pnpm typecheck && pnpm build && npm version minor",
+    "bump:major": "pnpm typecheck && pnpm build && npm version major"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^1.2.12",
@@ -28,21 +52,16 @@
     "@modelcontextprotocol/sdk": "^1.12.0",
     "ai": "^4.3.16",
     "apograph-agents": "link:",
-    "better-sqlite3": "^11.10.0",
     "commander": "^13.1.0",
     "css-tree": "^3.1.0",
-    "drizzle-orm": "^0.44.2",
     "pixelmatch": "^8.0.0",
     "playwright": "^1.52.0",
     "pngjs": "^7.0.0",
-    "webcrack": "^2.14.0",
     "zod": "^3.24.4"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "@types/css-tree": "^2.3.10",
     "@types/node": "^22.15.21",
-    "@types/pixelmatch": "^7.1.0",
     "@types/pngjs": "^6.0.5",
     "typescript": "^5.8.3"
   }

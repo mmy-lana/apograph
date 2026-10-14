@@ -21,6 +21,8 @@ import { copyFile, mkdir, readdir } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import type { AssetEntry, CrawlRoute, EvidenceManifest, ProjectFile } from '../types.js';
 import type { ApographPlan, PlanRoute } from '../plan/schema.js';
+import type { ProgressHandle } from '../utils/progress.js';
+import { NULL_PROGRESS } from '../utils/progress.js';
 import {
   formatA11yTreeForVisionPrompt,
   formatAssetMapForPrompt,
@@ -34,12 +36,30 @@ import type { ScreenshotImage } from './vision.js';
 // Public contract
 // ---------------------------------------------------------------------------
 
+/** Optional synthesis callbacks (terminal integration, resumption). */
+export interface ModularSynthesisCallbacks {
+  /**
+   * Starts a live progress spinner for a stage label; must return a handle
+   * that the stage stops when it completes.
+   */
+  startProgress?: (label: string) => ProgressHandle;
+  /**
+   * Route paths to skip because their page files already exist on disk
+   * (checkpoint resumption).
+   */
+  skipRoutePaths?: string[];
+  /** Invoked after a route page has been synthesized (resumption tracking). */
+  onRouteCompleted?: (path: string) => void;
+}
+
 /** Input for {@link synthesizeModularProject}. */
 export interface ModularSynthesisInput {
   plan: ApographPlan;
   manifest: EvidenceManifest;
   /** Evidence bundle directory (screenshots + mirrored assets). */
   evidenceDir: string;
+  /** Terminal progress + resumption hooks. */
+  callbacks?: ModularSynthesisCallbacks;
 }
 
 /** Result of a modular synthesis run. */
@@ -49,6 +69,10 @@ export interface ModularSynthesisResult {
   visionStages: string[];
   /** Stage labels completed via deterministic fallback templates. */
   fallbackStages: string[];
+  /** Route paths whose page files this run synthesized. */
+  synthesizedRoutePaths: string[];
+  /** Route paths skipped because they already existed (resumption). */
+  skippedRoutePaths: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -558,23 +582,43 @@ function manifestRouteFor(planRoute: PlanRoute, manifest: EvidenceManifest): Cra
   return manifest.routes.find((route) => route.path === planRoute.path);
 }
 
+/** Matches a `.map(...)` call over an inline array with no object literals. */
+const INLINE_EMPTY_ARRAY_MAP_RE = /\[\s*(?:\/\/[^\n]*\n\s*)*\]\s*\.map\(/;
+
+/**
+ * True when an LLM-generated Navbar looks compile-viable: exports `Navbar`
+ * and does not map over an untyped inline empty array (`never[]` source of
+ * `Property 'path' does not exist on type 'never'` build failures).
+ */
+function isNavbarViable(content: string): boolean {
+  if (!content.includes('export function Navbar')) return false;
+  if (INLINE_EMPTY_ARRAY_MAP_RE.test(content)) return false;
+  return true;
+}
+
 /** Runs one vision LLM stage, falling back to deterministic output on failure. */
 async function runVisionStage(
   stage: string,
+  label: string,
   text: string,
   screenshots: ScreenshotImage[],
   fallback: () => ProjectFile[],
   result: ModularSynthesisResult,
+  startProgressFn?: (label: string) => ProgressHandle,
 ): Promise<ProjectFile[]> {
+  const progress = startProgressFn ? startProgressFn(label) : null;
+
   try {
     const files = await generateFilesWithVision(text, SYSTEM_GUIDELINES, screenshots);
     if (files.length === 0) throw new Error('model returned no files');
     result.visionStages.push(stage);
+    progress?.stop('Done');
     return files;
   } catch (cause) {
     const reason = cause instanceof Error ? cause.message : String(cause);
     console.warn(`[apograph] ${stage}: vision synthesis unavailable (${reason}); using deterministic template.`);
     result.fallbackStages.push(stage);
+    progress?.stop('Fallback');
     return fallback();
   }
 }
@@ -593,11 +637,15 @@ export async function synthesizeModularProject(
 ): Promise<ModularSynthesisResult> {
   const { plan, manifest, evidenceDir } = input;
   const included = plan.routes.filter((route) => route.included);
+  const callbacks = input.callbacks;
+  const skipPaths = new Set(callbacks?.skipRoutePaths ?? []);
 
   const result: ModularSynthesisResult = {
     files: [],
     visionStages: [],
     fallbackStages: [],
+    synthesizedRoutePaths: [],
+    skippedRoutePaths: [],
   };
 
   // --- Stage 1: design tokens -> src/index.css (deterministic) -----------
@@ -639,12 +687,18 @@ export async function synthesizeModularProject(
     '   backdrop-blur bg-background/80 border-b"); on <768px a hamburger',
     '   (lucide-react Menu/X) toggles a client-side drawer with useState;',
     '   desktop shows inline links.',
+    '   CRITICAL: declare the nav link list with an explicit type —',
+    '   `const NAV_LINKS: Array<{ to: string; label: string }> = [...]` —',
+    '   and NEVER map over an inline empty array `[].map(...)`: TypeScript',
+    '   infers `never[]` and the build fails. If there are no extra links,',
+    '   render no list at all.',
     '2. src/components/Footer.tsx — exported function Footer; matches the',
     '   screenshot footer content and links.',
   ].join('\n');
 
   const layoutFiles = await runVisionStage(
     'stage-2: shared layout',
+    'Synthesizing Navbar and Footer via local model',
     layoutPrompt,
     layoutScreenshots,
     () => [
@@ -652,11 +706,56 @@ export async function synthesizeModularProject(
       { path: 'src/components/Footer.tsx', content: generateFooterTemplate(plan.appName, included) },
     ],
     result,
+    callbacks?.startProgress ?? (() => NULL_PROGRESS),
   );
+
+  // Guarantee Footer.tsx: local models sometimes emit only Navbar.tsx, which
+  // breaks App.tsx's import. Always ensure the deterministic footer exists.
+  const footerIndex = layoutFiles.findIndex(
+    (file) => file.path === 'src/components/Footer.tsx',
+  );
+  if (footerIndex === -1) {
+    layoutFiles.push({
+      path: 'src/components/Footer.tsx',
+      content: generateFooterTemplate(plan.appName, included),
+    });
+  }
+
+  // Guarantee a viable Navbar: local models occasionally emit compile-breaking
+  // navbars (missing export, or `.map()` over an inline empty array, which
+  // TypeScript infers as `never[]`). Replace those with the deterministic
+  // template so App.tsx's import always compiles.
+  const navbarIndex = layoutFiles.findIndex(
+    (file) => file.path === 'src/components/Navbar.tsx',
+  );
+  if (navbarIndex !== -1) {
+    const navbar = layoutFiles[navbarIndex];
+    if (navbar !== undefined && !isNavbarViable(navbar.content)) {
+      console.warn(
+        '[apograph] stage-2: LLM Navbar failed the viability check ' +
+          '(missing export or untyped empty `.map()` list); using the deterministic template.',
+      );
+      layoutFiles[navbarIndex] = {
+        path: 'src/components/Navbar.tsx',
+        content: generateNavbarTemplate(plan.appName, included),
+      };
+    }
+  } else {
+    layoutFiles.push({
+      path: 'src/components/Navbar.tsx',
+      content: generateNavbarTemplate(plan.appName, included),
+    });
+  }
 
   // --- Stage 3: route pages -----------------------------------------------
   const pageFiles: ProjectFile[] = [];
   for (const route of included) {
+    // Resumption: skip routes whose page files already exist on disk.
+    if (skipPaths.has(route.path)) {
+      result.skippedRoutePaths.push(route.path);
+      continue;
+    }
+
     const manifestRoute = manifestRouteFor(route, manifest);
     const screenshots = manifestRoute
       ? await loadRouteScreenshots(manifestRoute, evidenceDir)
@@ -695,6 +794,7 @@ export async function synthesizeModularProject(
 
     const files = await runVisionStage(
       `stage-3: route ${route.path}`,
+      `Synthesizing page ${route.path}`,
       pagePrompt,
       screenshots,
       () => [
@@ -704,9 +804,12 @@ export async function synthesizeModularProject(
         },
       ],
       result,
+      callbacks?.startProgress ?? (() => NULL_PROGRESS),
     );
 
     pageFiles.push(...files);
+    result.synthesizedRoutePaths.push(route.path);
+    callbacks?.onRouteCompleted?.(route.path);
   }
 
   // --- Stage 4: router assembly (deterministic) ----------------------------

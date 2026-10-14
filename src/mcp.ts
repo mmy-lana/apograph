@@ -20,26 +20,11 @@ import type {
   RecordedRequest,
   DecompiledBundle,
 } from './types.js';
-import { launchHeadlessChromium, crawlEvidence } from './crawler/engine.js';
-import { NetworkCollector } from './harvester/network.js';
-import { captureDOMSnapshot } from './harvester/dom.js';
-import { harvestAndDecompileScripts } from './legacy/decompile/bundle.js';
-import { clusterEndpoints, enrichRequestsWithRoutePatterns } from './legacy/infer/routes.js';
-import { inferAllSchemas } from './legacy/infer/schema.js';
-import { synthesizeFrontend } from './synthesizer/frontend.js';
-import { synthesizeBackend, formatSchemasForPrompt } from './legacy/synthesizer/backend.js';
+import { crawlEvidence } from './crawler/engine.js';
+import { createPlanFromEvidence } from './plan/generator.js';
+import { synthesizeModularProject, copyMirroredAssets } from './synthesizer/modular.js';
 import { emitProject } from './emitter/scaffold.js';
 import { runVerification } from './verifier/engine.js';
-
-// ---------------------------------------------------------------------------
-// Shared pipeline internals (mirrors src/cli.ts)
-// ---------------------------------------------------------------------------
-
-interface HarvestOutcome {
-  session: HarvestedSession;
-  snapshot: DOMSnapshot;
-  bundles: DecompiledBundle[];
-}
 
 /** Derives an app name from a URL's hostname. */
 function appNameFromUrl(url: string): string {
@@ -50,99 +35,6 @@ function appNameFromUrl(url: string): string {
   } catch {
     return 'apograph-app';
   }
-}
-
-/** Fetches the raw source text of every external script on the page. */
-async function collectScriptSources(page: Page): Promise<string[]> {
-  const srcs = await page.$$eval('script[src]', (els) =>
-    els.map((el) => (el as HTMLScriptElement).src),
-  );
-
-  const sources: string[] = [];
-  for (const src of srcs) {
-    try {
-      const text = await page.evaluate(
-        async (scriptUrl: string): Promise<string | null> => {
-          const response = await fetch(scriptUrl);
-          return response.ok ? response.text() : null;
-        },
-        src,
-      );
-      if (text !== null && text.length > 0) sources.push(text);
-    } catch {
-      // Unreachable script (CORS-rejected, 404, etc.) — skip it.
-    }
-  }
-  return sources;
-}
-
-/** Runs the capture half of the pipeline. */
-async function runHarvest(url: string): Promise<HarvestOutcome> {
-  const browser = await launchHeadlessChromium();
-  const page = await browser.newPage();
-
-  const collector = new NetworkCollector();
-  collector.attach(page);
-
-  await page.goto(url, { waitUntil: 'networkidle' });
-
-  const scriptSources = await collectScriptSources(page);
-  const snapshot = await captureDOMSnapshot(page, url);
-
-  const requests: RecordedRequest[] = enrichRequestsWithRoutePatterns(
-    collector.stop(page),
-  );
-
-  await browser.close();
-
-  const session: HarvestedSession = {
-    id: randomUUID(),
-    targetUrl: url,
-    requests,
-    socketFrames: [],
-    events: [],
-    scripts: scriptSources,
-  };
-
-  const bundles = await harvestAndDecompileScripts(scriptSources);
-
-  return { session, snapshot, bundles };
-}
-
-/** Persists a harvest outcome to disk. */
-async function persistHarvest(
-  dir: string,
-  outcome: HarvestOutcome,
-): Promise<void> {
-  const absolute = resolve(dir);
-  await mkdir(absolute, { recursive: true });
-
-  await writeFile(
-    join(absolute, 'session.json'),
-    JSON.stringify(outcome.session, null, 2),
-    'utf8',
-  );
-  await writeFile(
-    join(absolute, 'snapshot.json'),
-    JSON.stringify(outcome.snapshot, null, 2),
-    'utf8',
-  );
-}
-
-/** Formats a harvest outcome into a summary stats string. */
-function harvestSummary(outcome: HarvestOutcome): string {
-  return [
-    `Harvest complete for ${outcome.session.targetUrl}`,
-    `- Requests captured: ${outcome.session.requests.length}`,
-    `- Script sources: ${outcome.session.scripts.length}`,
-    `- Unpacked bundles: ${outcome.bundles.length}`,
-    `- Unpacked modules: ${outcome.bundles.reduce((n, b) => n + b.modules.length, 0)}`,
-    `- A11y root role: ${outcome.snapshot.a11yTree.role}`,
-    `- Design tokens: ${Object.keys(outcome.snapshot.tokens.colors).length} colors, ` +
-      `${outcome.snapshot.tokens.fonts.length} fonts, ` +
-      `${outcome.snapshot.tokens.spacing.length} spacing, ` +
-      `${outcome.snapshot.tokens.radii.length} radii`,
-  ].join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -200,37 +92,40 @@ server.tool(
 
 server.tool(
   'apograph_clone',
-  'Autonomously launch a headless Chromium session, harvest network/DOM, infer schemas, and synthesize a self-hosted full-stack Docker repository.',
+  'Autonomously crawl a website, derive a plan, synthesize a standalone React 19 + Tailwind CSS frontend, and verify it.',
   {
     targetUrl: z.string().url(),
     outDir: z.string().optional(),
+    maxPages: z.number().int().min(1).optional(),
     verify: z.boolean().optional().default(true),
   },
-  async ({ targetUrl, outDir, verify }) => {
+  async ({ targetUrl, outDir, maxPages, verify }) => {
     const outputDir = outDir ?? join('./output', appNameFromUrl(targetUrl));
-    const appName = appNameFromUrl(targetUrl);
+    const evidenceDir = '.apograph/evidence';
 
-    const outcome = await runHarvest(targetUrl);
-    await persistHarvest(outputDir, outcome);
+    const manifest = await crawlEvidence({
+      rootUrl: targetUrl,
+      evidenceDir,
+      maxPages: maxPages ?? 10,
+    });
 
-    const clusters = clusterEndpoints(outcome.session.requests);
-    const schemas = inferAllSchemas(outcome.session.requests, clusters);
+    const plan = createPlanFromEvidence(manifest);
+    plan.approved = true;
+    plan.approvedAt = new Date().toISOString();
 
-    const [frontendFiles, backendFiles] = await Promise.all([
-      synthesizeFrontend([outcome.snapshot], outcome.bundles),
-      synthesizeBackend(schemas),
-    ]);
+    const result = await synthesizeModularProject({ plan, manifest, evidenceDir });
 
-    const { writtenFiles, projectDir } = await emitProject(
-      [...frontendFiles, ...backendFiles],
-      outputDir,
-      appName,
-    );
+    const { writtenFiles, projectDir } = await emitProject(result.files, outputDir, plan.appName, {
+      force: true,
+      metadata: manifest.routes[0]?.metadata,
+    });
+
+    await copyMirroredAssets(join(evidenceDir, 'assets'), projectDir);
 
     const lines = [
       `Synthesized ${writtenFiles.length} files to ${projectDir}`,
-      harvestSummary(outcome),
-      `Endpoint clusters: ${clusters.length}; contracts inferred: ${schemas.length}`,
+      `Pages crawled: ${manifest.stats.pagesCrawled}`,
+      `Stages via vision LLM: ${result.visionStages.length}, fallback: ${result.fallbackStages.length}`,
       'Written files:',
       ...writtenFiles.map((file) => `- ${file}`),
     ];
@@ -238,12 +133,12 @@ server.tool(
     if (verify) {
       const report = await runVerification({
         outputDir: projectDir,
-        evidenceDir: '.apograph/evidence',
+        evidenceDir,
       });
       lines.push(
         report.overall.passed
           ? '3-tier verification PASSED (build, routes, visuals).'
-          : '3-tier verification FAILED — see the gaps below.',
+          : '3-tier verification FAILED — see diagnostics below.',
       );
       for (const diagnostic of report.diagnostics) {
         lines.push(`- ${diagnostic}`);
@@ -251,66 +146,6 @@ server.tool(
     }
 
     lines.push('Boot the frontend with `pnpm install && pnpm dev`.');
-
-    return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
-  },
-);
-
-// ---------------------------------------------------------------------------
-// Tool: apograph_harvest
-// ---------------------------------------------------------------------------
-
-server.tool(
-  'apograph_harvest',
-  'Harvest network traffic, client scripts, and DOM accessibility tree for a target URL using headless Chromium.',
-  {
-    targetUrl: z.string().url(),
-    outDir: z.string(),
-  },
-  async ({ targetUrl, outDir }) => {
-    const outcome = await runHarvest(targetUrl);
-    await persistHarvest(outDir, outcome);
-
-    const lines = [
-      harvestSummary(outcome),
-      `Wrote session.json and snapshot.json to ${resolve(outDir)}`,
-    ];
-
-    return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
-  },
-);
-
-// ---------------------------------------------------------------------------
-// Tool: apograph_infer_contracts
-// ---------------------------------------------------------------------------
-
-server.tool(
-  'apograph_infer_contracts',
-  'Read a harvested session from disk and deterministically deduce parameterized routes, Zod schemas, and SQLite tables.',
-  {
-    harvestDir: z.string(),
-  },
-  async ({ harvestDir }) => {
-    const sessionPath = join(resolve(harvestDir), 'session.json');
-    const session = JSON.parse(
-      await readFile(sessionPath, 'utf8'),
-    ) as HarvestedSession;
-
-    const clusters = clusterEndpoints(session.requests);
-    const schemas = inferAllSchemas(session.requests, clusters);
-
-    const lines = [
-      `Inferred contracts for ${session.targetUrl}`,
-      `Endpoint clusters (${clusters.length}):`,
-      ...clusters.map(
-        (cluster) =>
-          `- ${cluster.pattern} [${cluster.methods.join(', ')}] ` +
-            `(${cluster.sampleUrls.length} sample URLs)`,
-      ),
-      '',
-      'API contracts:',
-      formatSchemasForPrompt(schemas),
-    ];
 
     return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
   },

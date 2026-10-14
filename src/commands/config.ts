@@ -19,7 +19,7 @@ export type ConfigProvider = 'ollama' | 'openai' | 'anthropic' | 'gateway';
 /** The persisted configuration shape. */
 export interface ApographConfig {
   provider: ConfigProvider;
-  /** Model identifier (e.g. `gpt-4o`, `qwen2.5-coder:7b-instruct`). */
+  /** Model identifier (e.g. `gpt-4o`, `apograph-qwen35:9b-8k`). */
   model?: string;
   /** API key for the provider (not needed for local Ollama). */
   apiKey?: string;
@@ -34,7 +34,7 @@ export function configFilePath(): string {
 
 /** Default model per provider, used as prompt placeholder text. */
 const PROVIDER_DEFAULTS: Record<ConfigProvider, string> = {
-  ollama: 'qwen2.5-coder:7b-instruct',
+  ollama: 'apograph-qwen35:9b-8k',
   openai: 'gpt-4o',
   anthropic: 'claude-3-7-sonnet-latest',
   gateway: 'gpt-4o',

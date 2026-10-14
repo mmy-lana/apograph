@@ -99,7 +99,7 @@ async function checkLlm(): Promise<CheckResult> {
       detail: reason,
       fix:
         provider === 'local'
-          ? 'Start Ollama (`ollama serve`) and pull the fallback model (`ollama pull qwen2.5-coder:7b-instruct`), or export OPENAI_API_KEY / ANTHROPIC_API_KEY.'
+          ? 'Start Ollama (`ollama serve`) and pull the fallback model (`ollama pull apograph-qwen35:9b-8k`), or export OPENAI_API_KEY / ANTHROPIC_API_KEY.'
           : 'Check your API key and network access for the configured provider, or point APOGRAPH_BASE_URL / APOGRAPH_API_KEY at a reachable gateway.',
     };
   }
@@ -124,7 +124,7 @@ async function checkOllama(): Promise<CheckResult> {
     pass: false,
     detail: 'no response from /api/tags',
     fix:
-      'Optional local fallback — install from https://ollama.com, then run `ollama serve` and `ollama pull qwen2.5-coder:7b-instruct`.',
+      'Optional local fallback — install from https://ollama.com, then run `ollama serve` and `ollama pull apograph-qwen35:9b-8k`.',
   };
 }
 

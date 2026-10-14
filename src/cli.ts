@@ -14,7 +14,8 @@
  */
 
 import { Command } from 'commander';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import * as p from '@clack/prompts';
 import type { CrawlScope, EvidenceManifest, ViewportMode } from './types.js';
@@ -28,6 +29,15 @@ import { printVerificationSummary, writeVerificationReport } from './verifier/re
 import { runDoctor } from './commands/doctor.js';
 import { runSetup } from './commands/setup.js';
 import { runConfigCommand } from './commands/config.js';
+import { runStatusCommand } from './commands/status.js';
+import { startProgress } from './utils/progress.js';
+import type { ProgressHandle } from './utils/progress.js';
+import {
+  loadCheckpoint,
+  clearCheckpoint,
+  setupInterruptTrap,
+} from './utils/interrupt.js';
+import type { CloneCheckpoint, CloneStage } from './utils/interrupt.js';
 import {
   createPlanFromEvidence,
   loadEvidenceManifest,
@@ -202,6 +212,21 @@ interface ModularSynthesisOptions {
   interactive: boolean;
   verify: boolean;
   viewport: ViewportMode;
+  /** Route paths to skip because their page files already exist. */
+  skipRoutePaths?: string[];
+  /** Receives route paths as their pages finish synthesizing. */
+  onRouteCompleted?: (path: string) => void;
+}
+
+/** Finds included routes whose page files already exist under `outDir`. */
+function existingPagePaths(plan: ApographPlan, outDir: string): string[] {
+  const existing: string[] = [];
+  for (const route of plan.routes) {
+    if (!route.included) continue;
+    const pageFile = join(resolve(outDir), 'src', 'pages', `${route.componentName}.tsx`);
+    if (existsSync(pageFile)) existing.push(route.path);
+  }
+  return existing;
 }
 
 /** Runs the modular synthesis -> emit -> asset copy -> verify half of the pipeline. */
@@ -218,10 +243,22 @@ async function runModularSynthesis(
     `→ Synthesizing project for ${included.length} route(s) ` +
       '(4-stage modular pipeline)...',
   );
-  const result = await synthesizeModularProject({ plan, manifest, evidenceDir });
+  const result = await synthesizeModularProject({
+    plan,
+    manifest,
+    evidenceDir,
+    callbacks: {
+      startProgress: startProgress,
+      skipRoutePaths: options.skipRoutePaths,
+      onRouteCompleted: options.onRouteCompleted,
+    },
+  });
   console.log(
     `→ Synthesis: ${result.visionStages.length} stage(s) via vision LLM, ` +
-      `${result.fallbackStages.length} via deterministic fallback.`,
+      `${result.fallbackStages.length} via deterministic fallback.` +
+      (result.skippedRoutePaths.length > 0
+        ? ` Skipped ${result.skippedRoutePaths.length} already-synthesized route(s).`
+        : ''),
   );
 
   console.log(`→ Emitting project to ${resolve(outDir)}...`);
@@ -238,14 +275,17 @@ async function runModularSynthesis(
   }
 
   if (options.verify) {
-    console.log(
-      `→ Running 3-tier verification (build, routes, ${options.viewport} visuals)...`,
-    );
-    const report = await runVerification({
-      outputDir: projectDir,
-      evidenceDir,
-      viewport: options.viewport,
-    });
+    const progress = startProgress('Running 3-tier verification');
+    let report;
+    try {
+      report = await runVerification({
+        outputDir: projectDir,
+        evidenceDir,
+        viewport: options.viewport,
+      });
+    } finally {
+      progress.stop('Verification finished');
+    }
     printVerificationSummary(report);
     const reportPath = await writeVerificationReport(projectDir, report);
     console.log(`→ Verification report: ${reportPath}`);
@@ -258,6 +298,167 @@ async function runModularSynthesis(
   console.log('✔ Done.');
   console.log(`  Output:  ${projectDir}`);
   console.log('  Boot it: cd into the project and run pnpm install && pnpm dev');
+}
+
+// ---------------------------------------------------------------------------
+// Clone pipeline (shared by `clone` and `resume`)
+// ---------------------------------------------------------------------------
+
+/** Options for the shared clone pipeline. */
+interface ClonePipelineOptions {
+  url: string;
+  outDir: string;
+  evidenceDir: string;
+  viewport: ViewportMode;
+  requestedScope: CrawlScope | undefined;
+  maxDepth: number;
+  maxPages: number;
+  yes: boolean;
+  force: boolean;
+  verify: boolean;
+  interactive: boolean;
+  /** Checkpoint to resume from (skips crawl + approval gate). */
+  resumeFrom?: CloneCheckpoint;
+}
+
+/**
+ * Runs the full clone pipeline: crawl → plan (approval gate) → modular
+ * synthesize → emit → verify, with a live spinner, a SIGINT checkpoint trap,
+ * and checkpoint-resumable stages.
+ */
+async function runClonePipeline(options: ClonePipelineOptions): Promise<void> {
+  const {
+    url,
+    outDir,
+    evidenceDir,
+    viewport,
+    requestedScope,
+    maxDepth,
+    maxPages,
+    yes,
+    force,
+    verify,
+    interactive,
+    resumeFrom,
+  } = options;
+
+  // --- Spinner holder (the interrupt trap stops/restarts this) ------------
+  let activeSpinner: ProgressHandle | null = null;
+  let activeLabel: string | null = null;
+
+  const stopSpinner = (): void => {
+    activeSpinner?.stop('Interrupted');
+    activeSpinner = null;
+  };
+  const restartSpinner = (): void => {
+    if (activeLabel !== null) activeSpinner = startProgress(activeLabel);
+  };
+
+  // --- Checkpoint state ----------------------------------------------------
+  let stage: CloneStage = 'crawl';
+  const completedRoutePaths = new Set<string>(resumeFrom?.completedRoutePaths ?? []);
+
+  const disposeTrap = setupInterruptTrap({
+    workingDir: '.',
+    interactive,
+    stopSpinner,
+    restartSpinner,
+    checkpoint: (): CloneCheckpoint => ({
+      targetUrl: url,
+      stage,
+      savedAt: new Date().toISOString(),
+      evidenceDir,
+      outDir,
+      viewport,
+      completedRoutePaths: [...completedRoutePaths],
+    }),
+  });
+
+  try {
+    // --- Step 1: headless evidence crawl (scope-resolved) ------------------
+    let manifest: EvidenceManifest;
+
+    const hasExistingEvidence = await manifestHasRoutes(evidenceDir);
+    if (resumeFrom !== undefined && hasExistingEvidence) {
+      console.log('→ Resuming: evidence bundle already crawled — skipping crawl.');
+      manifest = await loadEvidenceManifest(evidenceDir);
+    } else {
+      const { scope, maxPagesCap } = await resolveCrawlScope(url, requestedScope, interactive);
+      console.log(
+        `→ Crawling ${url} with headless Chromium (scope: ${scope}, viewport: ${viewport})...`,
+      );
+      activeLabel = 'Crawl in progress';
+      activeSpinner = startProgress(activeLabel);
+      manifest = await crawlEvidence({
+        rootUrl: url,
+        evidenceDir,
+        maxDepth,
+        maxPages: maxPagesCap ?? maxPages,
+        viewport,
+        scope,
+      });
+      activeSpinner.stop(`Crawled ${manifest.stats.pagesCrawled} page(s)`);
+      activeSpinner = null;
+      activeLabel = null;
+    }
+
+    // --- Step 2: plan generation + approval gate ---------------------------
+    stage = 'plan';
+    let approved: ApographPlan;
+
+    if (resumeFrom !== undefined) {
+      console.log('→ Resuming: plan was approved in the previous run — auto-approving.');
+      approved = createPlanFromEvidence(manifest);
+      approved.approved = true;
+      approved.approvedAt = new Date().toISOString();
+      await writePlanFile(join(evidenceDir, PLAN_FILENAME), approved);
+    } else {
+      const plan = createPlanFromEvidence(manifest);
+      const planPath = join(evidenceDir, PLAN_FILENAME);
+      await writePlanFile(planPath, plan);
+      console.log(`→ Unapproved plan written to ${resolve(planPath)}`);
+
+      try {
+        approved = await runApprovalGate(planPath, { nonInteractive: yes });
+      } catch (cause) {
+        if (cause instanceof ApprovalCancelledError) {
+          console.error('✖ Clone aborted: the plan was not approved.');
+          process.exitCode = 1;
+          return;
+        }
+        throw cause;
+      }
+    }
+
+    // --- Steps 3–5: modular synthesis + emission + verification ------------
+    stage = 'synthesize';
+    await runModularSynthesis(approved, manifest, evidenceDir, outDir, {
+      // A resumed run must merge — forcing would delete already-synthesized
+      // pages that App.tsx imports.
+      force: resumeFrom !== undefined ? false : force,
+      interactive,
+      verify,
+      viewport,
+      skipRoutePaths: existingPagePaths(approved, outDir),
+      onRouteCompleted: (path) => {
+        completedRoutePaths.add(path);
+      },
+    });
+  } finally {
+    disposeTrap();
+  }
+
+  await clearCheckpoint('.');
+}
+
+/** True when the evidence manifest in `dir` exists and has crawled routes. */
+async function manifestHasRoutes(evidenceDir: string): Promise<boolean> {
+  try {
+    const manifest = await loadEvidenceManifest(evidenceDir);
+    return manifest.routes.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -361,14 +562,20 @@ program
       console.log(`→ Scope: ${scope}.`);
     }
 
-    const manifest = await crawlEvidence({
-      rootUrl: url,
-      evidenceDir: options.evidence,
-      maxDepth: parseNumber(options.maxDepth, 2),
-      maxPages: maxPagesCap ?? parseNumber(options.maxPages, 10),
-      viewport,
-      scope,
-    });
+    const progress = startProgress('Crawl in progress');
+    let manifest;
+    try {
+      manifest = await crawlEvidence({
+        rootUrl: url,
+        evidenceDir: options.evidence,
+        maxDepth: parseNumber(options.maxDepth, 2),
+        maxPages: maxPagesCap ?? parseNumber(options.maxPages, 10),
+        viewport,
+        scope,
+      });
+    } finally {
+      progress.stop('Crawl finished');
+    }
 
     console.log('');
     console.log('✔ Crawl complete.');
@@ -393,48 +600,88 @@ program
   .option('--force', 'overwrite the output directory completely instead of merging')
   .option('--no-verify', 'skip the 3-tier verification pass')
   .action(async (url: string, options: CloneOptions) => {
-    const outDir = options.out ?? outDirFromUrl(url);
     const viewport = parseViewportOption(options.viewport);
-    const requestedScope = parseScopeOption(options.scope);
     const interactive = isInteractive(options.yes);
 
-    // Step 1: headless evidence crawl (scope-resolved).
-    const { scope, maxPagesCap } = await resolveCrawlScope(url, requestedScope, interactive);
-    console.log(`→ Crawling ${url} with headless Chromium (scope: ${scope}, viewport: ${viewport})...`);
-    await crawlEvidence({
-      rootUrl: url,
-      evidenceDir: options.evidence,
-      maxDepth: parseNumber(options.maxDepth, 2),
-      maxPages: maxPagesCap ?? parseNumber(options.maxPages, 10),
-      viewport,
-      scope,
-    });
+    // Checkpoint resumption: a saved run for this URL can be continued.
+    const checkpoint = await loadCheckpoint('.');
+    let resumeFrom: CloneCheckpoint | undefined;
 
-    // Step 2: plan generation + approval gate.
-    const manifest = await loadEvidenceManifest(options.evidence);
-    const plan = createPlanFromEvidence(manifest);
-    const planPath = join(options.evidence, PLAN_FILENAME);
-    await writePlanFile(planPath, plan);
-    console.log(`→ Unapproved plan written to ${resolve(planPath)}`);
-
-    let approved: ApographPlan;
-    try {
-      approved = await runApprovalGate(planPath, { nonInteractive: options.yes });
-    } catch (cause) {
-      if (cause instanceof ApprovalCancelledError) {
-        console.error('✖ Clone aborted: the plan was not approved.');
-        process.exitCode = 1;
-        return;
+    if (checkpoint !== null && checkpoint.targetUrl === url) {
+      if (options.yes || !interactive) {
+        resumeFrom = checkpoint;
+        console.log(
+          `→ Found saved checkpoint for ${url} (stage: ${checkpoint.stage}) — auto-resuming (--yes).`,
+        );
+      } else {
+        const shouldResume = await p.confirm({
+          message: `Found saved checkpoint for ${url}. Resume from previous progress?`,
+          initialValue: true,
+        });
+        if (p.isCancel(shouldResume)) {
+          console.error('✖ Clone cancelled.');
+          process.exitCode = 1;
+          return;
+        }
+        if (shouldResume) {
+          resumeFrom = checkpoint;
+        }
       }
-      throw cause;
     }
 
-    // Steps 3–5: modular synthesis + emission + verification.
-    await runModularSynthesis(approved, manifest, options.evidence, outDir, {
-      force: options.force,
-      interactive,
-      verify: options.verify,
+    await runClonePipeline({
+      url,
+      outDir: options.out ?? outDirFromUrl(url),
+      evidenceDir: options.evidence,
       viewport,
+      requestedScope: parseScopeOption(options.scope),
+      maxDepth: parseNumber(options.maxDepth, 2),
+      maxPages: parseNumber(options.maxPages, 10),
+      yes: options.yes,
+      force: options.force,
+      verify: options.verify,
+      interactive,
+      resumeFrom,
+    });
+  });
+
+program
+  .command('resume')
+  .description('Resume an interrupted clone from the saved checkpoint')
+  .argument('[dir]', 'working directory', '.')
+  .option('--no-verify', 'skip the 3-tier verification pass')
+  .action(async (dir: string, options: { verify: boolean }) => {
+    const checkpoint = await loadCheckpoint(dir);
+
+    if (checkpoint === null) {
+      console.error(
+        `No checkpoint found at ${resolve(dir, '.apograph/checkpoint.json')}. ` +
+          'Interrupt a run with Ctrl+C and choose "Save checkpoint" first.',
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log(
+      `→ Resuming ${checkpoint.targetUrl} from stage "${checkpoint.stage}" ` +
+        `(${checkpoint.completedRoutePaths.length} route(s) already synthesized).`,
+    );
+
+    const interactive = isInteractive(false);
+
+    await runClonePipeline({
+      url: checkpoint.targetUrl,
+      outDir: checkpoint.outDir || outDirFromUrl(checkpoint.targetUrl),
+      evidenceDir: checkpoint.evidenceDir,
+      viewport: checkpoint.viewport,
+      requestedScope: undefined,
+      maxDepth: 2,
+      maxPages: 10,
+      yes: !interactive,
+      force: false,
+      verify: options.verify,
+      interactive,
+      resumeFrom: checkpoint,
     });
   });
 
@@ -491,6 +738,14 @@ program
     if (!report.overall.passed) {
       process.exitCode = 1;
     }
+  });
+
+program
+  .command('status')
+  .description('Show the status of generated projects under ./output/')
+  .option('--all', 'show every project when there are more than 5')
+  .action(async (options: { all: boolean }) => {
+    await runStatusCommand(options);
   });
 
 program

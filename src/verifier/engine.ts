@@ -195,13 +195,56 @@ function errorLines(output: string): string[] {
     .slice(0, 50);
 }
 
+/** True when a `node_modules` directory exists under `cwd`. */
+async function nodeModulesExists(cwd: string): Promise<boolean> {
+  try {
+    await stat(join(cwd, 'node_modules'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Tier 1: runs `tsc --noEmit` and `vite build` inside the output directory.
+ * Installs dependencies if `node_modules` is absent before typechecking.
  * `vite build` is only attempted when the typecheck passes (mirroring the
  * project's `pnpm build` script). Returns success flags and compiler logs.
  */
 export async function verifyBuild(outputDir: string): Promise<BuildCheck> {
   const cwd = resolve(outputDir);
+
+  const hasModules = await nodeModulesExists(cwd);
+
+  if (!hasModules) {
+    // Install dependencies. A non-zero exit is tolerated when node_modules
+    // was still materialized — pnpm may exit non-zero on unapproved build
+    // scripts or lockfile conflicts while having installed everything the
+    // build needs. Only escalate to npm when pnpm produced nothing.
+    const install = await runCommand('pnpm', ['install', '--prefer-offline'], cwd);
+
+    let modulesReady = await nodeModulesExists(cwd);
+
+    if (!modulesReady) {
+      // pnpm may refuse on a conflicting lockfile (e.g. one written by npm);
+      // fall back to npm before giving up.
+      const fallback = await runCommand('npm', ['install', '--prefer-offline'], cwd);
+      modulesReady = await nodeModulesExists(cwd);
+
+      if (!modulesReady) {
+        return {
+          success: false,
+          tscPassed: false,
+          vitePassed: false,
+          errors: [
+            'Failed to install dependencies in emitted project:',
+            ...errorLines(install.output),
+            ...errorLines(fallback.output),
+          ],
+        };
+      }
+    }
+  }
 
   const tsc = await runCommand('npx', ['--no-install', 'tsc', '--noEmit'], cwd);
   const errors: string[] = [];

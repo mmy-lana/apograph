@@ -21,7 +21,8 @@ import type { LanguageModel } from 'ai';
 import { loadApographConfig } from '../commands/config.js';
 
 const LOCAL_OLLAMA_BASE_URL = 'http://localhost:11434/v1';
-const LOCAL_FALLBACK_MODEL = 'qwen2.5-coder:7b-instruct';
+/** Default local vision model (tuned for 16 GB Apple Silicon / Mac). */
+const LOCAL_FALLBACK_MODEL = 'apograph-qwen35:9b-8k';
 
 /** Default cloud model ids per provider. */
 const PROVIDER_MODELS = {
