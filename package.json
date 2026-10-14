@@ -1,5 +1,5 @@
 {
-  "name": "apograph",
+  "name": "apograph-agents",
   "version": "0.1.0",
   "description": "Industrial cleanroom reverse-engineering and code synthesis tool",
   "type": "module",
@@ -10,6 +10,7 @@
     "LICENSE"
   ],
   "bin": {
+    "apograph-agents": "dist/cli.js",
     "apograph": "dist/cli.js",
     "apograph-mcp": "dist/mcp.js"
   },
