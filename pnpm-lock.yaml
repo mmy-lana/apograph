@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  apograph-agents: 'link:'
+
 importers:
 
   .:
@@ -23,6 +26,9 @@ importers:
       ai:
         specifier: ^4.3.16
         version: 4.3.19(react@19.3.0)(zod@3.25.76)
+      apograph-agents:
+        specifier: 'link:'
+        version: 'link:'
       better-sqlite3:
         specifier: ^11.10.0
         version: 11.10.0
