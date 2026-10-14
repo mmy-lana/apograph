@@ -13,9 +13,6 @@ import { join } from 'node:path';
 import type { Page } from 'playwright';
 import type { AssetEntry, UncapturedResource } from '../types.js';
 
-/** Hard limit on elements inspected for computed `background-image`. */
-const MAX_BACKGROUND_SCAN_ELEMENTS = 2_000;
-
 /** Download timeout per asset. */
 const DOWNLOAD_TIMEOUT_MS = 20_000;
 
@@ -37,6 +34,7 @@ const MIME_EXTENSIONS: Record<string, string> = {
  * computed `background-image` values, and `<style>` block `url(...)`s.
  */
 function collectImageUrlsInPage(): string[] {
+  const MAX_BACKGROUND_SCAN_ELEMENTS = 2_000;
   const urls = new Set<string>();
   const push = (value: string | null | undefined): void => {
     if (value && value.length > 0) urls.add(value);
