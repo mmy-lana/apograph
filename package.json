@@ -3,10 +3,15 @@
   "version": "0.1.0",
   "description": "Industrial cleanroom reverse-engineering and code synthesis tool",
   "type": "module",
-  "private": true,
+  "license": "MIT",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "bin": {
-    "apograph": "./dist/cli.js",
-    "apograph-mcp": "./dist/mcp.js"
+    "apograph": "dist/cli.js",
+    "apograph-mcp": "dist/mcp.js"
   },
   "engines": {
     "node": ">=20"

@@ -6,6 +6,8 @@
  *   apograph clone <url>       Full pipeline: harvest -> decompile -> infer -> synthesize -> emit -> verify.
  *   apograph harvest <url>     Capture only; writes session.json / snapshot.json / unpacked scripts.
  *   apograph synthesize <dir>  Rebuild from a previous harvest directory.
+ *   apograph doctor            Check environment health (Node, CDP, LLM, Ollama).
+ *   apograph setup             Install the apograph MCP server into your coding agent.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -29,6 +31,8 @@ import { synthesizeFrontend } from './synthesizer/frontend.js';
 import { synthesizeBackend } from './synthesizer/backend.js';
 import { emitProject } from './emitter/scaffold.js';
 import { verifyAndSelfHeal } from './verifier/smoke.js';
+import { runDoctor } from './commands/doctor.js';
+import { runSetup } from './commands/setup.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -312,6 +316,21 @@ program
 
     const outcome = await loadHarvest(dir);
     await runSynthesis(outcome.session, outcome.snapshot, outcome.bundles, outDir, options.verify, passes);
+  });
+
+program
+  .command('doctor')
+  .description('Check environment health: Node.js, Chrome CDP, LLM connectivity, Ollama')
+  .action(async () => {
+    await runDoctor();
+  });
+
+program
+  .command('setup')
+  .description('Install the apograph MCP server into your AI coding agent (Claude Desktop, Cursor, Claude Code, Windsurf, OpenCode)')
+  .option('-c, --client <name>', 'only configure a specific agent (claude-desktop, cursor, claude-code, windsurf, opencode)')
+  .action(async (options: { client?: string }) => {
+    await runSetup(options);
   });
 
 try {
