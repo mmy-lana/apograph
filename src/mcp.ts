@@ -29,7 +29,7 @@ import { inferAllSchemas } from './legacy/infer/schema.js';
 import { synthesizeFrontend } from './synthesizer/frontend.js';
 import { synthesizeBackend, formatSchemasForPrompt } from './legacy/synthesizer/backend.js';
 import { emitProject } from './emitter/scaffold.js';
-import { verifyAndSelfHeal } from './verifier/smoke.js';
+import { runVerification } from './verifier/engine.js';
 
 // ---------------------------------------------------------------------------
 // Shared pipeline internals (mirrors src/cli.ts)
@@ -236,16 +236,21 @@ server.tool(
     ];
 
     if (verify) {
-      const result = await verifyAndSelfHeal(outputDir, 2);
+      const report = await runVerification({
+        outputDir: projectDir,
+        evidenceDir: '.apograph/evidence',
+      });
       lines.push(
-        result.success
-          ? `Self-healing verification PASSED after ${result.passesRun} pass(es); ` +
-              `${result.repairedFiles.length} file(s) repaired.`
-          : `Self-healing verification FAILED after ${result.passesRun} pass(es).`,
+        report.overall.passed
+          ? '3-tier verification PASSED (build, routes, visuals).'
+          : '3-tier verification FAILED — see the gaps below.',
       );
+      for (const diagnostic of report.diagnostics) {
+        lines.push(`- ${diagnostic}`);
+      }
     }
 
-    lines.push('Boot the repository with `docker compose up`.');
+    lines.push('Boot the frontend with `pnpm install && pnpm dev`.');
 
     return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
   },

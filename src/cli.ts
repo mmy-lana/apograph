@@ -3,36 +3,25 @@
  * apograph — CLI entrypoint (Layer 5: Orchestration).
  *
  * Commands:
- *   apograph plan [dir]          Generate the authoritative plan from evidence and approve it interactively.
- *   apograph crawl <url>         Headless evidence crawl: screenshots, a11y trees, tokens, mirrored assets.
- *   apograph clone <url>         Full pipeline: crawl -> plan (approval gate) -> modular synthesize -> emit.
- *   apograph synthesize <dir>    Modular synthesis from an approved apograph-plan.json.
- *   apograph harvest <url>       Legacy capture only; writes session.json / snapshot.json / unpacked scripts.
- *   apograph doctor              Check environment health (Node, Chromium, LLM, Ollama).
- *   apograph setup               Install the apograph MCP server into your coding agent.
+ *   apograph plan [dir]           Generate the authoritative plan from evidence and approve it interactively.
+ *   apograph crawl <url>          Headless evidence crawl: screenshots, a11y trees, tokens, mirrored assets.
+ *   apograph clone <url>          Full pipeline: crawl -> plan (approval gate) -> modular synthesize -> emit -> verify.
+ *   apograph synthesize <dir>     Modular synthesis from an approved apograph-plan.json.
+ *   apograph verify <dir> [dir2]  3-tier verification: build, route smoke, visual comparison.
+ *   apograph doctor               Check environment health (Node, Chromium, LLM, Ollama).
+ *   apograph setup                Install the apograph MCP server into your coding agent.
  */
 
-import { randomUUID } from 'node:crypto';
 import { Command } from 'commander';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import type { Page } from 'playwright';
-import type {
-  HarvestedSession,
-  DOMSnapshot,
-  RecordedRequest,
-  DecompiledBundle,
-  EvidenceManifest,
-} from './types.js';
+import type { EvidenceManifest } from './types.js';
 import type { ApographPlan } from './plan/schema.js';
-import { launchHeadlessChromium, crawlEvidence } from './crawler/engine.js';
-import { NetworkCollector } from './harvester/network.js';
-import { captureDOMSnapshot } from './harvester/dom.js';
-import { harvestAndDecompileScripts } from './legacy/decompile/bundle.js';
-import { enrichRequestsWithRoutePatterns } from './legacy/infer/routes.js';
+import { crawlEvidence } from './crawler/engine.js';
 import { synthesizeModularProject, copyMirroredAssets } from './synthesizer/modular.js';
 import { emitProject } from './emitter/scaffold.js';
-import { verifyAndSelfHeal } from './verifier/smoke.js';
+import { runVerification } from './verifier/engine.js';
+import { printVerificationSummary, writeVerificationReport } from './verifier/report.js';
 import { runDoctor } from './commands/doctor.js';
 import { runSetup } from './commands/setup.js';
 import {
@@ -48,12 +37,6 @@ import { runApprovalGate, ApprovalCancelledError } from './plan/gate.js';
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
-
-interface HarvestOutcome {
-  session: HarvestedSession;
-  snapshot: DOMSnapshot;
-  bundles: DecompiledBundle[];
-}
 
 /** Derives an app name from a URL's hostname (e.g. app.example.com -> app-example-com). */
 function appNameFromUrl(url: string): string {
@@ -75,106 +58,6 @@ function outDirFromUrl(url: string): string {
 function parseNumber(value: string, fallback: number): number {
   const parsed = Number.parseInt(value, 10);
   return Number.isNaN(parsed) ? fallback : parsed;
-}
-
-/** Fetches the raw source text of every external script on the page. */
-async function collectScriptSources(page: Page): Promise<string[]> {
-  const srcs = await page.$$eval('script[src]', (els) =>
-    els.map((el) => (el as HTMLScriptElement).src),
-  );
-
-  const sources: string[] = [];
-  for (const src of srcs) {
-    try {
-      const text = await page.evaluate(
-        async (scriptUrl: string): Promise<string | null> => {
-          const response = await fetch(scriptUrl);
-          return response.ok ? response.text() : null;
-        },
-        src,
-      );
-      if (text !== null && text.length > 0) sources.push(text);
-    } catch {
-      // Unreachable script (CORS-rejected, 404, etc.) — skip it.
-    }
-  }
-  return sources;
-}
-
-/** Runs the capture half of the pipeline (steps 1–8 of `clone`). */
-async function runHarvest(url: string): Promise<HarvestOutcome> {
-  console.log('→ Launching headless Chromium...');
-
-  const browser = await launchHeadlessChromium();
-  const page = await browser.newPage();
-
-  const collector = new NetworkCollector();
-  collector.attach(page);
-
-  console.log(`→ Navigating to ${url}...`);
-  await page.goto(url, { waitUntil: 'networkidle' });
-
-  const scriptSources = await collectScriptSources(page);
-
-  console.log('→ Capturing DOM snapshot (a11y tree + design tokens)...');
-  const snapshot = await captureDOMSnapshot(page, url);
-
-  const requests: RecordedRequest[] = enrichRequestsWithRoutePatterns(
-    collector.stop(page),
-  );
-
-  await browser.close();
-
-  console.log(
-    `→ Harvest complete: ${requests.length} requests, ${scriptSources.length} scripts.`,
-  );
-
-  const session: HarvestedSession = {
-    id: randomUUID(),
-    targetUrl: url,
-    requests,
-    socketFrames: [],
-    events: [],
-    scripts: scriptSources,
-  };
-
-  const bundles = await harvestAndDecompileScripts(scriptSources);
-
-  return { session, snapshot, bundles };
-}
-
-/** Persists a harvest outcome to disk (session, snapshot, unpacked scripts). */
-async function persistHarvest(
-  dir: string,
-  outcome: HarvestOutcome,
-): Promise<void> {
-  const absolute = resolve(dir);
-  await mkdir(absolute, { recursive: true });
-
-  await writeFile(
-    join(absolute, 'session.json'),
-    JSON.stringify(outcome.session, null, 2),
-    'utf8',
-  );
-  await writeFile(
-    join(absolute, 'snapshot.json'),
-    JSON.stringify(outcome.snapshot, null, 2),
-    'utf8',
-  );
-
-  const scriptsDir = join(absolute, 'scripts');
-  await mkdir(scriptsDir, { recursive: true });
-  for (const bundle of outcome.bundles) {
-    const bundleDir = join(scriptsDir, bundle.bundleName);
-    await mkdir(bundleDir, { recursive: true });
-    for (const module of bundle.modules) {
-      await writeFile(
-        join(bundleDir, module.path.replace(/\.\.\//g, '_').replace(/^\//, '')),
-        module.rawCode,
-        'utf8',
-      );
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,14 +120,13 @@ async function loadPlanAndEvidence(
   return { plan, manifest, evidenceDir, planPath };
 }
 
-/** Runs the modular synthesis -> emit -> asset copy half of the pipeline. */
+/** Runs the modular synthesis -> emit -> asset copy -> verify half of the pipeline. */
 async function runModularSynthesis(
   plan: ApographPlan,
   manifest: EvidenceManifest,
   evidenceDir: string,
   outDir: string,
   verify: boolean,
-  passes: number,
 ): Promise<void> {
   const included = plan.routes.filter((route) => route.included);
 
@@ -268,18 +150,13 @@ async function runModularSynthesis(
   }
 
   if (verify) {
-    console.log(`→ Running smoke verification (max ${passes} repair passes)...`);
-    const verdict = await verifyAndSelfHeal(projectDir, passes);
-    if (verdict.success) {
-      console.log(
-        `→ Verification passed after ${verdict.passesRun} pass(es); ` +
-          `${verdict.repairedFiles.length} file(s) repaired.`,
-      );
-    } else {
-      console.warn(
-        `→ Verification FAILED after ${verdict.passesRun} pass(es). ` +
-          'Inspect the project and re-run with --passes for more repair attempts.',
-      );
+    console.log('→ Running 3-tier verification (build, routes, visuals)...');
+    const report = await runVerification({ outputDir: projectDir, evidenceDir });
+    printVerificationSummary(report);
+    const reportPath = await writeVerificationReport(projectDir, report);
+    console.log(`→ Verification report: ${reportPath}`);
+    if (!report.overall.passed) {
+      console.warn('→ Verification found gaps — see the diagnostics above.');
     }
   }
 
@@ -301,12 +178,6 @@ interface CloneOptions {
   maxPages: string;
   yes: boolean;
   verify: boolean;
-  passes: string;
-}
-
-/** Options for the `harvest` command. */
-interface HarvestOptions {
-  out?: string;
 }
 
 /** Options for the `crawl` command. */
@@ -322,11 +193,15 @@ interface PlanCliOptions {
   out?: string;
 }
 
+/** Options for the `verify` command. */
+interface VerifyCliOptions {
+  threshold: string;
+}
+
 /** Options for the `synthesize` command. */
 interface SynthesizeOptions {
   out?: string;
   verify: boolean;
-  passes: string;
 }
 
 const program = new Command('apograph');
@@ -389,18 +264,16 @@ program
 
 program
   .command('clone')
-  .description('Full pipeline: crawl, plan (approval gate), modular synthesize, emit')
+  .description('Full pipeline: crawl, plan (approval gate), modular synthesize, emit, verify')
   .argument('<url>', 'target URL to reverse-engineer')
   .option('-o, --out <dir>', 'output directory (defaults to ./output/<hostname>)')
   .option('-e, --evidence <dir>', 'evidence output directory', '.apograph/evidence')
   .option('--max-depth <number>', 'max crawl depth', '2')
   .option('--max-pages <number>', 'max pages to crawl', '10')
   .option('--yes', 'auto-approve the plan without interactive prompts')
-  .option('--no-verify', 'skip smoke verification and self-healing')
-  .option('--passes <number>', 'max self-healing repair passes', '2')
+  .option('--no-verify', 'skip the 3-tier verification pass')
   .action(async (url: string, options: CloneOptions) => {
     const outDir = options.out ?? outDirFromUrl(url);
-    const passes = parseNumber(options.passes, 2);
 
     // Step 1: headless evidence crawl.
     console.log(`→ Crawling ${url} with headless Chromium...`);
@@ -430,24 +303,8 @@ program
       throw cause;
     }
 
-    // Steps 3–4: modular synthesis + emission.
-    await runModularSynthesis(approved, manifest, options.evidence, outDir, options.verify, passes);
-  });
-
-program
-  .command('harvest')
-  .description('Legacy capture only: writes session.json, snapshot.json, and unpacked scripts')
-  .argument('<url>', 'target URL to harvest')
-  .option('-o, --out <dir>', 'output directory (defaults to ./output/<hostname>)')
-  .action(async (url: string, options: HarvestOptions) => {
-    const outDir = options.out ?? outDirFromUrl(url);
-
-    const outcome = await runHarvest(url);
-    await persistHarvest(outDir, outcome);
-
-    console.log('');
-    console.log('✔ Harvest saved.');
-    console.log(`  Output: ${resolve(outDir)}`);
+    // Steps 3–5: modular synthesis + emission + verification.
+    await runModularSynthesis(approved, manifest, options.evidence, outDir, options.verify);
   });
 
 program
@@ -455,11 +312,8 @@ program
   .description('Modular synthesis: build a standalone frontend from an approved apograph-plan.json')
   .argument('<planOrEvidenceDir>', 'directory containing apograph-plan.json (or the plan file itself)')
   .option('-o, --out <dir>', 'output directory (defaults to ./output/<appName>)')
-  .option('--no-verify', 'skip smoke verification and self-healing')
-  .option('--passes <number>', 'max self-healing repair passes', '2')
+  .option('--no-verify', 'skip the 3-tier verification pass')
   .action(async (dir: string, options: SynthesizeOptions) => {
-    const passes = parseNumber(options.passes, 2);
-
     const { plan, manifest, evidenceDir } = await loadPlanAndEvidence(dir);
 
     if (!plan.approved) {
@@ -470,7 +324,33 @@ program
     }
 
     const outDir = options.out ?? join('output', plan.appName);
-    await runModularSynthesis(plan, manifest, evidenceDir, outDir, options.verify, passes);
+    await runModularSynthesis(plan, manifest, evidenceDir, outDir, options.verify);
+  });
+
+program
+  .command('verify')
+  .description('3-tier verification of a generated project: build, headless route smoke check, visual screenshot comparison')
+  .argument('<outputDir>', 'generated project directory to verify')
+  .argument('[evidenceDir]', 'evidence directory (defaults to .apograph/evidence)', DEFAULT_EVIDENCE_DIR)
+  .option('--threshold <number>', 'visual mismatch threshold in percent', '15')
+  .action(async (outputDir: string, evidenceDir: string, options: VerifyCliOptions) => {
+    const thresholdPercent = parseNumber(options.threshold, 15);
+
+    const report = await runVerification({
+      outputDir,
+      evidenceDir,
+      visualThreshold: thresholdPercent / 100,
+    });
+
+    printVerificationSummary(report);
+
+    const reportPath = await writeVerificationReport(outputDir, report);
+    console.log('');
+    console.log(`✔ Verification report: ${reportPath}`);
+
+    if (!report.overall.passed) {
+      process.exitCode = 1;
+    }
   });
 
 program
