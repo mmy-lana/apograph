@@ -6,7 +6,7 @@
  * table definitions for array-returning GET endpoints.
  */
 
-import type { RecordedRequest, EndpointCluster, InferredSchema } from '../types.js';
+import type { RecordedRequest, EndpointCluster, InferredSchema } from '../../types.js';
 import { parameterizePath } from './routes.js';
 
 // ---------------------------------------------------------------------------

@@ -31,7 +31,6 @@
     "css-tree": "^3.1.0",
     "drizzle-orm": "^0.44.2",
     "playwright": "^1.52.0",
-    "quicktype-core": "^23.0.170",
     "webcrack": "^2.14.0",
     "zod": "^3.24.4"
   },

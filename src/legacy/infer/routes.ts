@@ -5,7 +5,7 @@
  * requests into endpoint clusters by parameterizing URL path segments.
  */
 
-import type { RecordedRequest, EndpointCluster } from '../types.js';
+import type { RecordedRequest, EndpointCluster } from '../../types.js';
 
 /** Max number of sample URLs retained per cluster. */
 const MAX_SAMPLE_URLS = 5;

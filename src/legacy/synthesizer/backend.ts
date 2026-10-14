@@ -6,9 +6,9 @@
  * inferred endpoint contracts.
  */
 
-import type { InferredSchema, ProjectFile } from '../types.js';
+import type { InferredSchema, ProjectFile } from '../../types.js';
 import { generateDrizzleSchema } from '../infer/schema.js';
-import { generateStructuredFiles } from './llm.js';
+import { generateStructuredFiles } from '../../synthesizer/llm.js';
 
 // ---------------------------------------------------------------------------
 // Deterministic database files

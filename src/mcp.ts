@@ -23,11 +23,11 @@ import type {
 import { attachToCDP, disconnectCDP } from './harvester/cdp.js';
 import { NetworkCollector } from './harvester/network.js';
 import { captureDOMSnapshot } from './harvester/dom.js';
-import { harvestAndDecompileScripts } from './decompile/bundle.js';
-import { clusterEndpoints, enrichRequestsWithRoutePatterns } from './infer/routes.js';
-import { inferAllSchemas } from './infer/schema.js';
+import { harvestAndDecompileScripts } from './legacy/decompile/bundle.js';
+import { clusterEndpoints, enrichRequestsWithRoutePatterns } from './legacy/infer/routes.js';
+import { inferAllSchemas } from './legacy/infer/schema.js';
 import { synthesizeFrontend } from './synthesizer/frontend.js';
-import { synthesizeBackend, formatSchemasForPrompt } from './synthesizer/backend.js';
+import { synthesizeBackend, formatSchemasForPrompt } from './legacy/synthesizer/backend.js';
 import { emitProject } from './emitter/scaffold.js';
 import { verifyAndSelfHeal } from './verifier/smoke.js';
 

@@ -6,7 +6,7 @@
  */
 
 import { webcrack } from 'webcrack';
-import type { UnpackedModule, DecompiledBundle } from '../types.js';
+import type { UnpackedModule, DecompiledBundle } from '../../types.js';
 
 /**
  * Decompile a single bundle source into the canonical shape.
