@@ -4,6 +4,10 @@
   "description": "Industrial cleanroom reverse-engineering and code synthesis tool",
   "type": "module",
   "private": true,
+  "bin": {
+    "apograph": "./dist/cli.js",
+    "apograph-mcp": "./dist/mcp.js"
+  },
   "engines": {
     "node": ">=20"
   },
