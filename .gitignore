@@ -21,6 +21,10 @@ repomix-output.*
 .cache/
 test-results/
 
+# Apograph runtime evidence and generated projects
+.apograph/
+output/
+
 # OS metadata
 .DS_Store
 Thumbs.db
