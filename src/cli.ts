@@ -3,6 +3,7 @@
  * apograph — CLI entrypoint (Layer 5: Orchestration).
  *
  * Commands:
+ *   apograph plan [dir]        Generate the authoritative plan from evidence and approve it interactively.
  *   apograph crawl <url>        Headless evidence crawl: screenshots, a11y trees, tokens, mirrored assets.
  *   apograph clone <url>       Full pipeline: harvest -> decompile -> infer -> synthesize -> emit -> verify.
  *   apograph harvest <url>     Capture only; writes session.json / snapshot.json / unpacked scripts.
@@ -34,6 +35,14 @@ import { emitProject } from './emitter/scaffold.js';
 import { verifyAndSelfHeal } from './verifier/smoke.js';
 import { runDoctor } from './commands/doctor.js';
 import { runSetup } from './commands/setup.js';
+import {
+  createPlanFromEvidence,
+  loadEvidenceManifest,
+  writePlanFile,
+  DEFAULT_EVIDENCE_DIR,
+  PLAN_FILENAME,
+} from './plan/generator.js';
+import { runApprovalGate } from './plan/gate.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -259,6 +268,12 @@ interface CrawlCliOptions {
   maxPages: string;
 }
 
+/** Options for the `plan` command. */
+interface PlanCliOptions {
+  yes: boolean;
+  out?: string;
+}
+
 /** Options for the `synthesize` command. */
 interface SynthesizeOptions {
   out?: string;
@@ -272,6 +287,33 @@ program
   .name('apograph')
   .version('0.1.0')
   .description('Cleanroom reverse-engineering and code synthesis tool');
+
+program
+  .command('plan')
+  .description('Generate the authoritative plan from the evidence bundle and approve it interactively')
+  .argument('[evidenceDir]', 'evidence directory (defaults to .apograph/evidence)', DEFAULT_EVIDENCE_DIR)
+  .option('--yes', 'auto-approve the plan without interactive prompts')
+  .option('-o, --out <file>', 'custom plan output path (defaults to <evidenceDir>/apograph-plan.json)')
+  .action(async (evidenceDir: string, options: PlanCliOptions) => {
+    console.log(`→ Reading evidence from ${resolve(evidenceDir)}...`);
+    const manifest = await loadEvidenceManifest(evidenceDir);
+
+    console.log(`→ Deriving plan from ${manifest.routes.length} crawled route(s)...`);
+    const plan = createPlanFromEvidence(manifest);
+
+    const planPath = options.out ?? join(evidenceDir, PLAN_FILENAME);
+    await writePlanFile(planPath, plan);
+    console.log(`→ Unapproved plan written to ${resolve(planPath)}`);
+
+    const approved = await runApprovalGate(planPath, {
+      nonInteractive: options.yes,
+    });
+
+    console.log('');
+    console.log('✔ Plan ready.');
+    console.log(`  Plan:    ${resolve(planPath)}`);
+    console.log(`  Routes:  ${approved.routes.filter((route) => route.included).length} included / ${approved.routes.length} total`);
+  });
 
 program
   .command('crawl')
