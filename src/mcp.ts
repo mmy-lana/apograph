@@ -20,7 +20,7 @@ import type {
   RecordedRequest,
   DecompiledBundle,
 } from './types.js';
-import { attachToCDP, disconnectCDP } from './harvester/cdp.js';
+import { launchHeadlessChromium, crawlEvidence } from './crawler/engine.js';
 import { NetworkCollector } from './harvester/network.js';
 import { captureDOMSnapshot } from './harvester/dom.js';
 import { harvestAndDecompileScripts } from './legacy/decompile/bundle.js';
@@ -77,8 +77,9 @@ async function collectScriptSources(page: Page): Promise<string[]> {
 }
 
 /** Runs the capture half of the pipeline. */
-async function runHarvest(url: string, port: number): Promise<HarvestOutcome> {
-  const { browser, page } = await attachToCDP({ port });
+async function runHarvest(url: string): Promise<HarvestOutcome> {
+  const browser = await launchHeadlessChromium();
+  const page = await browser.newPage();
 
   const collector = new NetworkCollector();
   collector.attach(page);
@@ -92,7 +93,7 @@ async function runHarvest(url: string, port: number): Promise<HarvestOutcome> {
     collector.stop(page),
   );
 
-  await disconnectCDP(browser);
+  await browser.close();
 
   const session: HarvestedSession = {
     id: randomUUID(),
@@ -154,23 +155,62 @@ const server = new McpServer(
 );
 
 // ---------------------------------------------------------------------------
+// Tool: apograph_crawl
+// ---------------------------------------------------------------------------
+
+server.tool(
+  'apograph_crawl',
+  'Headless crawl of a site from a root URL: dual-viewport screenshots, a11y trees, design tokens, and mirrored image assets, persisted as an evidence bundle under .apograph/evidence/.',
+  {
+    targetUrl: z.string().url(),
+    evidenceDir: z.string().optional(),
+    maxDepth: z.number().int().min(0).optional(),
+    maxPages: z.number().int().min(1).optional(),
+  },
+  async ({ targetUrl, evidenceDir, maxDepth, maxPages }) => {
+    const manifest = await crawlEvidence({
+      rootUrl: targetUrl,
+      evidenceDir: evidenceDir ?? '.apograph/evidence',
+      maxDepth: maxDepth ?? 2,
+      maxPages: maxPages ?? 10,
+    });
+
+    const lines = [
+      `Crawled ${manifest.stats.pagesCrawled} page(s) from ${manifest.targetUrl} ` +
+        `in ${manifest.stats.durationMs}ms`,
+      `- Links discovered: ${manifest.stats.linksDiscovered}`,
+      `- Assets: ${manifest.stats.assetsDownloaded} downloaded, ` +
+        `${manifest.stats.assetsFailed} failed, ${manifest.stats.externalAssets} external`,
+      `- Skipped URLs: ${manifest.diagnostics.skippedUrls.length}`,
+      `- Failed navigations: ${manifest.diagnostics.failedNavigations.length}`,
+      '',
+      'Routes:',
+      ...manifest.routes.map(
+        (route) => `- ${route.path} "${route.title}" (${route.desktopScreenshot}, ${route.mobileScreenshot})`,
+      ),
+    ];
+
+    return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+  },
+);
+
+// ---------------------------------------------------------------------------
 // Tool: apograph_clone
 // ---------------------------------------------------------------------------
 
 server.tool(
   'apograph_clone',
-  'Autonomously attach to an authenticated browser session, harvest network/DOM, infer schemas, and synthesize a self-hosted full-stack Docker repository.',
+  'Autonomously launch a headless Chromium session, harvest network/DOM, infer schemas, and synthesize a self-hosted full-stack Docker repository.',
   {
     targetUrl: z.string().url(),
     outDir: z.string().optional(),
-    cdpPort: z.number().int().optional().default(9222),
     verify: z.boolean().optional().default(true),
   },
-  async ({ targetUrl, outDir, cdpPort, verify }) => {
+  async ({ targetUrl, outDir, verify }) => {
     const outputDir = outDir ?? join('./output', appNameFromUrl(targetUrl));
     const appName = appNameFromUrl(targetUrl);
 
-    const outcome = await runHarvest(targetUrl, cdpPort);
+    const outcome = await runHarvest(targetUrl);
     await persistHarvest(outputDir, outcome);
 
     const clusters = clusterEndpoints(outcome.session.requests);
@@ -217,14 +257,13 @@ server.tool(
 
 server.tool(
   'apograph_harvest',
-  'Harvest network traffic, client scripts, and DOM accessibility tree for a target URL over CDP.',
+  'Harvest network traffic, client scripts, and DOM accessibility tree for a target URL using headless Chromium.',
   {
     targetUrl: z.string().url(),
     outDir: z.string(),
-    cdpPort: z.number().int().optional().default(9222),
   },
-  async ({ targetUrl, outDir, cdpPort }) => {
-    const outcome = await runHarvest(targetUrl, cdpPort);
+  async ({ targetUrl, outDir }) => {
+    const outcome = await runHarvest(targetUrl);
     await persistHarvest(outDir, outcome);
 
     const lines = [

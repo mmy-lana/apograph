@@ -3,10 +3,11 @@
  * apograph — CLI entrypoint (Layer 5: Orchestration).
  *
  * Commands:
+ *   apograph crawl <url>        Headless evidence crawl: screenshots, a11y trees, tokens, mirrored assets.
  *   apograph clone <url>       Full pipeline: harvest -> decompile -> infer -> synthesize -> emit -> verify.
  *   apograph harvest <url>     Capture only; writes session.json / snapshot.json / unpacked scripts.
  *   apograph synthesize <dir>  Rebuild from a previous harvest directory.
- *   apograph doctor            Check environment health (Node, CDP, LLM, Ollama).
+ *   apograph doctor            Check environment health (Node, Chromium, LLM, Ollama).
  *   apograph setup             Install the apograph MCP server into your coding agent.
  */
 
@@ -21,7 +22,7 @@ import type {
   RecordedRequest,
   DecompiledBundle,
 } from './types.js';
-import { attachToCDP, disconnectCDP } from './harvester/cdp.js';
+import { launchHeadlessChromium, crawlEvidence } from './crawler/engine.js';
 import { NetworkCollector } from './harvester/network.js';
 import { captureDOMSnapshot } from './harvester/dom.js';
 import { harvestAndDecompileScripts } from './legacy/decompile/bundle.js';
@@ -91,10 +92,11 @@ async function collectScriptSources(page: Page): Promise<string[]> {
 }
 
 /** Runs the capture half of the pipeline (steps 1–8 of `clone`). */
-async function runHarvest(url: string, port: number): Promise<HarvestOutcome> {
-  console.log(`→ Connecting to Chrome on port ${port}...`);
+async function runHarvest(url: string): Promise<HarvestOutcome> {
+  console.log('→ Launching headless Chromium...');
 
-  const { browser, page } = await attachToCDP({ port });
+  const browser = await launchHeadlessChromium();
+  const page = await browser.newPage();
 
   const collector = new NetworkCollector();
   collector.attach(page);
@@ -111,7 +113,7 @@ async function runHarvest(url: string, port: number): Promise<HarvestOutcome> {
     collector.stop(page),
   );
 
-  await disconnectCDP(browser);
+  await browser.close();
 
   console.log(
     `→ Harvest complete: ${requests.length} requests, ${scriptSources.length} scripts.`,
@@ -240,7 +242,6 @@ async function loadHarvest(dir: string): Promise<HarvestOutcome> {
 
 /** Options for the `clone` command (commander passes numbers as strings). */
 interface CloneOptions {
-  port: string;
   out?: string;
   verify: boolean;
   passes: string;
@@ -248,8 +249,14 @@ interface CloneOptions {
 
 /** Options for the `harvest` command. */
 interface HarvestOptions {
-  port: string;
   out?: string;
+}
+
+/** Options for the `crawl` command. */
+interface CrawlCliOptions {
+  evidence: string;
+  maxDepth: string;
+  maxPages: string;
 }
 
 /** Options for the `synthesize` command. */
@@ -267,19 +274,41 @@ program
   .description('Cleanroom reverse-engineering and code synthesis tool');
 
 program
+  .command('crawl')
+  .description('Headless evidence crawl: dual-viewport screenshots, a11y trees, design tokens, mirrored assets')
+  .argument('<url>', 'root URL to crawl')
+  .option('-e, --evidence <dir>', 'evidence output directory', '.apograph/evidence')
+  .option('--max-depth <number>', 'max crawl depth', '2')
+  .option('--max-pages <number>', 'max pages to crawl', '10')
+  .action(async (url: string, options: CrawlCliOptions) => {
+    const manifest = await crawlEvidence({
+      rootUrl: url,
+      evidenceDir: options.evidence,
+      maxDepth: parseNumber(options.maxDepth, 2),
+      maxPages: parseNumber(options.maxPages, 10),
+    });
+
+    console.log('');
+    console.log('✔ Crawl complete.');
+    console.log(`  Pages crawled:    ${manifest.stats.pagesCrawled}`);
+    console.log(`  Links discovered: ${manifest.stats.linksDiscovered}`);
+    console.log(`  Assets mirrored:  ${manifest.stats.assetsDownloaded} downloaded, ` +
+      `${manifest.stats.assetsFailed} failed, ${manifest.stats.externalAssets} external`);
+    console.log(`  Manifest:         ${resolve(options.evidence, 'manifest.json')}`);
+  });
+
+program
   .command('clone')
   .description('Full pipeline: harvest, decompile, infer, synthesize, emit, verify')
   .argument('<url>', 'target URL to reverse-engineer')
-  .option('-p, --port <number>', 'Chrome CDP port', '9222')
   .option('-o, --out <dir>', 'output directory (defaults to ./output/<hostname>)')
   .option('--no-verify', 'skip smoke verification and self-healing')
   .option('--passes <number>', 'max self-healing repair passes', '2')
   .action(async (url: string, options: CloneOptions) => {
-    const port = parseNumber(options.port, 9222);
     const outDir = options.out ?? outDirFromUrl(url);
     const passes = parseNumber(options.passes, 2);
 
-    const outcome = await runHarvest(url, port);
+    const outcome = await runHarvest(url);
     await persistHarvest(outDir, outcome);
     await runSynthesis(outcome.session, outcome.snapshot, outcome.bundles, outDir, options.verify, passes);
   });
@@ -288,13 +317,11 @@ program
   .command('harvest')
   .description('Capture only: writes session.json, snapshot.json, and unpacked scripts')
   .argument('<url>', 'target URL to harvest')
-  .option('-p, --port <number>', 'Chrome CDP port', '9222')
   .option('-o, --out <dir>', 'output directory (defaults to ./output/<hostname>)')
   .action(async (url: string, options: HarvestOptions) => {
-    const port = parseNumber(options.port, 9222);
     const outDir = options.out ?? outDirFromUrl(url);
 
-    const outcome = await runHarvest(url, port);
+    const outcome = await runHarvest(url);
     await persistHarvest(outDir, outcome);
 
     console.log('');
@@ -320,7 +347,7 @@ program
 
 program
   .command('doctor')
-  .description('Check environment health: Node.js, Chrome CDP, LLM connectivity, Ollama')
+  .description('Check environment health: Node.js, headless Chromium, LLM connectivity, Ollama')
   .action(async () => {
     await runDoctor();
   });

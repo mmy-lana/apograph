@@ -1,0 +1,332 @@
+/**
+ * apograph — Headless crawl engine (Layer 1b: Crawl).
+ *
+ * Replaces the old CDP-attach flow: launches its own headless Chromium via
+ * `playwright.chromium.launch({ headless: true })` — no
+ * `--remote-debugging-port=9222` required.
+ *
+ * Crawls same-origin links from a root URL (max depth 2, max 10 pages —
+ * both configurable), prioritizing navigation pages (`/about`, `/pricing`,
+ * `/features`, `/contact`, `/faq`). For every page it captures:
+ * - dual-viewport screenshots (desktop 1280x800, mobile 390x844) as PNGs;
+ * - the a11y tree and CSSTree design tokens (reusing `harvester/dom.ts`);
+ * - image asset references, mirrored into the evidence bundle afterwards.
+ *
+ * Everything is recorded in `.apograph/evidence/manifest.json`.
+ */
+
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { chromium } from 'playwright';
+import type { Browser, Page } from 'playwright';
+import type { EvidenceManifest } from '../types.js';
+import { captureDOMSnapshot } from '../harvester/dom.js';
+import { discoverImageAssets, mirrorAssets } from './assets.js';
+import { isCrawlablePage, isSameOrigin, linkPriority, normalizeUrl } from './urls.js';
+
+// ---------------------------------------------------------------------------
+// Options & constants
+// ---------------------------------------------------------------------------
+
+/** Options for {@link crawlEvidence}. */
+export interface CrawlOptions {
+  /** The root URL to start crawling from. */
+  rootUrl: string;
+  /** Evidence output directory. Defaults to `.apograph/evidence`. */
+  evidenceDir?: string;
+  /** Max crawl depth (links followed from the root). Defaults to 2. */
+  maxDepth?: number;
+  /** Max number of pages crawled. Defaults to 10. */
+  maxPages?: number;
+}
+
+/** Desktop capture viewport. */
+const DESKTOP_VIEWPORT = { width: 1280, height: 800 } as const;
+
+/** Mobile capture viewport. */
+const MOBILE_VIEWPORT = { width: 390, height: 844 } as const;
+
+/** Default evidence directory (relative to cwd). */
+const DEFAULT_EVIDENCE_DIR = '.apograph/evidence';
+
+/** Default crawl bounds. */
+const DEFAULT_MAX_DEPTH = 2;
+const DEFAULT_MAX_PAGES = 10;
+
+/** Per-page navigation timeout. */
+const NAVIGATION_TIMEOUT_MS = 30_000;
+
+/** One pending URL in the crawl frontier. */
+interface FrontierEntry {
+  url: string;
+  depth: number;
+  priority: number;
+  order: number;
+}
+
+// ---------------------------------------------------------------------------
+// Headless browser lifecycle
+// ---------------------------------------------------------------------------
+
+/**
+ * Launches the shared headless Chromium instance used by every capture
+ * pipeline (evidence crawl and harvest alike). No CDP port is required.
+ */
+export async function launchHeadlessChromium(): Promise<Browser> {
+  return chromium.launch({ headless: true });
+}
+
+// ---------------------------------------------------------------------------
+// Crawl engine
+// ---------------------------------------------------------------------------
+
+/** Derives a filesystem-safe slug from a URL path (`/` -> `index`). */
+function slugForPath(pathname: string): string {
+  const slug = pathname
+    .split('/')
+    .filter(Boolean)
+    .join('-')
+    .replace(/[^a-zA-Z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  return slug.length > 0 ? slug : 'index';
+}
+
+/**
+ * Runs the full evidence crawl for a root URL and writes the evidence bundle
+ * (screenshots, mirrored assets, `manifest.json`) under the evidence dir.
+ * Returns the persisted manifest.
+ */
+export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceManifest> {
+  const rootUrl = normalizeUrl(options.rootUrl);
+  if (rootUrl === null) {
+    throw new Error(`Invalid root URL: ${options.rootUrl}`);
+  }
+
+  const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
+  const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
+
+  const evidenceDir = resolve(options.evidenceDir ?? DEFAULT_EVIDENCE_DIR);
+  const screenshotsDir = join(evidenceDir, 'screenshots');
+  const assetsDir = join(evidenceDir, 'assets');
+  await mkdir(screenshotsDir, { recursive: true });
+  await mkdir(assetsDir, { recursive: true });
+
+  const rootOrigin = new URL(rootUrl).origin;
+  const startedAt = Date.now();
+
+  const browser = await launchHeadlessChromium();
+
+  const routes: EvidenceManifest['routes'] = [];
+  const assetUrls = new Set<string>();
+  const diagnostics: EvidenceManifest['diagnostics'] = {
+    skippedUrls: [],
+    failedNavigations: [],
+    uncapturedResources: [],
+  };
+
+  const visited = new Set<string>();
+  const queued = new Set<string>();
+  const recordedSkips = new Set<string>();
+  const frontier: FrontierEntry[] = [{ url: rootUrl, depth: 0, priority: 0, order: 0 }];
+  queued.add(rootUrl);
+
+  const bookkeeping: CrawlBookkeeping = {
+    visited,
+    queued,
+    frontier,
+    linksDiscovered: 0,
+    order: 1,
+  };
+
+  /** Records a skip once per URL. */
+  const skip = (url: string, reason: string): void => {
+    const key = `${url}::${reason}`;
+    if (recordedSkips.has(key)) return;
+    recordedSkips.add(key);
+    diagnostics.skippedUrls.push({ url, reason });
+  };
+
+  try {
+    const context = await browser.newContext({ viewport: { ...DESKTOP_VIEWPORT } });
+    const page = await context.newPage();
+
+    while (frontier.length > 0 && visited.size < maxPages) {
+      // Highest priority first, then shallowest, then discovery order.
+      frontier.sort(
+        (a, b) => b.priority - a.priority || a.depth - b.depth || a.order - b.order,
+      );
+      const entry = frontier.shift();
+      if (entry === undefined) break;
+
+      queued.delete(entry.url);
+      if (visited.has(entry.url)) continue;
+      visited.add(entry.url);
+
+      const path = safePathname(entry.url);
+
+      let title = '';
+      try {
+        await page.goto(entry.url, {
+          waitUntil: 'networkidle',
+          timeout: NAVIGATION_TIMEOUT_MS,
+        });
+        title = await page.title();
+      } catch (cause) {
+        const reason = cause instanceof Error ? cause.message : String(cause);
+        diagnostics.failedNavigations.push({ url: entry.url, reason });
+        continue;
+      }
+
+      // DOM snapshot + a11y tree + design tokens (shared harvester logic).
+      const snapshot = await captureDOMSnapshot(page, path);
+
+      // Dual-viewport screenshots.
+      const slug = slugForPath(path);
+      const desktopScreenshot = join(screenshotsDir, `${slug}-desktop.png`);
+      const mobileScreenshot = join(screenshotsDir, `${slug}-mobile.png`);
+
+      await page.setViewportSize({ ...DESKTOP_VIEWPORT });
+      await page.screenshot({ path: desktopScreenshot, type: 'png' });
+      await page.setViewportSize({ ...MOBILE_VIEWPORT });
+      await page.screenshot({ path: mobileScreenshot, type: 'png' });
+      await page.setViewportSize({ ...DESKTOP_VIEWPORT });
+
+      routes.push({
+        url: entry.url,
+        path,
+        title,
+        desktopScreenshot,
+        mobileScreenshot,
+        a11yTree: snapshot.a11yTree,
+        tokens: snapshot.tokens,
+      });
+
+      // Link discovery.
+      await enqueueLinks(page, entry, rootUrl, maxDepth, maxPages, bookkeeping, skip);
+
+      // Asset discovery.
+      for (const assetUrl of await discoverImageAssets(page)) {
+        assetUrls.add(assetUrl);
+      }
+    }
+
+    // Whatever the frontier still holds was cut off by the page cap.
+    for (const entry of frontier) {
+      skip(entry.url, `page-cap (max ${maxPages} pages)`);
+    }
+  } finally {
+    await browser.close();
+  }
+
+  // Asset mirroring pass.
+  const { entries: assets, uncaptured } = await mirrorAssets(
+    [...assetUrls],
+    rootOrigin,
+    assetsDir,
+  );
+  diagnostics.uncapturedResources.push(...uncaptured);
+
+  const manifest: EvidenceManifest = {
+    targetUrl: rootUrl,
+    crawledAt: new Date().toISOString(),
+    stats: {
+      pagesCrawled: routes.length,
+      linksDiscovered: bookkeeping.linksDiscovered,
+      assetsDownloaded: assets.filter((asset) => asset.status === 'downloaded').length,
+      assetsFailed: assets.filter((asset) => asset.status === 'failed').length,
+      externalAssets: assets.filter((asset) => asset.status === 'external').length,
+      durationMs: Date.now() - startedAt,
+    },
+    routes,
+    assets,
+    diagnostics,
+  };
+
+  await writeFile(
+    join(evidenceDir, 'manifest.json'),
+    JSON.stringify(manifest, null, 2),
+    'utf8',
+  );
+
+  return manifest;
+}
+
+// ---------------------------------------------------------------------------
+// Link enqueueing
+// ---------------------------------------------------------------------------
+
+/** Mutable crawl bookkeeping passed to the link enqueueing step. */
+interface CrawlBookkeeping {
+  visited: Set<string>;
+  queued: Set<string>;
+  frontier: FrontierEntry[];
+  linksDiscovered: number;
+  order: number;
+}
+
+/**
+ * Discovers same-origin links on the page and enqueues the crawlable ones,
+ * recording skips (off-site, non-page, over-depth, page-cap) as diagnostics.
+ */
+async function enqueueLinks(
+  page: Page,
+  entry: FrontierEntry,
+  rootUrl: string,
+  maxDepth: number,
+  maxPages: number,
+  bookkeeping: CrawlBookkeeping,
+  skip: (url: string, reason: string) => void,
+): Promise<void> {
+  const { visited, queued, frontier } = bookkeeping;
+
+  const hrefs = await page.$$eval('a[href]', (anchors) =>
+    anchors.map((anchor) => (anchor as HTMLAnchorElement).href),
+  );
+
+  for (const href of hrefs) {
+    const normalized = normalizeUrl(href);
+    if (normalized === null) continue;
+    bookkeeping.linksDiscovered += 1;
+
+    if (!isSameOrigin(normalized, rootUrl)) {
+      skip(normalized, 'off-site (not same-origin)');
+      continue;
+    }
+
+    if (visited.has(normalized) || queued.has(normalized)) continue;
+
+    if (!isCrawlablePage(normalized)) {
+      skip(normalized, 'non-page asset link');
+      continue;
+    }
+
+    const depth = entry.depth + 1;
+    if (depth > maxDepth) {
+      skip(normalized, `max-depth (${maxDepth})`);
+      continue;
+    }
+
+    if (visited.size + queued.size >= maxPages) {
+      skip(normalized, `page-cap (max ${maxPages} pages)`);
+      continue;
+    }
+
+    frontier.push({
+      url: normalized,
+      depth,
+      priority: linkPriority(normalized),
+      order: bookkeeping.order++,
+    });
+    queued.add(normalized);
+  }
+}
+
+/** Extracts a URL's pathname without throwing on malformed input. */
+function safePathname(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return url;
+  }
+}

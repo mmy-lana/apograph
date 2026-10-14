@@ -1,16 +1,17 @@
 /**
  * apograph — Environment diagnostics (`apograph doctor`).
  *
- * Checks Node.js runtime, local Chrome CDP accessibility, active LLM
- * connectivity (1-token probe through the resolved model), and local Ollama
- * status, printing a [PASS]/[WARN] checklist with exact fix commands.
+ * Checks Node.js runtime, headless Chromium availability (Playwright
+ * launch probe), active LLM connectivity (1-token probe through the resolved
+ * model), and local Ollama status, printing a [PASS]/[WARN] checklist with
+ * exact fix commands.
  */
 
 import { versions } from 'node:process';
 import { generateText } from 'ai';
+import { chromium } from 'playwright';
 import { getModel, resolveProviderName } from '../config/models.js';
 
-const CDP_VERSION_URL = 'http://localhost:9222/json/version';
 const OLLAMA_TAGS_URL = 'http://localhost:11434/api/tags';
 const PROBE_TIMEOUT_MS = 3_000;
 const MIN_NODE_MAJOR = 20;
@@ -49,29 +50,28 @@ function checkNodeVersion(): CheckResult {
   };
 }
 
-/** Checks local Chrome CDP accessibility on the default debugging port. */
-async function checkCdp(): Promise<CheckResult> {
-  const body = await probeJson(CDP_VERSION_URL);
+/** Checks headless Chromium availability by launching a probe instance. */
+async function checkChromium(): Promise<CheckResult> {
+  try {
+    const browser = await chromium.launch({ headless: true });
+    const version = browser.version();
+    await browser.close();
 
-  if (body) {
-    const browser = typeof body.Browser === 'string' ? body.Browser : 'Chrome';
     return {
-      label: 'Chrome CDP (localhost:9222)',
+      label: 'Headless Chromium (Playwright)',
       pass: true,
-      detail: browser,
+      detail: version,
       fix: null,
     };
+  } catch (cause) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    return {
+      label: 'Headless Chromium (Playwright)',
+      pass: false,
+      detail: reason,
+      fix: 'Install the Playwright Chromium build: `pnpm exec playwright install chromium`',
+    };
   }
-
-  return {
-    label: 'Chrome CDP (localhost:9222)',
-    pass: false,
-    detail: 'no response from /json/version',
-    fix:
-      'Launch Chrome with remote debugging enabled:\n' +
-      '  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\\n' +
-      '    --remote-debugging-port=9222',
-  };
 }
 
 /** Checks the resolved LLM with a 1-token generation probe. */
@@ -134,7 +134,7 @@ export async function runDoctor(): Promise<void> {
 
   const checks: CheckResult[] = [
     checkNodeVersion(),
-    await checkCdp(),
+    await checkChromium(),
     await checkLlm(),
     await checkOllama(),
   ];

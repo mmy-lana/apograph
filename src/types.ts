@@ -49,6 +49,87 @@ export interface HarvestedSession {
 }
 
 // ---------------------------------------------------------------------------
+// Layer 1b — Headless evidence crawl
+// ---------------------------------------------------------------------------
+
+/** One crawled page's recorded evidence. */
+export interface CrawlRoute {
+  /** The normalized URL of the page. */
+  url: string;
+  /** URL path of the page (e.g. `/about`). */
+  path: string;
+  /** Document title at capture time. */
+  title: string;
+  /** Local path of the desktop (1280x800) screenshot PNG. */
+  desktopScreenshot: string;
+  /** Local path of the mobile (390x844) screenshot PNG. */
+  mobileScreenshot: string;
+  /** Accessibility tree extracted at capture time. */
+  a11yTree: A11yNode;
+  /** Design tokens extracted at capture time. */
+  tokens: DesignTokens;
+}
+
+/** Lifecycle status of one mirrored asset. */
+export type AssetStatus = 'downloaded' | 'failed' | 'external';
+
+/** One entry in the asset manifest. */
+export interface AssetEntry {
+  originalUrl: string;
+  /** Local file path, or null when not mirrored (external / failed). */
+  localPath: string | null;
+  status: AssetStatus;
+  /** MIME type as reported by the download response, when known. */
+  mimeType?: string;
+}
+
+/** A URL the crawler chose not to visit, with the reason. */
+export interface SkippedUrl {
+  url: string;
+  reason: string;
+}
+
+/** A URL whose navigation failed, with the error reason. */
+export interface FailedNavigation {
+  url: string;
+  reason: string;
+}
+
+/** A resource that could not be captured into the evidence bundle. */
+export interface UncapturedResource {
+  url: string;
+  reason: string;
+}
+
+/** Crawl problems recorded for the manifest's diagnostics section. */
+export interface CrawlDiagnostics {
+  skippedUrls: SkippedUrl[];
+  failedNavigations: FailedNavigation[];
+  uncapturedResources: UncapturedResource[];
+}
+
+/** Aggregate statistics for one crawl run. */
+export interface CrawlStats {
+  pagesCrawled: number;
+  linksDiscovered: number;
+  assetsDownloaded: number;
+  assetsFailed: number;
+  externalAssets: number;
+  durationMs: number;
+}
+
+/** The full evidence bundle manifest written to `.apograph/evidence/manifest.json`. */
+export interface EvidenceManifest {
+  targetUrl: string;
+  /** ISO-8601 timestamp of the crawl. */
+  crawledAt: string;
+  stats: CrawlStats;
+  routes: CrawlRoute[];
+  assets: AssetEntry[];
+  diagnostics: CrawlDiagnostics;
+}
+
+// ---------------------------------------------------------------------------
 // Layer 2 — Reconstruction
 // ---------------------------------------------------------------------------
 
