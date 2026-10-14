@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo
+
+# Repomix & context dumps
+repomix-output.*
+*-output.xml
+*-output.txt
+
+# Environment & secrets
+.env
+.env.*
+*.local
+
+# Playwright & browser caches
+.cache/
+test-results/
+
+# OS metadata
+.DS_Store
+Thumbs.db
