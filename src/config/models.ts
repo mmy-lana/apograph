@@ -19,6 +19,7 @@ import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import type { LanguageModel } from 'ai';
 import { loadApographConfig } from '../commands/config.js';
+import type { ApographConfig } from '../commands/config.js';
 
 const LOCAL_OLLAMA_BASE_URL = 'http://localhost:11434/v1';
 /** Default local vision model (tuned for 16 GB Apple Silicon / Mac). */
@@ -34,33 +35,41 @@ const PROVIDER_MODELS = {
 /** The persisted config, read once per process (null when absent). */
 const persistedConfig = loadApographConfig();
 
-/**
- * Resolves which provider/alias is active, given the current environment
- * and the persisted config. Exported for diagnostics and tests; not part of
- * the model factory contract.
- */
-export function resolveProviderName(): 'gateway' | 'anthropic' | 'openai' | 'local' {
+/** Resolves which provider/alias is active. Pure and injectable for tests. */
+export function resolveProvider(
+  env: Record<string, string | undefined>,
+  config: ApographConfig | null,
+): 'gateway' | 'anthropic' | 'openai' | 'local' {
   if (env.APOGRAPH_BASE_URL && env.APOGRAPH_API_KEY) return 'gateway';
   if (env.ANTHROPIC_API_KEY) return 'anthropic';
   if (env.OPENAI_API_KEY) return 'openai';
 
   // Environment unset — fall back to the persisted config, if any.
-  if (persistedConfig !== null) {
-    if (persistedConfig.provider === 'gateway') return 'gateway';
-    if (persistedConfig.provider === 'anthropic') return 'anthropic';
-    if (persistedConfig.provider === 'openai') return 'openai';
+  if (config !== null) {
+    if (config.provider === 'gateway') return 'gateway';
+    if (config.provider === 'anthropic') return 'anthropic';
+    if (config.provider === 'openai') return 'openai';
   }
 
   return 'local';
 }
 
-/** Resolves the model id for a provider (env override > config > default). */
-function resolveModelId(provider: 'gateway' | 'anthropic' | 'openai' | 'local'): string {
+/** Resolves which provider/alias is active, given the live env and config. */
+export function resolveProviderName(): 'gateway' | 'anthropic' | 'openai' | 'local' {
+  return resolveProvider(env, persistedConfig);
+}
+
+/** Resolves the model id for a provider (env override > config > default). Pure. */
+export function resolveModelId(
+  provider: 'gateway' | 'anthropic' | 'openai' | 'local',
+  env: Record<string, string | undefined> = process.env,
+  config: ApographConfig | null = persistedConfig,
+): string {
   if (env.APOGRAPH_MODEL !== undefined && env.APOGRAPH_MODEL.length > 0) {
     return env.APOGRAPH_MODEL;
   }
-  if (persistedConfig?.model !== undefined && persistedConfig.model.length > 0) {
-    return persistedConfig.model;
+  if (config?.model !== undefined && config.model.length > 0) {
+    return config.model;
   }
   if (provider === 'local') return LOCAL_FALLBACK_MODEL;
   return PROVIDER_MODELS[provider];

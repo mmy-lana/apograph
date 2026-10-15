@@ -11,17 +11,23 @@ import { versions } from 'node:process';
 import { generateText } from 'ai';
 import { chromium } from 'playwright';
 import { getModel, resolveProviderName } from '../config/models.js';
+import {
+  validateProviderConfig,
+  probeModelCapabilities,
+} from '../config/validate.js';
+import { loadApographConfig } from './config.js';
 
 const OLLAMA_TAGS_URL = 'http://localhost:11434/api/tags';
 const PROBE_TIMEOUT_MS = 3_000;
 const MIN_NODE_MAJOR = 20;
 
-/** One diagnostic outcome. */
+/** One diagnostic outcome. `failed` upgrades the marker to [FAIL]. */
 interface CheckResult {
   label: string;
   pass: boolean;
   detail: string;
   fix: string | null;
+  failed?: boolean;
 }
 
 /** Probes a URL and returns its JSON object body, or null on failure. */
@@ -128,6 +134,70 @@ async function checkOllama(): Promise<CheckResult> {
   };
 }
 
+/** Configuration validation checks (MODEL-02) — network probes are warn-only. */
+async function checkProviderConfig(): Promise<CheckResult[]> {
+  const validation = await validateProviderConfig({ config: loadApographConfig() });
+  const results: CheckResult[] = [];
+
+  results.push({
+    label: 'Active provider / model',
+    pass: true,
+    detail: `${validation.provider} / ${validation.modelId}` +
+      (validation.credentialHint !== null ? ` — credential ${validation.credentialHint}` : ''),
+    fix: null,
+  });
+
+  for (const check of validation.checks) {
+    results.push({
+      label: `Provider config: ${check.label}`,
+      pass: check.status === 'pass',
+      detail: check.detail,
+      fix: check.fix,
+      failed: check.status === 'fail',
+    });
+  }
+  return results;
+}
+
+/** Capability probes (MODEL-03) — report-only, never changes pipeline behavior. */
+async function checkCapabilities(): Promise<CheckResult[]> {
+  const results: CheckResult[] = [];
+  let capabilities;
+  try {
+    capabilities = await probeModelCapabilities(getModel());
+  } catch (cause) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    return [
+      {
+        label: 'Model capability probes',
+        pass: false,
+        detail: `could not probe the resolved model: ${reason}`,
+        fix: 'Fix the connectivity [WARN] above; capability probes need a reachable model.',
+      },
+    ];
+  }
+
+  results.push({
+    label: 'Structured output support',
+    pass: capabilities.structuredOutput,
+    detail: capabilities.structuredOutput
+      ? 'model accepted a json_schema generateObject probe'
+      : 'probe rejected — the pipeline will use the generateText + JSON-extraction fallback',
+    fix: capabilities.structuredOutput ? null : 'No action needed (automatic fallback). Cloud models can enable native structured output.',
+  });
+
+  results.push({
+    label: 'Vision / image input',
+    pass: capabilities.vision,
+    detail: capabilities.vision
+      ? 'model accepted an image-part probe (vision synthesis available)'
+      : `probe failed${capabilities.error !== undefined ? ` — ${capabilities.error}` : ''} — deterministic template fallback will be used`,
+    fix: capabilities.vision ? null : 'No action needed (automatic fallback). Use a vision-capable model for full visual synthesis.',
+  });
+
+  return results;
+}
+
 /** Runs all diagnostics and prints the formatted checklist. */
 export async function runDoctor(): Promise<void> {
   console.log('apograph doctor — environment diagnostics\n');
@@ -136,11 +206,15 @@ export async function runDoctor(): Promise<void> {
     checkNodeVersion(),
     await checkChromium(),
     await checkLlm(),
+    ...(await checkProviderConfig()),
+    ...(await checkCapabilities()),
     await checkOllama(),
   ];
 
+  const failures = checks.filter((check) => !check.pass).length;
+
   for (const check of checks) {
-    const marker = check.pass ? '[PASS]' : '[WARN]';
+    const marker = check.pass ? '[PASS]' : check.failed === true ? '[FAIL]' : '[WARN]';
     console.log(`${marker} ${check.label} — ${check.detail}`);
     if (!check.pass && check.fix) {
       const indented = check.fix

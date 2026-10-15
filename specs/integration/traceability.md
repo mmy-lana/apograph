@@ -16,9 +16,9 @@ Test IDs are defined in `spec.md` §10 (TEST-01…TEST-05). "Planned" = test doe
 | DSH-02 verification guidance | IS-02 | Documented reload procedure executed once | Checklist record | TEST-03 | P3 | Planned |
 | CLIENT-01 generic writer | IS-02 | Merge preserves keys; corrupt input aborts; creates file if missing | Writer tests | TEST-02 | P2 | **Verified** (unit tests: create, merge-preserving, idempotent no-op, abort-on-corrupt with backup) |
 | CLIENT-02 ranked roster | IS-07 | Each promoted client: verified path/shape + writer test | Per-adapter tests + docs | TEST-02, TEST-05 | P4 (post-approval) | Planned |
-| MODEL-01 provider independence | IS-08 | Resolution depends only on env + config file | Precedence unit tests | TEST-04 | P2 | Planned |
-| MODEL-02 config validation | IS-08 | WARN/FAIL with fix text for each failure mode; healthy passes | validate.ts unit tests | TEST-04, TEST-03 | P2 | Planned |
-| MODEL-03 capability detection | IS-08 | doctor prints structured-output + vision lines; pipeline unchanged | Unit + manual record | TEST-04, TEST-03 | P2 | Planned |
+| MODEL-01 provider independence | IS-08 | Resolution depends only on env + config file | Precedence unit tests | TEST-04 | P2 | **Verified** (precedence + model-id override unit tests green) |
+| MODEL-02 config validation | IS-08 | WARN/FAIL with fix text for each failure mode; healthy passes | validate.ts unit tests | TEST-04, TEST-03 | P2 | **Verified** (all five issue classes classified; [FAIL] marker observed in doctor; network probes injectable) |
+| MODEL-03 capability detection | IS-08 | doctor prints structured-output + vision lines; pipeline unchanged | Unit + manual record | TEST-04, TEST-03 | P2 | **Verified locally** (doctor lines observed on live local Ollama; probes report-only) |
 | MODEL-04 scoped claims | IS-08 | README claims match models.ts code paths | Doc review | TEST-05 | P3 | Planned |
 | DOC-01 README overhaul | IS-01/IS-06 | All commands/tables verified against CLI | Command execution + table diff | TEST-05 | P3 | Planned |
 | DOC-02 client roster docs | IS-07 | Roster with verified paths; unverified labeled | Doc review | TEST-05 | P4 | Planned |

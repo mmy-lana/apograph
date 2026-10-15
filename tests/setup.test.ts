@@ -20,7 +20,7 @@ import {
   runDshSetup,
   writeMcpServersConfig,
   normalizeClientKey,
-} from '../src/commands/setup.ts';
+} from '../dist/commands/setup.js';
 
 const SERVER = { command: 'npx', args: ['-y', 'apograph-agents', 'mcp'] };
 
