@@ -1,6 +1,6 @@
 {
   "name": "apograph-agents",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Industrial cleanroom website recreation engine — headless multi-page crawl, vision-driven React synthesis, and 3-tier verification",
   "type": "module",
   "license": "MIT",
@@ -39,6 +39,7 @@
     "node": ">=20"
   },
   "scripts": {
+    "test": "tsc && node --test tests/setup.test.ts tests/config.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc",
     "bump:patch": "pnpm typecheck && pnpm build && npm version patch",

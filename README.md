@@ -110,11 +110,14 @@ The emitted project is a **pure frontend**: React 19.3 + Vite + React Router v7 
 | `apograph crawl <url>` | Headless evidence crawl: screenshots, a11y trees, tokens, SEO metadata, mirrored assets |
 | `apograph plan [dir]` | Derive the plan from evidence and approve it interactively (`--yes` to auto-approve) |
 | `apograph clone <url>` | Full pipeline: crawl → plan (approval gate) → modular synthesize → emit → verify |
+| `apograph resume [dir]` | Resume an interrupted clone from a saved checkpoint |
 | `apograph synthesize <dir>` | Modular synthesis from an approved `apograph-plan.json` |
 | `apograph verify <dir> [dir2]` | 3-tier verification of a generated project |
+| `apograph status` | Show status of generated projects under `./output/` |
 | `apograph config` | Configure the LLM provider (stored in `~/.apograph/config.json`) |
 | `apograph doctor` | Environment health check: Node, Chromium, LLM connectivity, Ollama |
-| `apograph setup` | Install the apograph MCP server into your AI coding agent |
+| `apograph mcp` | Start the apograph MCP server over stdio directly |
+| `apograph setup` | Install the apograph MCP server into your AI coding agent (DSH, Cursor, Claude) |
 
 ### `apograph clone`
 
