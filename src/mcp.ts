@@ -21,6 +21,7 @@ import type {
   DecompiledBundle,
 } from './types.js';
 import { crawlEvidence } from './crawler/engine.js';
+import { getVersion } from './version.js';
 import { createPlanFromEvidence } from './plan/generator.js';
 import { synthesizeModularProject, copyMirroredAssets } from './synthesizer/modular.js';
 import { emitProject } from './emitter/scaffold.js';
@@ -42,7 +43,7 @@ function appNameFromUrl(url: string): string {
 // ---------------------------------------------------------------------------
 
 const server = new McpServer(
-  { name: 'apograph', version: '0.1.0' },
+  { name: 'apograph', version: getVersion() },
   { capabilities: { tools: {} } },
 );
 

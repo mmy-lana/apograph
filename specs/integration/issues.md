@@ -1,5 +1,11 @@
 # Apograph SDD — Issue List
 
+> **Phase 02 update.** Local repairs landed (unpublished, per no-publish rule):
+> - **IS-01** — README commands corrected to `npx apograph-agents` + global-install line + package-name note. *Fixed locally; the published 0.1.1 tarball still carries the broken README until the next authorized release* (unpkg check: 0 occurrences of `npx apograph-agents` in the published README). Full closure requires TEST-03 + publish.
+> - **IS-04** — **Fixed and verified**: version single-sourced from `package.json` via new `src/version.ts`; CLI `--version` and MCP `serverInfo` both report `0.1.1` (observed locally and from a tarball install).
+> - **IS-06** — partial: stale "v0.1.0" claim fixed; `resume`/`status` CLI-table rows still missing (deferred to Phase 03/P3 docs pass). Ollama tag still unverified.
+> - **IS-09** — partial evidence: `npm pack --dry-run` verified tarball contents (78 files incl. README/LICENSE/package.json); tarball installed into a temp prefix, all three bins functional. Full checklist still pending.
+>
 > **Phase 01 update.** Priorities and dependencies below are superseded by `spec.md` / `plan.md`:
 > - **P1 (plan phase P1):** IS-03, IS-04 (+ new work MCP-02/04 lifecycle & error containment, folded here rather than tracked as separate issues).
 > - **P2:** IS-02 (now decomposed into spec requirements DSH-01, CLIENT-01, MODEL-01/02/03), IS-08.

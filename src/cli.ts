@@ -28,6 +28,7 @@ import { runVerification } from './verifier/engine.js';
 import { printVerificationSummary, writeVerificationReport } from './verifier/report.js';
 import { runDoctor } from './commands/doctor.js';
 import { runSetup } from './commands/setup.js';
+import { getVersion } from './version.js';
 import { runConfigCommand } from './commands/config.js';
 import { runStatusCommand } from './commands/status.js';
 import { startProgress } from './utils/progress.js';
@@ -511,7 +512,7 @@ const program = new Command('apograph');
 
 program
   .name('apograph')
-  .version('0.1.0')
+  .version(getVersion())
   .description('Cleanroom reverse-engineering and code synthesis tool');
 
 program

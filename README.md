@@ -7,7 +7,9 @@
 
 > **Turn any website into a standalone, verified React project with your coding agent.**
 
-Apograph (v0.1.0) is a four-phase cleanroom engine: it crawls a site headlessly across multiple pages, derives a schema-validated plan you approve interactively, synthesizes a fresh React 19 + Tailwind CSS v4 frontend with a multimodal vision LLM, and proves the result with a 3-tier verification pipeline — build, route smoke checks, and pixel-diff visual comparison against the original screenshots.
+Apograph (v0.1.1) is a four-phase cleanroom engine: it crawls a site headlessly across multiple pages, derives a schema-validated plan you approve interactively, synthesizes a fresh React 19 + Tailwind CSS v4 frontend with a multimodal vision LLM, and proves the result with a 3-tier verification pipeline — build, route smoke checks, and pixel-diff visual comparison against the original screenshots.
+
+> **Package note:** the published npm package is **`apograph-agents`**. Its executables are `apograph-agents`, `apograph`, and `apograph-mcp`. When running without installing, use the package name: `npx apograph-agents <command>` (`npx apograph <command>` fails with E404 because `apograph` is a bin name, not the package name).
 
 No scraping guesswork. No prompt archaeology. No proprietary source — the LLM only ever sees derived artifacts: screenshots, accessibility trees, design tokens, and an approved plan.
 
@@ -19,10 +21,17 @@ No scraping guesswork. No prompt archaeology. No proprietary source — the LLM 
 
 ```bash
 # One command: crawl → plan approval → vision synthesis → emit → verify
-npx apograph clone https://example.com
+npx apograph-agents clone https://example.com
 
 # Boot the recreation
 cd output/example-com && pnpm install && pnpm dev
+```
+
+Or install globally so the short `apograph` command is on your PATH:
+
+```bash
+npm i -g apograph-agents
+apograph clone https://example.com
 ```
 
 Apograph launches its own **headless Chromium** — there is nothing to configure, no browser to launch, and no debugging port to expose.
@@ -30,7 +39,7 @@ Apograph launches its own **headless Chromium** — there is nothing to configur
 ### 2. Or point your coding agent at Apograph
 
 ```bash
-npx apograph setup --client cursor
+npx apograph-agents setup --client cursor
 ```
 
 Then restart your agent and paste this prompt:
@@ -44,7 +53,7 @@ until it passes.
 ### 3. Verify your environment first (optional)
 
 ```bash
-npx apograph doctor
+npx apograph-agents doctor
 ```
 
 ---
@@ -176,6 +185,8 @@ Apograph resolves its synthesis model with zero configuration by default. Enviro
 | 2 | `ANTHROPIC_API_KEY` set | `claude-3-7-sonnet-latest` |
 | 3 | `OPENAI_API_KEY` set | `gpt-4o` |
 | 4 | Nothing set | Local Ollama (`apograph-qwen35:9b-8k` at `http://localhost:11434/v1`) |
+
+Set `APOGRAPH_MODEL` (or the model field saved by `apograph config`) to override the model id for **whichever provider is active** — it applies to the gateway, Anthropic, OpenAI, and Ollama routes alike (verified in `src/config/models.ts`: environment variables always take precedence over `~/.apograph/config.json`).
 
 Structured output (`generateObject`) is used when the model supports it, with an automatic `generateText` + JSON-extraction fallback for local models and proxies. When no vision model is reachable at all, every synthesis stage falls back to deterministic compile-ready templates — the pipeline always produces a complete project.
 
