@@ -6,6 +6,7 @@
 - **Amends:** `src/harvester/dom.ts` (s5.1), `src/crawler/engine.ts` (s2, s3), verification tier 3 assumptions
 - **Related:** `specs/integration/visual-resilience.md` (s2, s5, s8.4, s8.5)
 - **Discovered in:** Nirantara end-to-end run (`https://nirantara.id/`)
+- **Amendments:** A1 (hardened scroll reset contract — supersedes the fixed `RESET_DELAY_MS` blind wait in s3.1; see s8)
 
 ---
 
@@ -178,3 +179,95 @@ The patch is complete when, re-running the Nirantara clone end-to-end:
 - The scroll pass is best expressed as a pure planner (steps/termination decided from observed scroll metrics) plus a thin in-page executor, mirroring the existing pure-collector / pure-builder split that made D1's fix and test suite possible.
 - The evaluation-boundary rule should eventually be enforced mechanically (lint rule or runtime guard in a shared `page.evaluate` wrapper) rather than by discipline alone; this patch specifies the static test as the minimum bar.
 - Full-page capture increases evidence PNG sizes; the prompt-size guard already bounds what reaches the model, and the disk bundle is not size-constrained.
+
+---
+
+## 8. Amendment A1: Hardened Scroll Reset Contract (Floating Navbar Displacement)
+
+- **Amendment ID:** A1
+- **Status:** Draft
+- **Supersedes:** the fixed `RESET_DELAY_MS = 150` blind wait in s3.1 ("reset delay before any snapshot, visible-node count, or screenshot") for the reset phase specifically. All other s3.1 bounds (step cap, time cap, settle delay) and all other sections remain in force.
+- **Applies to:** `src/crawler/scroll.ts` (executor), `src/crawler/engine.ts` and `src/plan/evidenceGate.ts` (capture ordering consumers)
+- **Discovered in:** Nirantara full-page capture run (floating navbar rendered mid-page)
+
+### 8.1 Defect Statement (D3 — Floating Navbar Displacement)
+
+In full-page screenshots (`fullPage: true`), the sticky/floating navbar was captured in the middle or lower half of the page instead of resting at the top:
+
+1. The reset in `src/crawler/scroll.ts` calls `window.scrollTo(0, 0)` without `behavior: 'instant'`.
+2. Sites declaring `html { scroll-behavior: smooth }` animate that reset asynchronously over 1000–2000 ms.
+3. The fixed `RESET_DELAY_MS = 150` expires while the page is still mid-animation. Playwright composites a full-page capture by stitching viewport-sized raster passes, and `position: fixed` / `position: sticky` elements are re-composited at whatever scroll offset exists during each pass — so the navbar is painted at its mid-animation offset rather than at the top.
+
+The result is evidence screenshots whose chrome (navbar, floating headers) is displaced, propagating into: misleading Gate 1 review, vision prompts that teach the model a wrong layout, and tier-3 pixelmatch mismatches/repairs chasing a phantom defect that exists only in the evidence, not the source site.
+
+Root cause: the reset phase conflated "issued a scroll command" with "the viewport is at the top". The contract must be stated in terms of the observable end state (`window.scrollY === 0`), not a fixed latency guess.
+
+### 8.2 Contract Requirements: Hardened Reset Sequence
+
+The reset phase of the capture ordering (s3.1) is replaced by the following mandatory sequence, executed as a single atomic in-page unit wherever it runs (`scroll.ts` executor; consumers must not re-implement it):
+
+**Step R1 — CSS smooth-scroll override.** Before issuing any reset scroll, temporarily force `scroll-behavior: auto` with `!important` on both `document.documentElement` and `document.body` (inline style, overriding any stylesheet or media-query rule). This neutralizes `html { scroll-behavior: smooth }` at the source rather than racing it.
+
+**Step R2 — Instant multi-target scroll reset.** Issue the reset through all of the following, in order, in one in-page evaluation:
+
+- `window.scrollTo({ top: 0, left: 0, behavior: 'instant' })` — the primary path; the explicit `behavior` overrides any inherited smooth behavior at the call site.
+- `document.documentElement.scrollTop = 0` — direct assignment for engines/pages where the scrolling element is `<html>` and `scrollTo` behavior options are ignored.
+- `document.body.scrollTop = 0` — direct assignment for the legacy case where the scrolling element is `<body>` (quirks-mode or explicitly styled `body { overflow: auto; height: 100vh }` shells).
+- Virtual scroll library dispatch: when a known smooth-scroll virtualizer is present on `window`, invoke its immediate API — at minimum `window.lenis?.scrollTo(0, { immediate: true })`, and any additional adapter the implementation registers (documented as an extensible adapter table). The dispatch must be null-safe: absence of the library is the common case and never an error.
+
+**Step R3 — Verified zero-scroll position guard.** Replace the blind `RESET_DELAY_MS` wait with a polling guard: poll `window.scrollY === 0` at a short interval (default: 50 ms) until it holds true, with a hard timeout guard (default: 1000 ms). The guard verifies the observable end state before any screenshot, DOM snapshot, visible-node count, or health check proceeds.
+
+- Success path: `scrollY === 0` confirmed; capture proceeds immediately (no additional fixed delay is required — the poll IS the delay).
+- Timeout path: the viewport never confirmed zero (scroll locked by a script, a hijacked scroll container, an interstitial, or a virtualizer that re-scrolls on every reset attempt). The reset terminates safely: capture proceeds with the current position, and the outcome is recorded as a diagnostic (`scroll reset could not confirm top position; captured at offset N px`), never as a thrown error. A displaced capture with a diagnostic is auditable at Gate 1; a crashed route is not.
+
+**Step R4 — Style restoration.** The temporary `scroll-behavior` override from R1 is removed (inline property cleared) after the guard resolves, so the captured DOM snapshot reflects the page's authentic inline styles. Restoration is best-effort and unconditional (including the timeout path) so the page is never left with injected inline styles.
+
+**Ordering contract (amended):** goto settle → auto-scroll (bounded) → settle delay → **hardened reset R1–R4** → visible-node count → screenshots → DOM snapshot → metadata. The executor returns an observable outcome object: `{ confirmedTop: boolean, finalScrollY: number, terminatedBy: 'confirmed' | 'timeout' }`, and consumers record the diagnostic when `confirmedTop === false`.
+
+### 8.3 In-Page Isolation
+
+The entire R1–R4 sequence executes inside `page.evaluate` bodies that remain 100% lexically self-contained per s2.1: the adapter list (Lenis and any others) must be declared inside the evaluated function, and no Node module-scope identifier may be referenced. The pure decision logic (poll planning: interval, deadline, termination classification from observed scroll positions, with an injectable clock and observer stream) remains exported and Node-testable, mirroring the planner/executor split of s3.1.
+
+### 8.4 Edge Case Safeguards (additions to s4)
+
+| Edge Case | Risk | Required Safeguard |
+|---|---|---|
+| `scroll-behavior: smooth` on `html` or `body` (incl. media-query variants) | Reset animates over 1000–2000 ms; fixed delay expires mid-animation; fixed/sticky chrome painted mid-page | R1 forces `auto !important` on both elements before the reset; R2 uses `behavior: 'instant'` regardless; R3 verifies the end state instead of guessing latency. |
+| Scrolling element is `body`, not `html` | `window.scrollTo` with behavior options is ignored on some engines; reset silently no-ops | R2 assigns `scrollTop` on both `documentElement` and `body`. |
+| Lenis / virtual smooth-scroll libraries | The library intercepts `window.scrollTo` and re-animates; direct assignments are reverted on the next animation frame | R2 dispatches the library's immediate API (`window.lenis?.scrollTo(0, { immediate: true })`) via a null-safe in-page adapter list. |
+| Scroll position locked (hijacked container, script re-scrolling on reset, cookie interstitial) | Poll would spin forever | R3 hard timeout (1000 ms); safe termination with capture-at-current-offset plus a recorded diagnostic; never a thrown error. |
+| Pages already at top (common case: short pages, or reset issued after planner determined zero steps) | Added latency from an unnecessary poll | First poll iteration observes `scrollY === 0` and confirms immediately; total added cost is one evaluate round-trip. |
+| Full-page compositing of fixed/sticky elements | Even at `scrollY === 0`, a stale scroll-linked transform (translate applied during the scroll pass and never removed) can displace the navbar | R3's confirmation of `scrollY === 0` is the primary guard; consumers additionally rely on the settle delay (s3.1) before the reset for transform-clean state. Sites whose chrome remains displaced at confirmed-zero scroll are a visual fidelity issue for the evidence review gate, not a reset-contract violation. |
+| Style restoration failure (page script mutates inline styles during R1–R4) | Temporary override leaks into the DOM snapshot | R4 restoration is unconditional and best-effort; the captured inline style is cosmetic to tokens (design-token extraction reads computed values), and the leak risk is accepted and documented. |
+
+### 8.5 Test Requirements (additions to s5)
+
+Pure, browser-free units (poll planner with injectable clock/observer; adapter dispatch table) plus executor-level fake-page tests:
+
+| Test | Assertion |
+|---|---|
+| `reset > smooth scroll is overridden to auto` | The in-page reset source declares `scroll-behavior` with `!important` on both `documentElement` and `body` before any `scrollTo` call (source-order assertion on the evaluated function body), and the executor's fake page records the style override preceding the scroll commands. |
+| `reset > zero-scroll position is verified before proceeding` | Given a fake page whose `scrollY` reports 500 for the first two poll observations then 0, the guard confirms after three polls and the executor's operation log places `confirmTop` after the reset commands and strictly before the capture-phase operations; given a page already at 0, exactly one poll observation is made. |
+| `reset > timeout guard terminates safely when scroll is locked` | Given a fake page whose `scrollY` never reaches 0 and a clock that advances past the 1000 ms deadline, the guard terminates with `terminatedBy: 'timeout'`, `confirmedTop: false`, the final `scrollY` is surfaced, no error is thrown, and the diagnostic string is produced for the consumer to record. |
+| `reset > multi-target reset issues all three scroll paths` | The evaluated reset body contains the `behavior: 'instant'` scrollTo, the `documentElement.scrollTop` assignment, and the `body.scrollTop` assignment. |
+| `reset > virtual scroll adapter is null-safe` | The evaluated body dispatches `window.lenis?.scrollTo(0, { immediate: true })` with optional chaining; a fake page without `lenis` completes the reset without error. |
+| `reset > style restoration always runs` | The executor removes the temporary `scroll-behavior` override on both the confirmed and timeout paths (fake-page assertion). |
+
+### 8.6 Regression Protection
+
+The existing suites (106 passing tests, including this patch's s5 assertions) must remain green. Specifically:
+
+- The s5.2 executor-ordering test is amended, not invalidated: the operation log's `resetDelay` entry is replaced by `confirmTop` (or the sequence `scrollReset`, `confirmTop`), and the ordering invariant — reset strictly precedes every screenshot/snapshot — is unchanged.
+- The s5.1 isolation scan continues to cover every new evaluated body added by this amendment.
+- `scroll.test.ts` planner tests (bottom/step/timeout/zero-height termination) are untouched: the amendment changes only the reset phase, not the planner.
+- All other suites (`health`, `theme`, `corpus`, `ui`, `gate`, `repair`) are unaffected: they consume persisted evidence or pure helpers, and the amended reset changes no exported signature they depend on.
+
+### 8.7 Acceptance Criteria (Amendment)
+
+The amendment is complete when, re-running the Nirantara clone end-to-end:
+
+1. The floating navbar rests at the top of every full-page desktop and mobile evidence screenshot, including Gate 1 re-crawls.
+2. On a page with `html { scroll-behavior: smooth }`, the reset confirms `scrollY === 0` within the poll window without relying on any fixed latency guess.
+3. A page with a locked scroll position still completes its capture with a recorded diagnostic, never a thrown error.
+4. No `scroll-behavior` inline style leak appears in captured design tokens or DOM snapshots after restoration.
+5. The full unit suite passes with 0 failures: the existing 106 tests plus the new reset assertions.
