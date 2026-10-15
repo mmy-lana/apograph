@@ -15,9 +15,10 @@ import { PNG } from 'pngjs';
 import {
   planAutoScroll,
   autoScrollWithReset,
+  planConfirmTop,
+  scrollResetDiagnostic,
   MAX_SCROLL_STEPS,
   SETTLE_DELAY_MS,
-  RESET_DELAY_MS,
 } from '../dist/crawler/scroll.js';
 import type { ScrollTickResult } from '../dist/crawler/scroll.js';
 import { compareScreenshots } from '../dist/verifier/engine.js';
@@ -181,23 +182,48 @@ test('scroll > zero-height body terminates immediately with zero steps', async (
 // ---------------------------------------------------------------------------
 
 interface FakePageCall {
-  kind: 'evaluate-tick' | 'evaluate-initial' | 'evaluate-reset' | 'wait';
+  kind:
+    | 'evaluate-tick'
+    | 'evaluate-initial'
+    | 'evaluate-reset'
+    | 'evaluate-observe'
+    | 'evaluate-restore'
+    | 'wait';
   ms?: number;
 }
 
-function makeFakePage(initialMaxScroll: number, converge: boolean): {
+interface FakePageOptions {
+  initialMaxScroll: number;
+  converge: boolean;
+  /** Post-reset scrollY the fake page reports (simulates a locked scroll). */
+  lockedScrollY?: number;
+}
+
+function makeFakePage(options: FakePageOptions): {
   page: Parameters<typeof autoScrollWithReset>[0];
   calls: FakePageCall[];
 } {
+  const { initialMaxScroll, converge, lockedScrollY = 0 } = options;
   const calls: FakePageCall[] = [];
   let maxScroll = initialMaxScroll;
 
   const page = {
     evaluate: async (fn: unknown, arg: unknown) => {
       const source = String(fn);
-      if (source.includes('window.scrollTo(0, 0)')) {
-        calls.push({ kind: 'evaluate-reset' });
+      if (source.includes("removeProperty('scroll-behavior')")) {
+        calls.push({ kind: 'evaluate-restore' });
         return null;
+      }
+      if (source.includes("setProperty('scroll-behavior'")) {
+        // R1+R2 atomic hardened reset: style override plus instant multi-
+        // target scroll. Post-reset scrollY is the locked offset if any.
+        calls.push({ kind: 'evaluate-reset' });
+        return lockedScrollY;
+      }
+      if (source.includes('window.scrollY') && !source.includes('scrollHeight')) {
+        // R3 zero-scroll observation poll.
+        calls.push({ kind: 'evaluate-observe' });
+        return lockedScrollY;
       }
       if (source.includes('top: target')) {
         calls.push({ kind: 'evaluate-tick' });
@@ -216,20 +242,32 @@ function makeFakePage(initialMaxScroll: number, converge: boolean): {
   return { page: page as unknown as Parameters<typeof autoScrollWithReset>[0], calls };
 }
 
-test('scroll > executor ordering: autoScroll, settle, reset, resetDelay', async () => {
-  const { page, calls } = makeFakePage(2000, true);
-  const result = await autoScrollWithReset(page);
+test('scroll > executor ordering: autoScroll, settle, reset, confirmTop, restore', async () => {
+  const { page, calls } = makeFakePage({ initialMaxScroll: 2000, converge: true });
+  const result = await autoScrollWithReset(page, {}, { sleep: async () => {} });
 
-  assert.deepEqual(result.operations, ['autoScroll', 'settleDelay', 'scrollReset', 'resetDelay']);
-  assert.equal(result.terminatedBy, 'bottom');
+  assert.deepEqual(result.operations, [
+    'autoScroll',
+    'settleDelay',
+    'scrollReset',
+    'confirmTop',
+    'restoreStyles',
+  ]);
+  assert.equal(result.scrollTerminatedBy, 'bottom');
+  // Amendment A1: the reset confirmed the top position.
+  assert.equal(result.confirmedTop, true);
+  assert.equal(result.finalScrollY, 0);
 
-  // Settle delay is exactly the spec constant; reset delay follows the reset.
+  // Settle delay is exactly the spec constant; the hardened reset and the
+  // zero-scroll confirmation follow it; restoration closes the sequence.
   const settle = calls.findIndex((call) => call.kind === 'wait' && call.ms === SETTLE_DELAY_MS);
   const reset = calls.findIndex((call) => call.kind === 'evaluate-reset');
-  const resetDelay = calls.findIndex((call) => call.kind === 'wait' && call.ms === RESET_DELAY_MS);
-  assert.ok(reset > -1, 'scroll reset to (0, 0) must be performed');
+  const confirm = calls.findIndex((call) => call.kind === 'evaluate-observe');
+  const restore = calls.findIndex((call) => call.kind === 'evaluate-restore');
+  assert.ok(reset > -1, 'hardened scroll reset must be performed');
   assert.ok(settle > -1 && settle < reset, 'settle delay must precede the reset');
-  assert.ok(reset < resetDelay, 'post-reset delay must follow the reset');
+  assert.ok(confirm > -1 && reset < confirm, 'zero-scroll confirmation must follow the reset');
+  assert.ok(restore > -1 && confirm < restore, 'style restoration must follow the guard');
   // At least one tick happened before the reset.
   assert.ok(calls.some((call) => call.kind === 'evaluate-tick'));
 });
@@ -333,4 +371,176 @@ test('verify > cropped comparison still detects real mismatch', async () => {
   const result = compareScreenshots(PNG.sync.write(topRedReference), current, '/tmp/unused-diff.png', 800);
   assert.equal(result.mismatchPercent, 100);
   assert.equal(result.cropNote, 'reference cropped from 2400 px to viewport height');
+});
+
+// ---------------------------------------------------------------------------
+// s8.5 (Amendment A1) - Hardened scroll reset contract
+// ---------------------------------------------------------------------------
+
+/** Reads the executor's hardened reset function source for static checks. */
+async function readScrollSource(): Promise<string> {
+  return readFile(join(SRC_ROOT, 'src', 'crawler', 'scroll.ts'), 'utf8');
+}
+
+test('reset > smooth scroll is overridden to auto', async () => {
+  const source = await readScrollSource();
+
+  // R1 is declared inside the atomic reset body: inline style with
+  // !important, on both scrolling elements, BEFORE any scrollTo call.
+  const resetIdx = source.indexOf("operations.push('scrollReset')");
+  const body = source.slice(resetIdx, source.indexOf('confirmTop', resetIdx));
+  const overrideDocEl = body.indexOf("docEl.style.setProperty('scroll-behavior', 'auto', 'important')");
+  const overrideBody = body.indexOf("body.style.setProperty('scroll-behavior', 'auto', 'important')");
+  const scrollTo = body.indexOf("window.scrollTo({ top: 0, left: 0, behavior: 'instant'");
+  assert.ok(overrideDocEl > -1, 'documentElement override must exist');
+  assert.ok(overrideBody > -1, 'body override must exist');
+  assert.ok(overrideDocEl < scrollTo && overrideBody < scrollTo, 'overrides must precede the reset scroll');
+
+  // Executor-level: the override evaluate happens before confirmation.
+  const { page, calls } = makeFakePage({ initialMaxScroll: 500, converge: true });
+  const result = await autoScrollWithReset(page, {}, { sleep: async () => {} });
+  assert.equal(result.confirmedTop, true);
+  const resetCall = calls.findIndex((call) => call.kind === 'evaluate-reset');
+  assert.ok(resetCall > -1);
+  assert.ok(resetCall < calls.findIndex((call) => call.kind === 'evaluate-observe'));
+});
+
+test('reset > zero-scroll position is verified before proceeding', async () => {
+  // Page reports a non-zero offset that settles to 0: guard polls until 0.
+  const { page, calls } = makeFakePage({ initialMaxScroll: 500, converge: true });
+  const result = await autoScrollWithReset(page, {}, { sleep: async () => {} });
+  assert.equal(result.terminatedBy, 'confirmed');
+  assert.equal(result.confirmedTop, true);
+  // At least one observation poll ran after the reset and before restore.
+  const resetIdx = calls.findIndex((call) => call.kind === 'evaluate-reset');
+  const firstObserve = calls.findIndex((call) => call.kind === 'evaluate-observe');
+  const restoreIdx = calls.findIndex((call) => call.kind === 'evaluate-restore');
+  assert.ok(firstObserve > resetIdx, 'confirmation poll must follow the reset');
+  assert.ok(restoreIdx > firstObserve, 'capture-affecting restoration must follow the guard');
+
+  // Pure planner: a page already at 0 needs exactly one observation.
+  let observations = 0;
+  const immediate = await planConfirmTop(
+    async () => {
+      observations += 1;
+      return 0;
+    },
+    async () => {},
+    () => 0,
+  );
+  assert.equal(observations, 1);
+  assert.deepEqual(immediate, { confirmedTop: true, finalScrollY: 0, terminatedBy: 'confirmed' });
+
+  // Pure planner: 500 -> 500 -> 0 confirms on the third poll.
+  const seq = [500, 500, 0];
+  let index = 0;
+  const polled = await planConfirmTop(
+    async () => seq[Math.min(index++, seq.length - 1)] as number,
+    async () => {},
+    () => 0,
+  );
+  assert.equal(index, 3);
+  assert.deepEqual(polled, { confirmedTop: true, finalScrollY: 0, terminatedBy: 'confirmed' });
+});
+
+test('reset > timeout guard terminates safely when scroll is locked', async () => {
+  // Locked page: every observation reports 500 px; the clock advances 100 ms
+  // per poll so the 1000 ms deadline trips.
+  let elapsed = 0;
+  let observations = 0;
+  const outcome = await planConfirmTop(
+    async () => {
+      observations += 1;
+      elapsed += 100;
+      return 500;
+    },
+    async () => {},
+    () => elapsed,
+  );
+  assert.deepEqual(outcome, { confirmedTop: false, finalScrollY: 500, terminatedBy: 'timeout' });
+  assert.ok(observations >= 1);
+
+  // The diagnostic names the locked offset and is a note, not an error.
+  const diagnostic = scrollResetDiagnostic(outcome);
+  assert.ok(diagnostic.includes('captured at offset 500 px'));
+
+  // Executor level: the timeout path completes without throwing and still
+  // performs unconditional style restoration.
+  const { page, calls } = makeFakePage({ initialMaxScroll: 2000, converge: true, lockedScrollY: 500 });
+  const executorNow = (() => {
+    let polls = 0;
+    return () => {
+      // The first observation happens immediately; each subsequent poll
+      // advances the clock by 600 ms so the 1000 ms deadline trips on the
+      // second observation.
+      polls += 1;
+      return polls <= 1 ? 0 : (polls - 1) * 600;
+    };
+  })();
+  const result = await autoScrollWithReset(page, {}, { now: executorNow, sleep: async () => {} });
+  assert.equal(result.confirmedTop, false);
+  assert.equal(result.finalScrollY, 500);
+  assert.equal(result.terminatedBy, 'timeout');
+  assert.ok(calls.some((call) => call.kind === 'evaluate-restore'), 'R4 restoration must run on the timeout path');
+});
+
+test('reset > multi-target reset issues all three scroll paths', async () => {
+  const source = await readScrollSource();
+  const resetIdx = source.indexOf("operations.push('scrollReset')");
+  const body = source.slice(resetIdx, source.indexOf('operations.push(\'confirmTop\')', resetIdx));
+  assert.ok(body.includes("window.scrollTo({ top: 0, left: 0, behavior: 'instant'"));
+  assert.ok(body.includes('docEl.scrollTop = 0'));
+  assert.ok(body.includes('body.scrollTop = 0'));
+});
+
+test('reset > virtual scroll adapter is null-safe', async () => {
+  const source = await readScrollSource();
+  const resetIdx = source.indexOf("operations.push('scrollReset')");
+  const body = source.slice(resetIdx, source.indexOf("operations.push('confirmTop')", resetIdx));
+  assert.ok(body.includes('lenis'), 'Lenis dispatch must be present');
+  assert.ok(body.includes('?.scrollTo?.(0, { immediate: true })'), 'dispatch must be null-safe (optional chaining)');
+  assert.ok(body.includes('window.lenis?.scrollTo(0, { immediate: true })'), 'canonical dispatch shape documented');
+
+  // A fake page without a `lenis` global completes the reset without error.
+  const { page } = makeFakePage({ initialMaxScroll: 500, converge: true });
+  const result = await autoScrollWithReset(page, {}, { sleep: async () => {} });
+  assert.equal(result.confirmedTop, true);
+});
+
+test('reset > style restoration always runs', async () => {
+  const source = await readScrollSource();
+  const restoreIdx = source.indexOf("operations.push('restoreStyles')");
+  const confirmIdx = source.indexOf('planConfirmTop(', source.indexOf("operations.push('scrollReset')"));
+  assert.ok(restoreIdx > -1 && confirmIdx > -1);
+  // Restoration is unconditional: it follows the guard without any branch
+  // between them inspecting the outcome.
+  const between = source.slice(confirmIdx, restoreIdx);
+  assert.ok(!between.includes('return '), 'no early return may skip R4 restoration');
+
+  // Confirmed path restores.
+  const confirmed = makeFakePage({ initialMaxScroll: 500, converge: true });
+  await autoScrollWithReset(confirmed.page, {}, { sleep: async () => {} });
+  assert.ok(confirmed.calls.some((call) => call.kind === 'evaluate-restore'));
+
+  // Timeout path restores too.
+  const locked = makeFakePage({ initialMaxScroll: 2000, converge: true, lockedScrollY: 500 });
+  let polls = 0;
+  await autoScrollWithReset(
+    locked.page,
+    {},
+    {
+      now: () => {
+        polls += 1;
+        return polls <= 1 ? 0 : (polls - 1) * 600;
+      },
+      sleep: async () => {},
+    },
+  );
+  assert.ok(locked.calls.some((call) => call.kind === 'evaluate-restore'));
+
+  // The in-page restoration clears the override on both scrolling elements.
+  const restoreBodyIdx = source.indexOf("operations.push('restoreStyles')");
+  const restoreBody = source.slice(restoreBodyIdx, source.indexOf('scrollTerminatedBy', restoreBodyIdx));
+  assert.ok(restoreBody.includes("document.documentElement.style.removeProperty('scroll-behavior')"));
+  assert.ok(restoreBody.includes("body.style.removeProperty('scroll-behavior')"));
 });

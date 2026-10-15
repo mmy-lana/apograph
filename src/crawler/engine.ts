@@ -33,7 +33,7 @@ import {
   classifyRedirect,
 } from './health.js';
 import type { CaptureHealth } from './health.js';
-import { autoScrollWithReset } from './scroll.js';
+import { autoScrollWithReset, scrollResetDiagnostic } from './scroll.js';
 import {
   createScopeFilter,
   isCrawlablePage,
@@ -238,15 +238,19 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
       }
 
       // Patch spec s3.1 capture ordering: goto settle -> auto-scroll ->
-      // settle delay -> scroll reset (0,0) -> reset delay, before any
+      // settle delay -> hardened scroll reset -> confirm top, before any
       // snapshot, node count, or screenshot.
       const scroll = await autoScrollWithReset(page);
-      if (scroll.terminatedBy !== 'bottom') {
+      if (scroll.scrollTerminatedBy !== 'bottom') {
         skip(
           entry.url,
-          `auto-scroll terminated by ${scroll.terminatedBy} after ${scroll.steps} step(s) ` +
+          `auto-scroll terminated by ${scroll.scrollTerminatedBy} after ${scroll.steps} step(s) ` +
             '(probable infinite scroll); capture proceeded within bounds',
         );
+      }
+      // Amendment A1 R3: record an unconfirmed reset as a diagnostic.
+      if (!scroll.confirmedTop) {
+        skip(entry.url, scrollResetDiagnostic(scroll));
       }
 
       // Viewport-gated full-page screenshots (patch spec s3.2). Captured at

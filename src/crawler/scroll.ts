@@ -22,8 +22,11 @@ export const SCROLL_TIMEOUT_MS = 5000;
 /** Settle delay at the bottom before capture, in ms. */
 export const SETTLE_DELAY_MS = 750;
 
-/** Delay after the scroll reset before capture, in ms. */
-export const RESET_DELAY_MS = 150;
+/** Poll interval for the verified zero-scroll guard, in ms (amendment A1 R3). */
+export const CONFIRM_TOP_INTERVAL_MS = 50;
+
+/** Hard timeout for the verified zero-scroll guard, in ms (amendment A1 R3). */
+export const CONFIRM_TOP_TIMEOUT_MS = 1000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -61,6 +64,16 @@ export interface ScrollPlanResult {
   terminatedBy: ScrollTermination;
   /** The maximum scroll position observed at termination. */
   finalMaxScroll: number;
+}
+
+/** Outcome of the hardened scroll reset guard (amendment A1 R3). */
+export interface ConfirmTopOutcome {
+  /** True when `window.scrollY === 0` was observed before the deadline. */
+  confirmedTop: boolean;
+  /** The last observed scroll position. */
+  finalScrollY: number;
+  /** How the guard terminated. */
+  terminatedBy: 'confirmed' | 'timeout';
 }
 
 /** Minimal page surface the executor needs (Playwright Page satisfies it). */
@@ -136,20 +149,91 @@ export async function planAutoScroll(
 }
 
 // ---------------------------------------------------------------------------
-// Executor
+// Verified zero-scroll guard (amendment A1 R3, pure planner)
 // ---------------------------------------------------------------------------
+
+/** Configurable bounds for the zero-scroll confirmation guard. */
+export interface ConfirmTopLimits {
+  intervalMs: number;
+  timeoutMs: number;
+}
+
+/** Default confirm-top limits (patch spec s8.2 R3). */
+export function defaultConfirmTopLimits(): ConfirmTopLimits {
+  return { intervalMs: CONFIRM_TOP_INTERVAL_MS, timeoutMs: CONFIRM_TOP_TIMEOUT_MS };
+}
+
+/**
+ * Pure planner for the verified zero-scroll guard (amendment A1 R3): polls
+ * the injectable `observe` (returning the current `window.scrollY`) at
+ * `intervalMs` until it observes 0, or until the injectable clock exceeds
+ * `timeoutMs`. Never throws; the timeout path is a safe, diagnostic-grade
+ * termination. The `sleep` injectable lets tests run without real timers.
+ */
+export async function planConfirmTop(
+  observe: () => Promise<number>,
+  sleep: (ms: number) => Promise<void>,
+  now: () => number = () => 0,
+  limits: Partial<ConfirmTopLimits> = {},
+): Promise<ConfirmTopOutcome> {
+  const { intervalMs, timeoutMs } = { ...defaultConfirmTopLimits(), ...limits };
+  const startedAt = now();
+
+  for (;;) {
+    const scrollY = await observe();
+    if (scrollY === 0) {
+      return { confirmedTop: true, finalScrollY: 0, terminatedBy: 'confirmed' };
+    }
+    if (now() - startedAt >= timeoutMs) {
+      return { confirmedTop: false, finalScrollY: scrollY, terminatedBy: 'timeout' };
+    }
+    await sleep(intervalMs);
+  }
+}
+
+/** Builds the consumer-facing diagnostic for an unconfirmed reset (A1 R3). */
+export function scrollResetDiagnostic(outcome: ConfirmTopOutcome): string {
+  return `scroll reset could not confirm top position; captured at offset ${outcome.finalScrollY} px`;
+}
+
+// ---------------------------------------------------------------------------
+// Executor (amendment A1: hardened reset sequence R1-R4)
+// ---------------------------------------------------------------------------
+
+/** Hooks the executor accepts for testability (all optional). */
+export interface ScrollExecutorHooks {
+  /** Monotonic clock for the confirm-top guard. Defaults to Date.now. */
+  now?: () => number;
+  /** Sleep primitive for polls and settle delays. Defaults to setTimeout. */
+  sleep?: (ms: number) => Promise<void>;
+}
 
 /**
  * Runs the bounded auto-scroll pass on a live page and then performs the
- * mandatory capture-ordering tail: settle delay at the bottom, scroll reset
- * to (0, 0), and the post-reset delay (patch spec s3.1). Returns the plan
- * result plus the ordered operation log for testability (patch spec s5.2).
+ * mandatory capture-ordering tail with the HARDENED reset sequence
+ * (amendment A1):
+ *
+ *   R1  force `scroll-behavior: auto !important` on html and body inline;
+ *   R2  instant multi-target reset (scrollTo instant, scrollTop on html and
+ *       body, null-safe virtualizer dispatch);
+ *   R3  poll `window.scrollY === 0` (50 ms interval, 1000 ms hard timeout,
+ *       safe termination with diagnostic on timeout);
+ *   R4  unconditional best-effort restoration of the temporary override.
+ *
+ * Returns the plan result, the ordered operation log, and the reset outcome
+ * for consumer diagnostics (patch spec s8.2, s5.2).
  */
 export async function autoScrollWithReset(
   page: ScrollablePage,
   limits: Partial<ScrollLimits> = {},
-): Promise<ScrollPlanResult & { operations: string[] }> {
+  hooks: ScrollExecutorHooks = {},
+): Promise<Omit<ScrollPlanResult, 'terminatedBy'> & {
+  /** Why the auto-scroll pass terminated ('bottom' | 'steps' | 'timeout'). */
+  scrollTerminatedBy: ScrollTermination;
+} & ConfirmTopOutcome & { operations: string[] }> {
   const operations: string[] = [];
+  const now = hooks.now ?? (() => Date.now());
+  const sleep = hooks.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
   const initial = await page.evaluate(() => {
     const scrollHeight = document.documentElement.scrollHeight;
@@ -185,13 +269,50 @@ export async function autoScrollWithReset(
   operations.push('settleDelay');
   await page.waitForTimeout(SETTLE_DELAY_MS);
 
+  // --- R1 + R2: atomic in-page hardened reset. Self-contained body (patch
+  // spec s2.1 Rule 1): the style override, the multi-target instant reset,
+  // and the null-safe virtualizer dispatch all live inside this closure.
   operations.push('scrollReset');
   await page.evaluate(() => {
-    window.scrollTo(0, 0);
+    const docEl = document.documentElement;
+    const body = document.body;
+    // R1: neutralize CSS smooth scrolling at the source.
+    docEl.style.setProperty('scroll-behavior', 'auto', 'important');
+    if (body !== null) body.style.setProperty('scroll-behavior', 'auto', 'important');
+    // R2: instant multi-target reset across every scrolling element.
+    window.scrollTo({ top: 0, left: 0, behavior: 'instant' as ScrollBehavior });
+    docEl.scrollTop = 0;
+    if (body !== null) body.scrollTop = 0;
+    // R2: null-safe virtual smooth-scroll library dispatch. The canonical
+    // call shape is `window.lenis?.scrollTo(0, { immediate: true })`; the
+    // double optional chain also guards a lenis object without scrollTo.
+    const lenisHost = window as unknown as {
+      lenis?: { scrollTo?: (target: number, options?: { immediate?: boolean }) => void };
+    };
+    lenisHost.lenis?.scrollTo?.(0, { immediate: true });
   }, null);
 
-  operations.push('resetDelay');
-  await page.waitForTimeout(RESET_DELAY_MS);
+  // --- R3: verified zero-scroll guard (replaces the blind fixed delay).
+  operations.push('confirmTop');
+  const outcome = await planConfirmTop(
+    () =>
+      page.evaluate(() => window.scrollY, null),
+    (ms) => sleep(ms),
+    now,
+  );
 
-  return { ...plan, operations };
+  // --- R4: unconditional best-effort style restoration (both paths).
+  operations.push('restoreStyles');
+  await page.evaluate(() => {
+    document.documentElement.style.removeProperty('scroll-behavior');
+    const body = document.body;
+    if (body !== null) body.style.removeProperty('scroll-behavior');
+  }, null);
+
+  return {
+    ...plan,
+    scrollTerminatedBy: plan.terminatedBy,
+    ...outcome,
+    operations,
+  };
 }

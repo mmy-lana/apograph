@@ -23,7 +23,7 @@ import * as p from '@clack/prompts';
 import type { A11yNode, CrawlRoute, EvidenceManifest } from '../types.js';
 import { checkCaptureHealth } from '../crawler/health.js';
 import type { CaptureHealth } from '../crawler/health.js';
-import { autoScrollWithReset } from '../crawler/scroll.js';
+import { autoScrollWithReset, scrollResetDiagnostic } from '../crawler/scroll.js';
 import { captureDOMSnapshot } from '../harvester/dom.js';
 import { launchHeadlessChromium } from '../crawler/engine.js';
 
@@ -495,9 +495,16 @@ export async function recrawlRoute(
     await page.goto(route.url, { waitUntil: 'networkidle', timeout: 30_000 });
     const title = await page.title();
 
-    // Patch spec s3.1: bounded auto-scroll, settle delay, and mandatory
-    // scroll reset before capture (same ordering as the crawl engine).
-    await autoScrollWithReset(page);
+    // Patch spec s3.1 + amendment A1: bounded auto-scroll, settle delay,
+    // and the hardened scroll reset (R1-R4) before capture (same ordering
+    // as the crawl engine).
+    const scroll = await autoScrollWithReset(page);
+    if (!scroll.confirmedTop) {
+      // Amendment A1 R3: unconfirmed reset is a diagnostic, never an error.
+      console.warn(
+        `[apograph] re-crawl ${route.path}: ${scrollResetDiagnostic(scroll)}`,
+      );
+    }
 
     // Full-page captures for both viewports (patch spec s3.2).
     await page.setViewportSize({ width: 1280, height: 800 });
