@@ -241,3 +241,78 @@ export async function generateFilesWithVision(
 export function screenshotsDirOf(evidenceDir: string): string {
   return join(evidenceDir, 'screenshots');
 }
+
+// ---------------------------------------------------------------------------
+// Closed-loop visual diff repair (spec s7)
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds the localized multimodal repair prompt (spec s7): the reference
+ * screenshot and the pixelmatch diff overlay are embedded as image parts
+ * (reference first, diff overlay second, text last), and the text instructs
+ * a targeted correction of the failing component — not a re-synthesis.
+ * Pure and exported for testing.
+ */
+export function buildVisualRepairPrompt(
+  componentPath: string,
+  mismatchPercent: number,
+): { text: string; systemPrompt: string } {
+  const text = [
+    `The component at ${componentPath} failed visual verification with a`,
+    `${mismatchPercent.toFixed(2)}% pixel mismatch against the reference site.`,
+    '',
+    'The FIRST image is the original reference screenshot; the SECOND image',
+    'is the pixelmatch diff overlay — highlighted regions mark exactly where',
+    'the synthesized output diverges from the reference.',
+    '',
+    'Repair ONLY the localized styling discrepancies visible in the diff',
+    'overlay: spacing, padding, margins, colors, gradients, font sizes and',
+    'weights, container alignment, and visibility. Do NOT rewrite unrelated',
+    'code, do NOT restructure the component, do NOT change imports, props,',
+    'state logic, or event handlers, and do NOT truncate the file.',
+    '',
+    `Emit exactly one file — ${componentPath} — with the complete,`,
+    'compile-ready corrected content.',
+  ].join('\n');
+
+  const systemPrompt = [
+    'You are a surgical frontend repair agent. You receive one React',
+    'component and a pixelmatch diff overlay against the reference site.',
+    'Apply the minimum targeted styling corrections indicated by the diff.',
+    'Respond with the complete corrected file content only: no markdown',
+    'fences, no commentary, no truncation. Preserve everything the diff does',
+    'not implicate.',
+  ].join(' ');
+
+  return { text, systemPrompt };
+}
+
+/**
+ * Runs one single-turn visual diff repair (spec s7): sends the current
+ * component source, the original reference screenshot, and the pixelmatch
+ * diff overlay to the vision model and returns the corrected file content.
+ */
+export async function repairComponentWithVisualDiff(
+  componentPath: string,
+  currentCode: string,
+  originalScreenshotDataUrl: string,
+  diffImageDataUrl: string,
+  mismatchPercent: number,
+): Promise<string> {
+  const { text, systemPrompt } = buildVisualRepairPrompt(componentPath, mismatchPercent);
+
+  const parts: PromptPart[] = buildPromptParts(
+    `${text}\n\nCurrent content of ${componentPath}:\n${currentCode}`,
+    [
+      { dataUrl: originalScreenshotDataUrl },
+      { dataUrl: diffImageDataUrl },
+    ],
+  );
+
+  const files = await generateStructuredFilesFromParts(parts, systemPrompt);
+  const repaired = files.find((file) => file.path === componentPath) ?? files[0];
+  if (repaired === undefined || repaired.content.trim().length === 0) {
+    throw new Error(`Visual repair for ${componentPath} returned no file content.`);
+  }
+  return repaired.content;
+}

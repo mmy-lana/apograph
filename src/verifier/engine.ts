@@ -27,6 +27,7 @@ import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
 import type {
   BuildCheck,
+  RepairRecord,
   RouteCheck,
   VerificationReport,
   VisualCheck,
@@ -34,6 +35,7 @@ import type {
 import type { EvidenceManifest, ViewportMode } from '../types.js';
 import type { ApographPlan, PlanRoute } from '../plan/schema.js';
 import { validatePlan } from '../plan/generator.js';
+import { repairComponentWithVisualDiff } from '../synthesizer/vision.js';
 
 /** Promisified execFile for async child-process execution. */
 const execFileAsync = promisify(execFile);
@@ -598,6 +600,182 @@ export async function verifyVisuals(
 }
 
 // ---------------------------------------------------------------------------
+// Closed-loop visual diff repair pass (spec s7)
+// ---------------------------------------------------------------------------
+
+/** Injectable dependencies for {@link runVisualRepairPass}. */
+export interface VisualRepairPassDeps {
+  /** Performs one repair turn. Defaults to the vision model repair. */
+  repairComponent?: (
+    componentPath: string,
+    currentCode: string,
+    originalScreenshotDataUrl: string,
+    diffImageDataUrl: string,
+    mismatchPercent: number,
+  ) => Promise<string>;
+  /** Rebuilds the project; returns build success. Defaults to tier 1. */
+  rebuild?: (outputDir: string) => Promise<boolean>;
+  /** Re-verifies one route's visuals after a rebuild. */
+  reVerify?: (routePath: string) => Promise<VisualCheck[]>;
+}
+
+/** Options for {@link runVisualRepairPass}. */
+export interface VisualRepairPassOptions extends VisualRepairPassDeps {
+  /** Tier-3 visual checks from the initial verification run. */
+  visuals: VisualCheck[];
+  /** Route path -> component file path (relative to outputDir or absolute). */
+  componentPathsByRoute: Map<string, string>;
+  /** Generated project directory (components are read/written here). */
+  outputDir: string;
+}
+
+/** Encodes a PNG file into a base64 data URL, or null if unreadable. */
+async function loadDataUrl(path: string): Promise<string | null> {
+  try {
+    const buffer = await readFile(path);
+    if (buffer.byteLength === 0) return null;
+    return `data:image/png;base64,${buffer.toString('base64')}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Runs the single-turn closed-loop visual diff repair pass (spec s7):
+ * for each route with failing visual comparisons, exactly one repair turn
+ * is triggered — the worst failing viewport's diff overlay and reference
+ * screenshot are embedded in a localized repair prompt for the route's
+ * component — then the project is rebuilt and the route's visuals are
+ * re-verified. Repairs record mismatchBefore/mismatchAfter/fixed per
+ * failing viewport. A route never receives a second turn in the same pass.
+ */
+export async function runVisualRepairPass(
+  options: VisualRepairPassOptions,
+): Promise<{ visuals: VisualCheck[]; repairs: RepairRecord[] }> {
+  const { visuals, componentPathsByRoute, outputDir } = options;
+  const repairComponent = options.repairComponent ?? repairComponentWithVisualDiff;
+  const rebuild = options.rebuild ?? defaultRebuild;
+  const repairs: RepairRecord[] = [];
+
+  // Group failing comparisons by route; single repair turn per route.
+  const failingByRoute = new Map<string, VisualCheck[]>();
+  for (const visual of visuals) {
+    if (visual.passed !== false) continue;
+    const group = failingByRoute.get(visual.path);
+    if (group !== undefined) group.push(visual);
+    else failingByRoute.set(visual.path, [visual]);
+  }
+
+  const repairedVisuals = new Map(visuals.map((visual) => [visual, visual]));
+
+  for (const [routePath, failures] of failingByRoute) {
+    const componentPath = componentPathsByRoute.get(routePath);
+    if (componentPath === undefined) continue;
+
+    // Worst failing viewport drives the repair prompt (single turn).
+    const worst = failures.reduce((a, b) =>
+      (b.mismatchPercent ?? 0) > (a.mismatchPercent ?? 0) ? b : a,
+    );
+
+    if (
+      worst.referenceScreenshot === null ||
+      worst.diffImage === null ||
+      worst.mismatchPercent === null
+    ) {
+      continue;
+    }
+
+    const resolvedComponentPath = componentPath.startsWith('/')
+      ? componentPath
+      : join(outputDir, componentPath);
+
+    let currentCode: string;
+    try {
+      currentCode = await readFile(resolvedComponentPath, 'utf8');
+    } catch {
+      // Component file absent (page not synthesized) — nothing to repair.
+      continue;
+    }
+
+    const originalDataUrl = await loadDataUrl(worst.referenceScreenshot);
+    const diffDataUrl = await loadDataUrl(worst.diffImage);
+    if (originalDataUrl === null || diffDataUrl === null) continue;
+
+    let repairedCode: string;
+    try {
+      repairedCode = await repairComponent(
+        resolvedComponentPath,
+        currentCode,
+        originalDataUrl,
+        diffDataUrl,
+        worst.mismatchPercent,
+      );
+    } catch {
+      // Repair turn failed; the route keeps its pre-repair verdicts.
+      continue;
+    }
+
+    // Write the repaired component to disk.
+    try {
+      await writeFile(resolvedComponentPath, repairedCode, 'utf8');
+    } catch {
+      continue;
+    }
+
+    // Re-build and re-verify the repaired target.
+    const buildOk = await rebuild(outputDir);
+    if (!buildOk || options.reVerify === undefined) {
+      for (const failure of failures) {
+        repairs.push({
+          path: routePath,
+          viewport: failure.viewport,
+          mismatchBefore: worst.mismatchPercent as number,
+          mismatchAfter: null,
+          fixed: false,
+        });
+      }
+      continue;
+    }
+
+    const fresh = await options.reVerify(routePath);
+
+    for (const failure of failures) {
+      const after = fresh.find(
+        (check) => check.path === failure.path && check.viewport === failure.viewport,
+      );
+      const mismatchAfter = after?.mismatchPercent ?? null;
+      const fixed = after?.passed === true;
+      repairs.push({
+        path: routePath,
+        viewport: failure.viewport,
+        mismatchBefore: failure.mismatchPercent ?? worst.mismatchPercent,
+        mismatchAfter,
+        fixed,
+      });
+    }
+
+    // Fold fresh checks into the returned visual list.
+    for (const check of fresh) {
+      const existing = visuals.find(
+        (visual) => visual.path === check.path && visual.viewport === check.viewport,
+      );
+      if (existing !== undefined) repairedVisuals.set(existing, check);
+    }
+  }
+
+  return {
+    visuals: visuals.map((visual) => repairedVisuals.get(visual) ?? visual),
+    repairs,
+  };
+}
+
+/** Default rebuild dep: the full tier-1 build check. */
+async function defaultRebuild(outputDir: string): Promise<boolean> {
+  const build = await verifyBuild(outputDir);
+  return build.success;
+}
+
+// ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
 
@@ -611,6 +789,8 @@ export interface VerificationOptions {
   visualThreshold?: number;
   /** Which viewports to compare visually. Defaults to `both`. */
   viewport?: ViewportMode;
+  /** Set false to disable the single-turn visual diff repair pass (spec s7). */
+  repair?: boolean;
 }
 
 /** True when a file is readable. */
@@ -754,6 +934,7 @@ export async function runVerification(
 
   let routes: RouteCheck[] = [];
   let visuals: VisualCheck[] = [];
+  let repairs: RepairRecord[] = [];
 
   if (!distReady) {
     diagnostics.push(
@@ -775,6 +956,53 @@ export async function runVerification(
       }
 
       visuals = await verifyVisuals(site, visualRoutes, outputDir, visualThreshold, viewportMode);
+
+      // Single-turn closed-loop repair pass (spec s7): one repair turn per
+      // failing route, then re-build + re-verify the repaired target.
+      if (options.repair !== false && plan !== null) {
+        const componentPathsByRoute = new Map<string, string>();
+        for (const route of plan.routes.filter((entry) => entry.included)) {
+          componentPathsByRoute.set(
+            route.path,
+            join('src', 'pages', `${route.componentName}.tsx`),
+          );
+        }
+
+        const distDir2 = distDir;
+        const pass = await runVisualRepairPass({
+          visuals,
+          componentPathsByRoute,
+          outputDir,
+          reVerify: async (routePath: string): Promise<VisualCheck[]> => {
+            const route = visualRoutes.find((entry) => entry.path === routePath);
+            if (route === undefined) return [];
+            if (!(await fileExists(join(distDir2, 'index.html')))) return [];
+            const repairSite = await startSiteServer(distDir2);
+            try {
+              return await verifyVisuals(
+                repairSite,
+                [route],
+                outputDir,
+                visualThreshold,
+                viewportMode,
+              );
+            } finally {
+              await repairSite.close();
+            }
+          },
+        });
+
+        visuals = pass.visuals;
+        repairs = pass.repairs;
+        if (pass.repairs.length > 0) {
+          const fixed = pass.repairs.filter((repair) => repair.fixed).length;
+          diagnostics.push(
+            `Visual diff repair pass: ${pass.repairs.length} repair record(s), ` +
+              `${fixed} now below threshold (single turn per route).`,
+          );
+        }
+      }
+
       const failingVisuals = visuals.filter((visual) => visual.passed === false);
       const skippedVisuals = visuals.filter((visual) => visual.passed === null);
       if (failingVisuals.length > 0) {
@@ -806,6 +1034,7 @@ export async function runVerification(
     build,
     routes,
     visuals,
+    ...(repairs.length > 0 ? { repairs } : {}),
     overall: {
       passed: build.success && routesPassed && visualsPassed,
       buildPassed: build.success,

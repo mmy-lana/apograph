@@ -68,6 +68,20 @@ export interface VerificationVerdict {
   visualsPassed: boolean;
 }
 
+/** One single-turn visual diff repair outcome (spec s7). */
+export interface RepairRecord {
+  /** Route path whose component was repaired. */
+  path: string;
+  /** Viewport whose pixelmatch diff drove the repair. */
+  viewport: 'desktop' | 'mobile';
+  /** Mismatch percentage before the repair turn. */
+  mismatchBefore: number;
+  /** Mismatch percentage after the repair turn (null when re-run failed). */
+  mismatchAfter: number | null;
+  /** True when the post-repair mismatch is below threshold. */
+  fixed: boolean;
+}
+
 /** The full verification report. */
 export interface VerificationReport {
   outputDir: string;
@@ -76,6 +90,8 @@ export interface VerificationReport {
   build: BuildCheck;
   routes: RouteCheck[];
   visuals: VisualCheck[];
+  /** Single-turn visual diff repair outcomes (spec s7). */
+  repairs?: RepairRecord[];
   overall: VerificationVerdict;
   /** Diagnostic summary of remaining gaps. */
   diagnostics: string[];
@@ -169,6 +185,22 @@ export function printVerificationSummary(report: VerificationReport): void {
     }
   }
   lines.push('');
+
+  // Repair pass outcomes (spec s7).
+  if ((report.repairs ?? []).length > 0) {
+    lines.push('Visual diff repair pass (single turn per route):');
+    for (const repair of report.repairs ?? []) {
+      const after =
+        repair.mismatchAfter !== null
+          ? `${repair.mismatchAfter.toFixed(1)}%`
+          : 'n/a';
+      lines.push(
+        `  ${repair.fixed ? '[FIXED]' : '[RESID]'} ${`${repair.path} ${repair.viewport}`.padEnd(32)} ` +
+          `mismatch ${repair.mismatchBefore.toFixed(1)}% -> ${after}`,
+      );
+    }
+    lines.push('');
+  }
 
   // Diagnostics.
   if (report.diagnostics.length > 0) {
