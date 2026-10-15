@@ -119,11 +119,24 @@ export interface UncapturedResource {
   reason: string;
 }
 
+/**
+ * An instant client-side redirect aliased during crawl (spec s2.2): the
+ * initial URL never becomes a route; generated configs redirect it to `to`.
+ */
+export interface RedirectAliasRecord {
+  from: string;
+  to: string;
+  /** Settle time in ms between navigation commit and final URL stability. */
+  settleTimeMs: number;
+}
+
 /** Crawl problems recorded for the manifest's diagnostics section. */
 export interface CrawlDiagnostics {
   skippedUrls: SkippedUrl[];
   failedNavigations: FailedNavigation[];
   uncapturedResources: UncapturedResource[];
+  /** Instant redirect aliases recorded instead of dead transition frames. */
+  redirectAliases: RedirectAliasRecord[];
 }
 
 /** Aggregate statistics for one crawl run. */

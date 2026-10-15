@@ -15,13 +15,24 @@
  * Everything is recorded in `.apograph/evidence/manifest.json`.
  */
 
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { chromium } from 'playwright';
-import type { Browser, Page } from 'playwright';
-import type { CrawlScope, EvidenceManifest, RouteMetadata, ViewportMode } from '../types.js';
+import type { Browser, Frame, Page } from 'playwright';
+import type {
+  CrawlScope,
+  EvidenceManifest,
+  RedirectAliasRecord,
+  RouteMetadata,
+  ViewportMode,
+} from '../types.js';
 import { captureDOMSnapshot } from '../harvester/dom.js';
 import { discoverImageAssets, mirrorAssets } from './assets.js';
+import {
+  checkCaptureHealth,
+  classifyRedirect,
+} from './health.js';
+import type { CaptureHealth } from './health.js';
 import {
   createScopeFilter,
   isCrawlablePage,
@@ -137,6 +148,7 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
     skippedUrls: [],
     failedNavigations: [],
     uncapturedResources: [],
+    redirectAliases: [],
   };
 
   const visited = new Set<string>();
@@ -166,6 +178,9 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
   /** The canonical root: updated to the post-redirect URL on the first page. */
   let canonicalRoot = requestedRoot;
 
+  /** Deferred alias verdict awaiting confirmation of the target's health. */
+  let pendingAlias: RedirectAliasRecord | null = null;
+
   try {
     const context = await browser.newContext({ viewport: { ...DESKTOP_VIEWPORT } });
     const page = await context.newPage();
@@ -185,6 +200,14 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
       const path = safePathname(entry.url);
 
       let title = '';
+      // Settle-time measurement for instant redirect detection (spec s2.2):
+      // time between navigation start and the last main-frame navigation.
+      const gotoStart = Date.now();
+      let lastNavTime = gotoStart;
+      const onNavigated = (frame: Frame): void => {
+        if (frame === page.mainFrame()) lastNavTime = Date.now();
+      };
+      page.on('framenavigated', onNavigated);
       try {
         await page.goto(entry.url, {
           waitUntil: 'networkidle',
@@ -195,7 +218,10 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         const reason = cause instanceof Error ? cause.message : String(cause);
         diagnostics.failedNavigations.push({ url: entry.url, reason });
         continue;
+      } finally {
+        page.off('framenavigated', onNavigated);
       }
+      const settleTimeMs = lastNavTime - gotoStart;
 
       // Record the post-redirect URL as the canonical root when the initial
       // request was redirected (e.g. /faq -> /frequently-asked-questions).
@@ -237,6 +263,58 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         await page.setViewportSize({ ...DESKTOP_VIEWPORT });
       }
 
+      // Capture health checks (spec s2.1): visible node count plus pixel
+      // uniformity of the desktop screenshot.
+      const visibleNodeCount = await countVisibleNodes(page);
+      let health: CaptureHealth = {
+        blank: false,
+        reason: null,
+        uniformityRatio: 1,
+        dominantColor: null,
+        visibleNodeCount,
+      };
+      if (desktopScreenshot !== null) {
+        const png = await readFile(desktopScreenshot);
+        health = checkCaptureHealth(png, visibleNodeCount);
+      }
+
+      // Instant redirect classification (spec s2.2): when the initial
+      // navigation settled instantly (< 500ms) onto a distinct URL and the
+      // pre-redirect frame is blank, alias instead of recording a dead route.
+      // The post-redirect frame's own health is confirmed after the loop.
+      const finalUrl = normalizeUrl(page.url());
+      if (finalUrl !== null && finalUrl !== entry.url && health.blank) {
+        const postHealth = {
+          blank: false,
+          reason: null,
+          uniformityRatio: 0,
+          dominantColor: null,
+          visibleNodeCount: 0,
+        };
+        const verdict = classifyRedirect(entry.url, finalUrl, settleTimeMs, health, postHealth);
+        if (verdict.alias) {
+          pendingAlias = { from: entry.url, to: finalUrl, settleTimeMs };
+          skip(entry.url, `blank transition frame; aliased to ${finalUrl}`);
+          // Make sure the alias target itself is captured.
+          if (!visited.has(finalUrl) && !queued.has(finalUrl)) {
+            frontier.push({
+              url: finalUrl,
+              depth: entry.depth,
+              priority: 0,
+              order: bookkeeping.order++,
+            });
+            queued.add(finalUrl);
+          }
+          continue;
+        }
+      }
+
+      // Automated pruning (spec s3.2): blank frames never enter synthesis.
+      if (health.blank) {
+        skip(entry.url, `blank capture frame (${health.reason ?? 'unknown'})`);
+        continue;
+      }
+
       routes.push({
         url: entry.url,
         path,
@@ -261,6 +339,18 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
     // Whatever the frontier still holds was cut off by the page cap.
     for (const entry of frontier) {
       skip(entry.url, `page-cap (max ${maxPages} pages)`);
+    }
+
+    // Confirm the deferred alias: it stands only when the redirect target
+    // was captured as a healthy route; otherwise the frame stays suspect.
+    const alias = pendingAlias;
+    if (alias !== null) {
+      const targetHealthy = routes.some((route) => route.url === alias.to);
+      if (targetHealthy) {
+        diagnostics.redirectAliases.push(alias);
+      } else {
+        skip(alias.from, 'suspect (blank redirect frame without healthy target)');
+      }
     }
   } finally {
     await browser.close();
@@ -298,6 +388,30 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
   );
 
   return manifest;
+}
+
+// ---------------------------------------------------------------------------
+// Visible node counting (spec s2.1)
+// ---------------------------------------------------------------------------
+
+/** In-page collector counting visible element nodes beneath <body>. */
+function countVisibleNodesInPage(): number {
+  if (document.body === null) return 0;
+  let count = 0;
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+  while (walker.nextNode()) {
+    const el = walker.currentNode as Element;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) count += 1;
+  }
+  return count;
+}
+
+/** Counts visible DOM nodes on the current page (spec s2.1 DOM emptiness). */
+async function countVisibleNodes(page: Page): Promise<number> {
+  return page.evaluate(countVisibleNodesInPage);
 }
 
 // ---------------------------------------------------------------------------
