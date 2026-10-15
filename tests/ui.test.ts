@@ -1,0 +1,170 @@
+/**
+ * Unit tests for dynamic provider progress reporting and non-destructive
+ * `apograph config` behavior (GLM 5.3 Flash preset, unknown-key retention).
+ *
+ * spec: integration/visual-resilience s8.5
+ */
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+
+import { formatModelRouteLabel } from '../dist/synthesizer/modular.js';
+import {
+  applyVisionPreset,
+  findVisionPreset,
+  mergeConfigWithUnknownKeys,
+  mergePromptAnswers,
+} from '../dist/commands/config.js';
+import type { ApographConfig } from '../dist/commands/config.js';
+import { resolveProvider, resolveModelId } from '../dist/config/models.js';
+
+// ---------------------------------------------------------------------------
+// s8.5 - progress > reports dynamic provider
+// ---------------------------------------------------------------------------
+
+test('progress > reports dynamic provider', () => {
+  // Cloud gateway route (Nirantara run).
+  assert.equal(
+    formatModelRouteLabel('z-ai', 'glm-5.3-flash'),
+    'via z-ai (glm-5.3-flash)',
+  );
+  // Local route.
+  assert.equal(
+    formatModelRouteLabel('ollama', 'apograph-qwen35:9b-8k'),
+    'via ollama (apograph-qwen35:9b-8k)',
+  );
+});
+
+test('progress > literal "via local model" appears nowhere in the rendering layer', async () => {
+  const modularSource = await readFile(
+    fileURLToPath(new URL('../src/synthesizer/modular.ts', import.meta.url)),
+    'utf8',
+  );
+  assert.ok(!modularSource.includes('via local model'));
+  // The dynamic label builder is used by the stage labels instead.
+  assert.ok(modularSource.includes('formatModelRouteLabel('));
+});
+
+// ---------------------------------------------------------------------------
+// s8.5 - config > prompts are non-destructive
+// ---------------------------------------------------------------------------
+
+test('config > empty input preserves existing values', () => {
+  const existing: ApographConfig = {
+    provider: 'z-ai',
+    model: 'glm-5.3-flash',
+    apiKey: 'existing-key',
+    baseUrl: 'https://api.z.ai/api/paas/v4',
+  };
+
+  // All-empty answers keep the existing typed values.
+  const merged = mergePromptAnswers(existing, {
+    provider: 'z-ai',
+    model: '',
+    apiKey: '',
+    baseUrl: '',
+  });
+  assert.deepEqual(merged, existing);
+
+  // Partial answers override only what was entered.
+  const partial = mergePromptAnswers(existing, {
+    provider: 'z-ai',
+    model: 'glm-5.3-air',
+    apiKey: '',
+    baseUrl: '',
+  });
+  assert.equal(partial.model, 'glm-5.3-air');
+  assert.equal(partial.apiKey, 'existing-key');
+  assert.equal(partial.baseUrl, 'https://api.z.ai/api/paas/v4');
+});
+
+test('config > unknown keys survive save merges', () => {
+  const existingRaw = {
+    provider: 'ollama',
+    model: 'apograph-qwen35:9b-8k',
+    experimentalFeature: true,
+    notes: ['hand-edited'],
+  };
+
+  const merged = mergeConfigWithUnknownKeys(existingRaw, {
+    provider: 'z-ai',
+    model: 'glm-5.3-flash',
+    apiKey: 'sk-test',
+    baseUrl: 'https://api.z.ai/api/paas/v4',
+  });
+
+  // Typed keys updated.
+  assert.equal(merged.provider, 'z-ai');
+  assert.equal(merged.model, 'glm-5.3-flash');
+  // Unknown keys retained byte-for-value.
+  assert.equal(merged.experimentalFeature, true);
+  assert.deepEqual(merged.notes, ['hand-edited']);
+
+  // A missing/corrupt file yields just the update (no crash).
+  assert.deepEqual(mergeConfigWithUnknownKeys(null, { provider: 'ollama' }), {
+    provider: 'ollama',
+  });
+});
+
+test('config > GLM 5.3 Flash preset resolves correctly', () => {
+  const preset = findVisionPreset('glm-5.3-flash');
+  assert.notEqual(preset, null);
+  assert.equal(preset?.provider, 'z-ai');
+  assert.equal(preset?.model, 'glm-5.3-flash');
+
+  // Fresh config: preset seeds provider, model, and default base URL.
+  const fresh = applyVisionPreset('glm-5.3-flash', null);
+  assert.equal(fresh.provider, 'z-ai');
+  assert.equal(fresh.model, 'glm-5.3-flash');
+  assert.equal(fresh.baseUrl, 'https://api.z.ai/api/paas/v4');
+
+  // Existing config: base URL and API key are carried over as defaults.
+  const carried = applyVisionPreset('glm-5.3-flash', {
+    provider: 'gateway',
+    apiKey: 'sk-existing',
+    baseUrl: 'https://my-proxy.example.com/v1',
+  });
+  assert.equal(carried.provider, 'z-ai');
+  assert.equal(carried.model, 'glm-5.3-flash');
+  assert.equal(carried.baseUrl, 'https://my-proxy.example.com/v1');
+  assert.equal(carried.apiKey, 'sk-existing');
+
+  // Unknown preset rejected.
+  assert.throws(() => applyVisionPreset('does-not-exist', null));
+});
+
+// ---------------------------------------------------------------------------
+// z-ai provider alias resolution
+// ---------------------------------------------------------------------------
+
+test('config > z-ai alias maps to OpenAI-compatible gateway resolution', () => {
+  const env: Record<string, string | undefined> = {};
+  assert.equal(resolveProvider(env, { provider: 'z-ai' }), 'gateway');
+  assert.equal(resolveProvider(env, { provider: 'gateway' }), 'gateway');
+  assert.equal(resolveProvider(env, null), 'local');
+
+  // Model id resolution: config model wins over provider default.
+  assert.equal(resolveModelId('gateway', env, { provider: 'z-ai', model: 'glm-5.3-flash' }), 'glm-5.3-flash');
+  // Env override wins over everything.
+  assert.equal(
+    resolveModelId('gateway', { APOGRAPH_MODEL: 'glm-5.3-air' }, { provider: 'z-ai', model: 'glm-5.3-flash' }),
+    'glm-5.3-air',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Source-level bans
+// ---------------------------------------------------------------------------
+
+test('source > config command retains the GLM preset as a first-class option', async () => {
+  const configSource = await readFile(
+    join(fileURLToPath(new URL('../src/commands/config.ts', import.meta.url))),
+    'utf8',
+  );
+  assert.ok(configSource.includes("'glm-5.3-flash'"));
+  assert.ok(configSource.includes('VISION_PRESETS'));
+  assert.ok(configSource.includes('mergePromptAnswers'));
+});

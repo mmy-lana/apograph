@@ -19,16 +19,11 @@
 
 import { copyFile, mkdir, readdir } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
-import type {
-  AssetEntry,
-  CrawlRoute,
-  DesignTokens,
-  EvidenceManifest,
-  ProjectFile,
-} from '../types.js';
+import type { AssetEntry, CrawlRoute, DesignTokens, EvidenceManifest, ProjectFile } from '../types.js';
 import type { ApographPlan, PlanRoute } from '../plan/schema.js';
 import type { ProgressHandle } from '../utils/progress.js';
 import { NULL_PROGRESS } from '../utils/progress.js';
+import { resolveModelId, resolveProviderName } from '../config/models.js';
 import {
   formatA11yTreeForVisionPrompt,
   formatAssetMapForPrompt,
@@ -80,6 +75,20 @@ export interface ModularSynthesisResult {
   synthesizedRoutePaths: string[];
   /** Route paths skipped because they already existed (resumption). */
   skippedRoutePaths: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic model-route reporting (spec s6.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Formats the active model route for progress output (spec s6.1): hardcoded
+ * provider strings are banned from the progress layer; provider and model
+ * are resolved from the live model route, e.g. `via z-ai (glm-5.3-flash)`
+ * or `via ollama (apograph-qwen35:9b-8k)`.
+ */
+export function formatModelRouteLabel(provider: string, modelId: string): string {
+  return `via ${provider} (${modelId})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -710,6 +719,10 @@ export async function synthesizeModularProject(
   const callbacks = input.callbacks;
   const skipPaths = new Set(callbacks?.skipRoutePaths ?? []);
 
+  // Active model route, resolved dynamically for progress reporting (s6.1).
+  const provider = resolveProviderName();
+  const modelId = resolveModelId(provider);
+
   const result: ModularSynthesisResult = {
     files: [],
     visionStages: [],
@@ -788,7 +801,7 @@ export async function synthesizeModularProject(
 
   const layoutFiles = await runVisionStage(
     'stage-2: shared layout',
-    'Synthesizing Navbar and Footer via local model',
+    `Synthesizing Navbar and Footer ${formatModelRouteLabel(provider, modelId)}`,
     layoutPrompt,
     layoutScreenshots,
     () => [
@@ -900,7 +913,7 @@ export async function synthesizeModularProject(
 
     const files = await runVisionStage(
       `stage-3: route ${route.path}`,
-      `Synthesizing page ${route.path}`,
+      `Synthesizing page ${route.path} ${formatModelRouteLabel(provider, modelId)}`,
       pagePrompt,
       screenshots,
       () => [

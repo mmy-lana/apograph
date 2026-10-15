@@ -13,18 +13,119 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import * as p from '@clack/prompts';
 
-/** Supported LLM providers. */
-export type ConfigProvider = 'ollama' | 'openai' | 'anthropic' | 'gateway';
+/** Supported LLM providers. `z-ai` is an alias of `gateway` (OpenAI-compatible). */
+export type ConfigProvider = 'ollama' | 'openai' | 'anthropic' | 'gateway' | 'z-ai';
 
 /** The persisted configuration shape. */
 export interface ApographConfig {
   provider: ConfigProvider;
-  /** Model identifier (e.g. `gpt-4o`, `apograph-qwen35:9b-8k`). */
+  /** Model identifier (e.g. `gpt-4o`, `glm-5.3-flash`, `apograph-qwen35:9b-8k`). */
   model?: string;
   /** API key for the provider (not needed for local Ollama). */
   apiKey?: string;
-  /** Base URL for a custom gateway/proxy (gateway provider only). */
+  /** Base URL for a custom gateway/proxy (gateway / z-ai provider only). */
   baseUrl?: string;
+}
+
+/** A first-class cloud vision preset (spec s6.2). */
+export interface VisionPreset {
+  id: string;
+  label: string;
+  hint: string;
+  provider: ConfigProvider;
+  model: string;
+  defaultBaseUrl: string;
+}
+
+/**
+ * First-class vision presets selectable in `apograph config` (spec s6.2).
+ * The GLM 5.3 Flash preset makes the Nirantara-class OpenAI-compatible
+ * gateway a selection rather than manual assembly.
+ */
+export const VISION_PRESETS: VisionPreset[] = [
+  {
+    id: 'glm-5.3-flash',
+    label: 'GLM 5.3 Flash (z-ai gateway)',
+    hint: 'OpenAI-compatible cloud vision gateway',
+    provider: 'z-ai',
+    model: 'glm-5.3-flash',
+    defaultBaseUrl: 'https://api.z.ai/api/paas/v4',
+  },
+];
+
+/** Finds a preset by id (null when unknown). */
+export function findVisionPreset(id: string): VisionPreset | null {
+  return VISION_PRESETS.find((preset) => preset.id === id) ?? null;
+}
+
+/**
+ * Applies a vision preset on top of the existing config (spec s6.2): the
+ * preset fixes provider and model defaults; the existing base URL and API
+ * key are carried over as defaults so empty prompt input keeps them.
+ */
+export function applyVisionPreset(
+  presetId: string,
+  existing: ApographConfig | null,
+): ApographConfig {
+  const preset = findVisionPreset(presetId);
+  if (preset === null) {
+    throw new Error(`Unknown vision preset: ${presetId}`);
+  }
+  return {
+    provider: preset.provider,
+    model: preset.model,
+    ...(existing?.baseUrl !== undefined ? { baseUrl: existing.baseUrl } : { baseUrl: preset.defaultBaseUrl }),
+    ...(existing?.apiKey !== undefined ? { apiKey: existing.apiKey } : {}),
+  };
+}
+
+/**
+ * Merges prompted answers over the existing config, non-destructively
+ * (spec s6.2): an empty answer (empty string) keeps the existing value,
+ * and unknown keys in the persisted file are preserved by
+ * {@link mergeConfigWithUnknownKeys}.
+ */
+export function mergePromptAnswers(
+  existing: ApographConfig | null,
+  answers: {
+    provider: ConfigProvider;
+    model?: string;
+    apiKey?: string;
+    baseUrl?: string;
+  },
+): ApographConfig {
+  const model = answers.model !== undefined && answers.model.length > 0
+    ? answers.model
+    : existing?.model;
+  const apiKey = answers.apiKey !== undefined && answers.apiKey.length > 0
+    ? answers.apiKey
+    : existing?.apiKey;
+  const baseUrl = answers.baseUrl !== undefined && answers.baseUrl.length > 0
+    ? answers.baseUrl
+    : existing?.baseUrl;
+
+  return {
+    provider: answers.provider,
+    ...(model !== undefined ? { model } : {}),
+    ...(apiKey !== undefined ? { apiKey } : {}),
+    ...(baseUrl !== undefined ? { baseUrl } : {}),
+  };
+}
+
+/**
+ * Merges a typed config update into the raw persisted JSON, preserving any
+ * unknown keys (spec s6.2: `apograph config` never rewrites a config file
+ * it did not intentionally change).
+ */
+export function mergeConfigWithUnknownKeys(
+  existingRaw: unknown,
+  update: ApographConfig,
+): Record<string, unknown> {
+  const base =
+    typeof existingRaw === 'object' && existingRaw !== null && !Array.isArray(existingRaw)
+      ? (existingRaw as Record<string, unknown>)
+      : {};
+  return { ...base, ...update };
 }
 
 /** Absolute path of the config file. */
@@ -38,7 +139,19 @@ const PROVIDER_DEFAULTS: Record<ConfigProvider, string> = {
   openai: 'gpt-4o',
   anthropic: 'claude-3-7-sonnet-latest',
   gateway: 'gpt-4o',
+  'z-ai': 'glm-5.3-flash',
 };
+
+/** True when a raw provider value is a supported ConfigProvider. */
+export function isConfigProvider(value: unknown): value is ConfigProvider {
+  return (
+    value === 'ollama' ||
+    value === 'openai' ||
+    value === 'anthropic' ||
+    value === 'gateway' ||
+    value === 'z-ai'
+  );
+}
 
 /**
  * Loads the persisted config, or null when absent or invalid. Missing
@@ -55,12 +168,7 @@ export function loadApographConfig(): ApographConfig | null {
     if (typeof raw !== 'object' || raw === null) return null;
 
     const candidate = raw as Partial<ApographConfig>;
-    if (
-      candidate.provider !== 'ollama' &&
-      candidate.provider !== 'openai' &&
-      candidate.provider !== 'anthropic' &&
-      candidate.provider !== 'gateway'
-    ) {
+    if (!isConfigProvider(candidate.provider)) {
       return null;
     }
 
@@ -75,11 +183,25 @@ export function loadApographConfig(): ApographConfig | null {
   }
 }
 
-/** Persists the config to `~/.apograph/config.json`. */
+/**
+ * Persists the config to `~/.apograph/config.json`, merging over the raw
+ * file so unknown keys survive the update (spec s6.2, non-destructive).
+ */
 export async function saveApographConfig(config: ApographConfig): Promise<string> {
   const path = configFilePath();
+
+  let existingRaw: unknown = null;
+  if (existsSync(path)) {
+    try {
+      existingRaw = JSON.parse(readFileSync(path, 'utf8'));
+    } catch {
+      existingRaw = null;
+    }
+  }
+
+  const merged = mergeConfigWithUnknownKeys(existingRaw, config);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(config, null, 2), 'utf8');
+  await writeFile(path, JSON.stringify(merged, null, 2), 'utf8');
   return path;
 }
 
@@ -115,24 +237,44 @@ export async function runConfigCommand(options: ConfigCliOptions): Promise<void>
 
   p.intro('apograph config — LLM provider settings');
 
-  const provider = await p.select({
-    message: 'Which provider should apograph use?',
+  const existing = loadApographConfig();
+
+  // Provider selection: first-class presets (spec s6.2) plus raw providers.
+  const selection = await p.select({
+    message: 'Which vision provider should apograph use? (empty input keeps existing values)',
+    initialValue: existing?.provider,
     options: [
+      ...VISION_PRESETS.map((preset) => ({
+        value: `preset:${preset.id}`,
+        label: preset.label,
+        hint: preset.hint,
+      })),
       { value: 'ollama' as const, label: 'Ollama (local)', hint: 'no API key required' },
       { value: 'openai' as const, label: 'OpenAI' },
       { value: 'anthropic' as const, label: 'Anthropic' },
       { value: 'gateway' as const, label: 'Custom gateway / proxy', hint: 'OpenAI-compatible endpoint' },
     ],
   });
-  if (p.isCancel(provider)) {
+  if (p.isCancel(selection)) {
     p.cancel('Configuration cancelled.');
     return;
   }
 
+  // Preset selection seeds provider, model, and base URL defaults.
+  const presetAnswer = selection.startsWith('preset:')
+    ? findVisionPreset(selection.slice('preset:'.length))
+    : null;
+  const presetConfig = presetAnswer !== null ? applyVisionPreset(presetAnswer.id, existing) : null;
+  const provider: ConfigProvider =
+    presetConfig?.provider ?? (selection as ConfigProvider);
+  const modelDefault =
+    presetConfig?.model ?? existing?.model ?? PROVIDER_DEFAULTS[provider];
+  const baseUrlDefault = presetConfig?.baseUrl ?? existing?.baseUrl;
+
   const model = await p.text({
-    message: 'Model name',
-    placeholder: PROVIDER_DEFAULTS[provider],
-    defaultValue: PROVIDER_DEFAULTS[provider],
+    message: 'Model name (empty keeps the default)',
+    placeholder: modelDefault,
+    defaultValue: modelDefault,
   });
   if (p.isCancel(model)) {
     p.cancel('Configuration cancelled.');
@@ -142,23 +284,31 @@ export async function runConfigCommand(options: ConfigCliOptions): Promise<void>
   let apiKey: string | undefined;
   if (provider !== 'ollama') {
     const key = await p.password({
-      message: `API key for ${provider}`,
+      message:
+        existing?.apiKey !== undefined
+          ? `API key for ${provider} (empty keeps the existing key)`
+          : `API key for ${provider}`,
     });
     if (p.isCancel(key)) {
       p.cancel('Configuration cancelled.');
       return;
     }
-    apiKey = key.length > 0 ? key : undefined;
+    apiKey = key;
   }
 
   let baseUrl: string | undefined;
-  if (provider === 'gateway') {
+  if (provider === 'gateway' || provider === 'z-ai') {
     const url = await p.text({
-      message: 'Gateway base URL',
-      placeholder: 'https://your-gateway.example.com/v1',
+      message: 'Gateway base URL (empty keeps the existing value)',
+      placeholder: baseUrlDefault ?? 'https://your-gateway.example.com/v1',
+      defaultValue: baseUrlDefault,
       validate: (value) => {
+        // Empty input keeps the existing/default base URL.
         if (value === undefined || value.length === 0) {
-          return 'A base URL is required for the gateway provider.';
+          if (baseUrlDefault === undefined) {
+            return 'A base URL is required for the gateway provider.';
+          }
+          return undefined;
         }
         try {
           new URL(value);
@@ -175,12 +325,12 @@ export async function runConfigCommand(options: ConfigCliOptions): Promise<void>
     baseUrl = url;
   }
 
-  const config: ApographConfig = {
+  const config = mergePromptAnswers(existing, {
     provider,
-    ...(model.length > 0 ? { model } : {}),
+    ...(model !== undefined ? { model } : {}),
     ...(apiKey !== undefined ? { apiKey } : {}),
     ...(baseUrl !== undefined ? { baseUrl } : {}),
-  };
+  });
 
   const confirm = await p.confirm({
     message: `Save configuration to ${configFilePath()}?`,

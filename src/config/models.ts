@@ -45,8 +45,9 @@ export function resolveProvider(
   if (env.OPENAI_API_KEY) return 'openai';
 
   // Environment unset — fall back to the persisted config, if any.
+  // `z-ai` is a first-class alias of the OpenAI-compatible gateway (spec s6.2).
   if (config !== null) {
-    if (config.provider === 'gateway') return 'gateway';
+    if (config.provider === 'gateway' || config.provider === 'z-ai') return 'gateway';
     if (config.provider === 'anthropic') return 'anthropic';
     if (config.provider === 'openai') return 'openai';
   }
