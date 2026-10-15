@@ -86,6 +86,8 @@ export interface CrawlRoute {
   a11yTree: A11yNode;
   /** Design tokens extracted at capture time. */
   tokens: DesignTokens;
+  /** Visible text corpus harvested in document order (spec s5.1). */
+  textSpans?: TextSpan[];
 }
 
 /** Lifecycle status of one mirrored asset. */
@@ -203,6 +205,20 @@ export interface InferredSchema {
 // Layer 4 — UI & Design System
 // ---------------------------------------------------------------------------
 
+/** One visible text span harvested from the DOM (spec s5.1). */
+export interface TextSpan {
+  /** Trimmed visible text content. */
+  text: string;
+  /** Verbatim gradient definition for gradient text (background-image). */
+  gradient?: string;
+  /** Computed text color (e.g. `rgb(6, 182, 212)`). */
+  color: string;
+  /** Element tag holding the text (e.g. `span`). */
+  tag: string;
+  /** Nearest semantic ancestor tag (e.g. `h1`), else the parent tag. */
+  parentTag: string;
+}
+
 /** One node of the accessibility tree (mirrors Playwright's AxNode shape). */
 export interface A11yNode {
   role: string;
@@ -235,6 +251,8 @@ export interface DOMSnapshot {
   route: string;
   a11yTree: A11yNode;
   tokens: DesignTokens;
+  /** Visible text corpus harvested in document order (spec s5.1). */
+  textSpans?: TextSpan[];
 }
 
 // ---------------------------------------------------------------------------

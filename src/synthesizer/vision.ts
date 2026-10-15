@@ -9,7 +9,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import type { A11yNode, CrawlRoute, DesignTokens } from '../types.js';
+import type { A11yNode, CrawlRoute, DesignTokens, TextSpan } from '../types.js';
 import { buildPromptParts, generateStructuredFilesFromParts } from './llm.js';
 import type { PromptPart } from './llm.js';
 import type { ProjectFile } from '../types.js';
@@ -155,6 +155,63 @@ export function formatAssetMapForPrompt(
       return `  /assets/${filename}  <-  ${asset.originalUrl}`;
     })
     .join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Text corpus prompt formatting (spec s5.2)
+// ---------------------------------------------------------------------------
+
+/** Maximum text spans embedded in a single prompt (guards context size). */
+export const MAX_PROMPT_TEXT_SPANS = 200;
+
+/** Heading/priority rank for text-corpus ordering (spec s5.2). */
+const SPAN_PRIORITY: Record<string, number> = {
+  h1: 0,
+  h2: 1,
+  h3: 2,
+  h4: 3,
+  h5: 3,
+  h6: 3,
+  p: 4,
+};
+
+/** Priority rank of a span: semantic ancestor first, then the element tag. */
+function spanRank(span: TextSpan): number {
+  return SPAN_PRIORITY[span.parentTag] ?? SPAN_PRIORITY[span.tag] ?? 5;
+}
+
+/**
+ * Formats the harvested text corpus for prompt embedding (spec s5.2):
+ * headings surface first (h1 > h2 > h3 > h4-h6 > p > other), stable within
+ * each rank, with gradient definitions shown verbatim so gradient headline
+ * text no longer depends on visual OCR.
+ */
+export function formatTextSpansForPrompt(spans: TextSpan[]): string {
+  if (spans.length === 0) return 'Text corpus: (not captured)';
+
+  const ranked = spans
+    .map((span, index) => ({ span, index }))
+    .sort((a, b) => spanRank(a.span) - spanRank(b.span) || a.index - b.index)
+    .slice(0, MAX_PROMPT_TEXT_SPANS);
+
+  const lines = ranked.map(({ span }) => {
+    const tag = span.parentTag !== span.tag ? `${span.parentTag}>${span.tag}` : span.tag;
+    const gradient = span.gradient !== undefined ? ` [gradient: ${span.gradient}]` : '';
+    return `  [${tag}] ${span.text}${gradient}`;
+  });
+
+  const truncated =
+    ranked.length < spans.length ? `\n  ... (${spans.length - ranked.length} more spans omitted)` : '';
+
+  return [
+    'Text corpus (visible DOM text in priority order — reproduce ALL of it',
+    'verbatim in the output, especially gradient headline spans; do NOT',
+    'transcribe text from the screenshots by eye):',
+    ...lines,
+    truncated,
+  ]
+    .join('\n')
+    .replace(/\n$/, '');
 }
 
 // ---------------------------------------------------------------------------

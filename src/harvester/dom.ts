@@ -12,7 +12,7 @@
 
 import type { Page } from 'playwright';
 import * as csstree from 'css-tree';
-import type { A11yNode, CanvasTheme, DesignTokens, DOMSnapshot } from '../types.js';
+import type { A11yNode, CanvasTheme, DesignTokens, DOMSnapshot, TextSpan } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // A11y tree extraction
@@ -269,18 +269,147 @@ function isSpacingValue(value: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Visible text corpus extraction (spec s5.1)
+// ---------------------------------------------------------------------------
+
+/** Raw, per-text-node data gathered in-page before pure filtering. */
+export interface RawTextSpan {
+  text: string;
+  color: string;
+  backgroundImage: string;
+  backgroundClip: string;
+  webkitTextFillColor: string;
+  display: string;
+  visibility: string;
+  boxWidth: number;
+  boxHeight: number;
+  tag: string;
+  parentTag: string;
+}
+
+/** Semantic ancestor tags used to resolve `parentTag` (spec s5.1). */
+const SEMANTIC_ANCESTORS = new Set([
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'p', 'li', 'a', 'button', 'blockquote', 'figcaption', 'summary', 'label', 'dt', 'dd',
+]);
+
+/** True when a computed color is fully transparent (alpha 0). */
+export function isTransparentColor(color: string): boolean {
+  const trimmed = color.trim().toLowerCase();
+  if (trimmed === 'transparent') return true;
+  const match = trimmed.match(/^rgba?\(\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*(?:,\s*([\d.]+)\s*)?\)$/);
+  if (match === null) return false;
+  const alpha = match[1] !== undefined ? Number(match[1]) : 1;
+  return alpha === 0;
+}
+
+/** True when an element's computed styles mark it as a gradient text span. */
+export function isGradientText(raw: {
+  backgroundImage: string;
+  backgroundClip: string;
+  webkitTextFillColor: string;
+}): boolean {
+  const hasGradient = /gradient\(/i.test(raw.backgroundImage);
+  const clipText = raw.backgroundClip.includes('text');
+  const fillTransparent = isTransparentColor(raw.webkitTextFillColor);
+  return hasGradient && (clipText || fillTransparent);
+}
+
+/**
+ * Pure mapping/filtering from raw in-page span data to the canonical
+ * `TextSpan` corpus (spec s5.1): drops `display: none`, `visibility: hidden`,
+ * zero-box, alpha-0-text, and empty-text entries; keeps document order; and
+ * captures gradient definitions verbatim on gradient headline spans.
+ */
+export function buildTextSpans(raw: RawTextSpan[]): TextSpan[] {
+  const spans: TextSpan[] = [];
+  for (const entry of raw) {
+    if (entry.display === 'none') continue;
+    if (entry.visibility === 'hidden') continue;
+    if (entry.boxWidth <= 0 || entry.boxHeight <= 0) continue;
+    if (isTransparentColor(entry.color)) continue;
+    const text = entry.text.trim();
+    if (text.length === 0) continue;
+
+    const span: TextSpan = {
+      text,
+      color: entry.color,
+      tag: entry.tag,
+      parentTag: entry.parentTag,
+    };
+    if (isGradientText(entry)) span.gradient = entry.backgroundImage;
+    spans.push(span);
+  }
+  return spans;
+}
+
+/** In-page collector harvesting raw visible text-node data in document order. */
+function collectRawTextSpans(): RawTextSpan[] {
+  if (document.body === null) return [];
+  const raw: RawTextSpan[] = [];
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+
+  const semanticAncestor = (el: Element | null): string | null => {
+    let current: Element | null = el;
+    while (current !== null) {
+      const tag = current.tagName.toLowerCase();
+      if (SEMANTIC_ANCESTORS.has(tag)) return tag;
+      current = current.parentElement;
+    }
+    return null;
+  };
+
+  while (walker.nextNode()) {
+    const textNode = walker.currentNode as Text;
+    const text = textNode.textContent ?? '';
+    if (text.trim().length === 0) continue;
+
+    const element = textNode.parentElement;
+    if (element === null) continue;
+
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    const tag = element.tagName.toLowerCase();
+    const parentTag = semanticAncestor(element.parentElement) ?? element.parentElement?.tagName.toLowerCase() ?? tag;
+
+    raw.push({
+      text,
+      color: style.color,
+      backgroundImage: style.backgroundImage,
+      backgroundClip: style.backgroundClip,
+      webkitTextFillColor: style.webkitTextFillColor,
+      display: style.display,
+      visibility: style.visibility,
+      boxWidth: rect.width,
+      boxHeight: rect.height,
+      tag,
+      parentTag,
+    });
+  }
+  return raw;
+}
+
+/** Extracts the visible text corpus for the current page (spec s5.1). */
+export async function extractTextSpans(page: Page): Promise<TextSpan[]> {
+  const raw = await page.evaluate(collectRawTextSpans);
+  return buildTextSpans(raw);
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot orchestration
 // ---------------------------------------------------------------------------
 
 /**
- * Captures a full DOM snapshot for a route: the accessibility tree and the
- * extracted design tokens, gathered concurrently.
+ * Captures a full DOM snapshot for a route: the accessibility tree, the
+ * extracted design tokens, and the visible text corpus (spec s5.1), all
+ * gathered concurrently.
  */
 export async function captureDOMSnapshot(page: Page, route: string): Promise<DOMSnapshot> {
-  const [a11yTree, tokens] = await Promise.all([
+  const [a11yTree, tokens, textSpans] = await Promise.all([
     extractA11yTree(page),
     extractDesignTokens(page),
+    extractTextSpans(page),
   ]);
 
-  return { route, a11yTree, tokens };
+  return { route, a11yTree, tokens, textSpans };
 }

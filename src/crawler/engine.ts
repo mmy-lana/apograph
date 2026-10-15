@@ -324,6 +324,9 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         metadata,
         a11yTree: snapshot.a11yTree,
         tokens: snapshot.tokens,
+        ...(snapshot.textSpans !== undefined
+          ? { textSpans: snapshot.textSpans }
+          : {}),
       });
 
       // Link discovery (scoped against the canonical root).
