@@ -212,12 +212,22 @@ export interface A11yNode {
   children?: A11yNode[];
 }
 
+/** Computed canvas colors of `document.body` at capture time (spec s4.1). */
+export interface CanvasTheme {
+  /** Computed body background color, normalized to `#rrggbb`. */
+  backgroundColor: string;
+  /** Computed body foreground color, normalized to `#rrggbb`. */
+  color?: string;
+}
+
 /** Design tokens extracted from stylesheets. */
 export interface DesignTokens {
   colors: Record<string, string>;
   fonts: string[];
   spacing: string[];
   radii: string[];
+  /** Computed `document.body` canvas colors (spec s4.1). */
+  canvas?: CanvasTheme;
 }
 
 /** A UI snapshot for one route: a11y tree plus extracted design tokens. */

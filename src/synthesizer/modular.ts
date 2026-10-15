@@ -19,7 +19,13 @@
 
 import { copyFile, mkdir, readdir } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
-import type { AssetEntry, CrawlRoute, EvidenceManifest, ProjectFile } from '../types.js';
+import type {
+  AssetEntry,
+  CrawlRoute,
+  DesignTokens,
+  EvidenceManifest,
+  ProjectFile,
+} from '../types.js';
 import type { ApographPlan, PlanRoute } from '../plan/schema.js';
 import type { ProgressHandle } from '../utils/progress.js';
 import { NULL_PROGRESS } from '../utils/progress.js';
@@ -85,9 +91,14 @@ const SYSTEM_GUIDELINES = [
   'Tailwind CSS v4 (CSS-first config in src/index.css via @theme), lucide-react icons.',
   'Rules:',
   '1. React 19 functional components with hooks only — no class components.',
-  '2. Style strictly with Tailwind CSS utility classes. The @theme tokens from',
-  '   src/index.css (colors, fonts, spacing, radii) are available as utilities',
-  '   (e.g. bg-apograph-0, font-apograph-0, p-apograph-0, rounded-apograph-0).',
+  '2. Style strictly with Tailwind CSS utility classes. Match the screenshots',
+  '   exactly: arbitrary value utilities are encouraged and expected — use',
+  '   bg-[#080f1c], text-cyan-400, gradient utilities (bg-gradient-to-r',
+  '   from-cyan-400 to-blue-500), opacity and blur utilities whenever they',
+  '   reproduce the reference visuals. Semantic @theme tokens (bg-background,',
+  '   text-foreground, border-border, text-muted-foreground) are also',
+  '   available. Never reference --color-apograph-N variables; use the',
+  '   provided reduced palette or direct hex values from the screenshots.',
   '3. Use lucide-react for every icon. Never invent SVG icon paths.',
   '4. Match the provided screenshots: desktop shot = >=1024px layout,',
   '   mobile shot = <768px layout. Reproduce the visual hierarchy, spacing rhythm,',
@@ -96,7 +107,8 @@ const SYSTEM_GUIDELINES = [
   '   never their original remote URLs.',
   '6. The Navbar must use a sticky blurred header: className must include',
   '   `sticky top-0 z-50 backdrop-blur bg-background/80 border-b` so content',
-  '   scrolls under a frosted header (bg-background comes from @theme).',
+  '   scrolls under a frosted header (bg-background comes from @theme and',
+  '   carries the source site\'s extracted canvas color).',
   '7. Forms must include realistic HTML validation (required, type="email"),',
   '   a success toast/banner after submit, and mock persistence via',
   "   localStorage.setItem('apograph_submissions', ...).",
@@ -105,23 +117,80 @@ const SYSTEM_GUIDELINES = [
 ].join('\n');
 
 // ---------------------------------------------------------------------------
+// Canvas theme resolution (spec s4.1, s4.2)
+// ---------------------------------------------------------------------------
+
+/** True when a `#rrggbb` color is perceptually dark (luminance < 0.5). */
+export function isDarkCanvasColor(hex: string): boolean {
+  const match = hex.match(/^#([0-9a-fA-F]{6})$/);
+  if (match === null) return false;
+  const value = Number.parseInt(match[1] as string, 16);
+  const r = (value >> 16) & 0xff;
+  const g = (value >> 8) & 0xff;
+  const b = value & 0xff;
+  const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+  return luminance < 0.5;
+}
+
+/**
+ * Resolves the dominant canvas background across captured routes (spec s4.1):
+ * the most frequent non-transparent computed body background. Routes without
+ * an extracted canvas (blank or legacy evidence) are ignored. Falls back to
+ * `#ffffff` only when no route yielded a canvas color.
+ */
+export function resolveDominantCanvas(
+  routes: Array<{ tokens: DesignTokens }>,
+): string {
+  const counts = new Map<string, number>();
+  for (const route of routes) {
+    const canvas = route.tokens.canvas?.backgroundColor;
+    if (canvas === undefined) continue;
+    if (!/^#[0-9a-fA-F]{6}$/.test(canvas)) continue;
+    counts.set(canvas, (counts.get(canvas) ?? 0) + 1);
+  }
+
+  let dominant: string | null = null;
+  let dominantCount = 0;
+  for (const [color, count] of counts) {
+    if (count > dominantCount) {
+      dominant = color;
+      dominantCount = count;
+    }
+  }
+
+  return dominant ?? '#ffffff';
+}
+
+// ---------------------------------------------------------------------------
 // Stage 1 — deterministic design tokens -> src/index.css
 // ---------------------------------------------------------------------------
 
 /**
  * Deterministically generates `src/index.css` for Tailwind CSS v4: the
- * `@import "tailwindcss"` entry plus a `@theme` block mapping the plan's
- * aggregated design tokens to named CSS variables (exposed as bg-/text-/
- * font-/p-/rounded- utilities).
+ * `@import "tailwindcss"` entry plus a `@theme` block. The background token
+ * is the extracted dominant canvas color (spec s4.2) — never a hardcoded
+ * white — with foreground/border/muted derived from canvas luminance.
  */
-export function generateIndexCss(designSystem: ApographPlan['designSystem']): string {
+export function generateIndexCss(
+  designSystem: ApographPlan['designSystem'],
+  canvasBackgroundColor?: string,
+): string {
+  const canvas = canvasBackgroundColor ?? '#ffffff';
+  const dark = isDarkCanvasColor(canvas);
+  const foreground = dark ? '#f8fafc' : '#171717';
+  const border = dark ? 'rgba(255, 255, 255, 0.1)' : '#e5e7eb';
+  const mutedForeground = dark ? 'rgba(248, 250, 252, 0.62)' : '#525252';
+
   const lines: string[] = [
     '/* src/index.css — generated deterministically by apograph from plan design tokens. */',
+    '/* Canvas background extracted from the source site (spec s4.1/s4.2). */',
     '@import "tailwindcss";',
     '',
     '@theme {',
-    '  --color-background: #ffffff;',
-    '  --color-foreground: #171717;',
+    `  --color-background: ${canvas};`,
+    `  --color-foreground: ${foreground};`,
+    `  --color-border: ${border};`,
+    `  --color-muted-foreground: ${mutedForeground};`,
   ];
 
   const colorValues = [...new Set(Object.values(designSystem.colors))];
@@ -174,9 +243,9 @@ export function generateNavbarTemplate(appName: string, routes: PlanRoute[]): st
     '  const [open, setOpen] = useState(false);',
     '',
     '  return (',
-    '    <header className="sticky top-0 z-50 border-b border-neutral-200 bg-background/80 backdrop-blur">',
+    '    <header className="sticky top-0 z-50 border-b border-border bg-background/80 backdrop-blur">',
     '      <nav className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6">',
-    '        <Link to="/" className="text-lg font-semibold tracking-tight">',
+    '        <Link to="/" className="text-lg font-semibold tracking-tight text-foreground">',
     `          ${escapeString(appName)}`,
     '        </Link>',
     '',
@@ -187,7 +256,7 @@ export function generateNavbarTemplate(appName: string, routes: PlanRoute[]): st
     '              to={link.to}',
     '              className={({ isActive }) =>',
     "                'text-sm font-medium transition-colors ' +",
-    "                (isActive ? 'text-neutral-900' : 'text-neutral-600 hover:text-neutral-900')",
+    "                (isActive ? 'text-foreground' : 'text-muted-foreground hover:text-foreground')",
     '              }',
     '            >',
     '              {link.label}',
@@ -200,14 +269,14 @@ export function generateNavbarTemplate(appName: string, routes: PlanRoute[]): st
     '          aria-label="Toggle navigation menu"',
     '          aria-expanded={open}',
     '          onClick={() => setOpen((value) => !value)}',
-    '          className="inline-flex h-10 w-10 items-center justify-center rounded-md text-neutral-700 md:hidden"',
+    '          className="inline-flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground md:hidden"',
     '        >',
     '          {open ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}',
     '        </button>',
     '      </nav>',
     '',
     '      {open ? (',
-    '        <div className="border-t border-neutral-200 bg-white md:hidden">',
+    '        <div className="border-t border-border bg-background md:hidden">',
     '          <div className="space-y-1 px-4 py-3">',
     '            {NAV_LINKS.map((link) => (',
     '              <NavLink',
@@ -216,7 +285,7 @@ export function generateNavbarTemplate(appName: string, routes: PlanRoute[]): st
     '                onClick={() => setOpen(false)}',
     '                className={({ isActive }) =>',
     "                  'block rounded-md px-3 py-2 text-sm font-medium ' +",
-    "                  (isActive ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-700')",
+    "                  (isActive ? 'bg-foreground/10 text-foreground' : 'text-muted-foreground')",
     '                }',
     '              >',
     '                {link.label}',
@@ -236,7 +305,7 @@ export function generateNavbarTemplate(appName: string, routes: PlanRoute[]): st
 export function generateFooterTemplate(appName: string, routes: PlanRoute[]): string {
   const links = routes.map((route) => {
     const label = route.title.length > 0 ? route.title : route.componentName;
-    return `            <Link key="${escapeString(route.path)}" to="${escapeString(route.path)}" className="text-sm text-neutral-500 hover:text-neutral-700">${escapeString(label)}</Link>`;
+    return `            <Link key="${escapeString(route.path)}" to="${escapeString(route.path)}" className="text-sm text-muted-foreground hover:text-foreground">${escapeString(label)}</Link>`;
   });
 
   return [
@@ -244,11 +313,11 @@ export function generateFooterTemplate(appName: string, routes: PlanRoute[]): st
     '',
     'export function Footer() {',
     '  return (',
-    '    <footer className="border-t border-neutral-200 bg-neutral-50">',
+    '    <footer className="border-t border-border bg-transparent">',
     '      <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-4 py-8 sm:flex-row sm:px-6">',
-    `        <p className="text-sm text-neutral-500">&copy; {new Date().getFullYear()} ${escapeString(appName)}</p>`,
+    `        <p className="text-sm text-muted-foreground">&copy; {new Date().getFullYear()} ${escapeString(appName)}</p>`,
     '        <nav className="flex flex-wrap gap-6">',
-    ...(links.length > 0 ? links : ['            <Link to="/" className="text-sm text-neutral-500 hover:text-neutral-700">Home</Link>']),
+    ...(links.length > 0 ? links : ['            <Link to="/" className="text-sm text-muted-foreground hover:text-foreground">Home</Link>']),
     '        </nav>',
     '      </div>',
     '    </footer>',
@@ -480,7 +549,7 @@ export function generateAppTsx(plan: ApographPlan): string {
     'export default function App() {',
     '  return (',
     '    <BrowserRouter>',
-    '      <div className="flex min-h-screen flex-col bg-white text-neutral-900">',
+    '      <div className="flex min-h-screen flex-col bg-background text-foreground">',
     '        <Navbar />',
     '        <main className="flex-1">',
     '          <Routes>',
@@ -649,9 +718,11 @@ export async function synthesizeModularProject(
   };
 
   // --- Stage 1: design tokens -> src/index.css (deterministic) -----------
+  // Dominant canvas across healthy captured routes (spec s4.1/s4.2).
+  const canvasColor = resolveDominantCanvas(manifest.routes);
   const indexCss: ProjectFile = {
     path: 'src/index.css',
-    content: generateIndexCss(plan.designSystem),
+    content: generateIndexCss(plan.designSystem, canvasColor),
   };
 
   // --- Stage 2: shared layout (Navbar + Footer) ---------------------------
@@ -668,8 +739,14 @@ export async function synthesizeModularProject(
       .map((route) => `${route.path} ("${route.title.length > 0 ? route.title : route.componentName}")`)
       .join(', ')}`,
     '',
-    'Design tokens (available as Tailwind @theme utilities):',
-    formatTokensForVisionPrompt(plan.designSystem),
+    `Canvas background (extracted from the source site): ${canvasColor}.`,
+    '   The page canvas must stay this color — never introduce white or',
+    '   light backgrounds that do not appear in the screenshots.',
+    '',
+    'Reduced color palette (use these, or arbitrary Tailwind hex utilities',
+    'like bg-[#080f1c] / text-cyan-400 / gradient utilities matching the',
+    'screenshots — do NOT use --color-apograph-N variables):',
+    formatTokensForVisionPrompt(layoutRoute?.tokens ?? plan.designSystem),
     '',
     'Mirrored image assets (reference as /assets/<filename>):',
     formatAssetMapForPrompt(manifest.assets),
@@ -767,7 +844,13 @@ export async function synthesizeModularProject(
       `Page title: ${route.title.length > 0 ? route.title : route.componentName}`,
       `Interactions to implement as client-side state (useState): ${route.inferredInteractions.join(', ')}`,
       '',
-      'Design tokens (available as Tailwind @theme utilities):',
+      `Canvas background (extracted from the source site): ${canvasColor}.`,
+      '   Keep the page canvas this color; match text and accent colors with',
+      '   arbitrary Tailwind hex utilities from the screenshots.',
+      '',
+      'Reduced color palette (use these, or arbitrary Tailwind hex utilities',
+      'like bg-[#080f1c] / text-cyan-400 / gradient utilities matching the',
+      'screenshots — do NOT use --color-apograph-N variables):',
       formatTokensForVisionPrompt(manifestRoute?.tokens ?? plan.designSystem),
       '',
       'Mirrored image assets (reference as /assets/<filename>):',

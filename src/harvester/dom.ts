@@ -12,7 +12,7 @@
 
 import type { Page } from 'playwright';
 import * as csstree from 'css-tree';
-import type { A11yNode, DesignTokens, DOMSnapshot } from '../types.js';
+import type { A11yNode, CanvasTheme, DesignTokens, DOMSnapshot } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // A11y tree extraction
@@ -100,6 +100,68 @@ function mapA11yNode(
 }
 
 // ---------------------------------------------------------------------------
+// Canvas theme extraction (spec s4.1)
+// ---------------------------------------------------------------------------
+
+/** In-page collector for the computed colors of `document.body`. */
+function collectBodyComputedStyle(): { backgroundColor: string; color: string } {
+  const style = getComputedStyle(document.body);
+  return {
+    backgroundColor: style.backgroundColor,
+    color: style.color,
+  };
+}
+
+/**
+ * Normalizes a CSS color value (`rgb(...)`, `rgba(...)`, or `#rgb`/`#rrggbb`)
+ * to lowercase `#rrggbb`. Returns null for transparent, non-opaque, or
+ * unparseable values so callers can skip them.
+ */
+export function normalizeColorToHex(value: string): string | null {
+  const trimmed = value.trim().toLowerCase();
+
+  const rgbMatch = trimmed.match(
+    /^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*(?:,\s*([\d.]+)\s*)?\)$/,
+  );
+  if (rgbMatch !== null) {
+    const alpha = rgbMatch[4] !== undefined ? Number(rgbMatch[4]) : 1;
+    if (alpha === 0) return null;
+    const r = rgbMatch[1] as string;
+    const g = rgbMatch[2] as string;
+    const b = rgbMatch[3] as string;
+    const hex = (n: string): string => Number(n).toString(16).padStart(2, '0');
+    return `#${hex(r)}${hex(g)}${hex(b)}`;
+  }
+
+  const hexMatch = trimmed.match(/^#([0-9a-f]{6})$/);
+  if (hexMatch !== null) return `#${hexMatch[1] as string}`;
+
+  const shortMatch = trimmed.match(/^#([0-9a-f]{3})$/);
+  if (shortMatch !== null) {
+    const chars = shortMatch[1]?.split('') ?? [];
+    const a = chars[0];
+    const b = chars[1];
+    const c = chars[2];
+    if (a === undefined || b === undefined || c === undefined) return null;
+    return `#${a}${a}${b}${b}${c}${c}`;
+  }
+
+  return null;
+}
+
+/** Extracts the computed `document.body` canvas theme (spec s4.1). */
+export async function extractCanvasTheme(page: Page): Promise<CanvasTheme | undefined> {
+  const computed = await page.evaluate(collectBodyComputedStyle);
+  const backgroundColor = normalizeColorToHex(computed.backgroundColor);
+  if (backgroundColor === null) return undefined;
+
+  const canvas: CanvasTheme = { backgroundColor };
+  const color = normalizeColorToHex(computed.color);
+  if (color !== null) canvas.color = color;
+  return canvas;
+}
+
+// ---------------------------------------------------------------------------
 // Design token extraction
 // ---------------------------------------------------------------------------
 
@@ -130,7 +192,10 @@ function collectCssText(): string {
  * extract normalized, deduplicated design tokens.
  */
 export async function extractDesignTokens(page: Page): Promise<DesignTokens> {
-  const css = await page.evaluate(collectCssText);
+  const [css, canvas] = await Promise.all([
+    page.evaluate(collectCssText),
+    extractCanvasTheme(page),
+  ]);
 
   const colors = new Map<string, string>();
   const fonts = new Set<string>();
@@ -189,6 +254,7 @@ export async function extractDesignTokens(page: Page): Promise<DesignTokens> {
     fonts: [...fonts].sort(),
     spacing: [...spacing].sort(),
     radii: [...radii].sort(),
+    ...(canvas !== undefined ? { canvas } : {}),
   };
 }
 

@@ -110,17 +110,33 @@ export function formatA11yTreeForVisionPrompt(
   return lines.join('\n');
 }
 
-/** Serializes design tokens into a compact prompt summary. */
+/** Maximum number of color values shown to the vision model (spec s4.3). */
+export const MAX_PROMPT_COLORS = 24;
+
+/**
+ * Serializes design tokens into a compact prompt summary as a REDUCED
+ * palette (spec s4.3): at most 24 unique color values with no indexed
+ * `--color-apograph-N` variable enumeration (which measurably overwhelmed
+ * the vision model and drove monochrome fallbacks), plus the canvas color.
+ */
 export function formatTokensForVisionPrompt(tokens: DesignTokens): string {
-  const colors = Object.entries(tokens.colors)
-    .map(([key, value]) => `  ${key}: ${value}`)
-    .join('\n');
+  const allValues = Object.values(tokens.colors);
+  const uniqueColors = [...new Set(allValues)].slice(0, MAX_PROMPT_COLORS);
+  const totalUnique = new Set(allValues).size;
+  const colors = uniqueColors.map((value) => `  ${value}`).join('\n');
+  const paletteNote =
+    totalUnique > MAX_PROMPT_COLORS
+      ? `\n  ... (${totalUnique - MAX_PROMPT_COLORS} more colors omitted; pick hues from the screenshots)`
+      : '';
+
+  const canvas = tokens.canvas?.backgroundColor;
 
   return [
-    colors.length > 0 ? `Colors:\n${colors}` : 'Colors: (none)',
-    `Fonts: ${tokens.fonts.length > 0 ? tokens.fonts.join(', ') : '(none)'}`,
-    `Spacing: ${tokens.spacing.length > 0 ? tokens.spacing.join(', ') : '(none)'}`,
-    `Radii: ${tokens.radii.length > 0 ? tokens.radii.join(', ') : '(none)'}`,
+    `Canvas background: ${canvas ?? 'not captured'}`,
+    `Reduced palette (max ${MAX_PROMPT_COLORS} colors):\n${colors}${paletteNote}`,
+    `Fonts: ${tokens.fonts.length > 0 ? tokens.fonts.slice(0, MAX_PROMPT_COLORS).join(', ') : '(none)'}`,
+    `Spacing: ${tokens.spacing.length > 0 ? tokens.spacing.slice(0, MAX_PROMPT_COLORS).join(', ') : '(none)'}`,
+    `Radii: ${tokens.radii.length > 0 ? tokens.radii.slice(0, MAX_PROMPT_COLORS).join(', ') : '(none)'}`,
   ].join('\n');
 }
 
