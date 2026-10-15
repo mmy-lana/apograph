@@ -1,5 +1,10 @@
 # Apograph SDD — Issue List
 
+> **Phase 06 update (release readiness audit — verdict: READY FOR REVIEW).** Full scorecard and evidence in `release-audit.md`; 9 Verified / 9 Partially / 2 Pending / 0 Blocked of the 20 spec requirements.
+> - **IS-09** — checklist elements all executed manually this audit (typecheck, build, 42/42 tests, pack inspection, tarball install + `mcp` handshake, dsh/custom writers, doctor, README re-audit); scripting + `test` script remain pre-release tasks.
+> - **IS-10** — MCP-04 now **Verified** (fault-injection observed); MCP-03 parity statement still to add to README.
+> - Open pre-release items: P3 docs pass (MCP-03/05 bullets, DOC-01/02/03), Gate C DSH live reload, authorized publish (published 0.1.1 remains stale until then).
+>
 > **Phase 05 update.**
 > - **IS-07** — **Implemented (documentation + verified generic route)**: `specs/integration/clients.md` is the authoritative client compatibility matrix (Tier 1 adapters incl. dsh with locations/schemas/reload/limitations; Tier 2 universal `--client custom` with copy-pasteable block and env-var handling). Unknown client names now print actionable guidance referencing `--client custom` (`unknownClientMessage`, unit-tested, zero filesystem writes). Tier 2 expansion (Zed/Continue/Cline dedicated adapters) remains deferred per approved D4 — no brittle adapters written without verified demand.
 > - **IS-02** — setup side complete and regression-protected (42/42 tests incl. new Tier 1 resolution/payload and unknown-client routing tests); the only open item remains the DSH live reload (Gate C, DSH-02).
