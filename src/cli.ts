@@ -50,6 +50,11 @@ import {
   PLAN_FILENAME,
 } from './plan/generator.js';
 import { runApprovalGate, ApprovalCancelledError } from './plan/gate.js';
+import {
+  runEvidenceReviewGate,
+  recrawlRoute,
+  EvidenceGateAbortedError,
+} from './plan/evidenceGate.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -317,6 +322,7 @@ interface ClonePipelineOptions {
   maxDepth: number;
   maxPages: number;
   yes: boolean;
+  noReview: boolean;
   force: boolean;
   verify: boolean;
   interactive: boolean;
@@ -339,6 +345,7 @@ async function runClonePipeline(options: ClonePipelineOptions): Promise<void> {
     maxDepth,
     maxPages,
     yes,
+    noReview,
     force,
     verify,
     interactive,
@@ -405,7 +412,7 @@ async function runClonePipeline(options: ClonePipelineOptions): Promise<void> {
       activeLabel = null;
     }
 
-    // --- Step 2: plan generation + approval gate ---------------------------
+    // --- Step 2: Gate 1 evidence review + plan generation + approval gate --
     stage = 'plan';
     let approved: ApographPlan;
 
@@ -416,6 +423,33 @@ async function runClonePipeline(options: ClonePipelineOptions): Promise<void> {
       approved.approvedAt = new Date().toISOString();
       await writePlanFile(join(evidenceDir, PLAN_FILENAME), approved);
     } else {
+      // Gate 1: evidence review before any plan generation (spec s3).
+      console.log('→ Reviewing capture evidence (Gate 1)...');
+      let gatedManifest: EvidenceManifest;
+      try {
+        const gated = await runEvidenceReviewGate(manifest, resolve(evidenceDir), {
+          nonInteractive: yes || noReview,
+          reCrawlRoute: (routeIndex) => recrawlRoute(manifest, routeIndex, resolve(evidenceDir)),
+        });
+        gatedManifest = gated.manifest;
+        const prunedCount = gated.record.pruned.length;
+        const aliasCount = gated.record.aliases.length;
+        console.log(
+          `→ Gate 1 complete: ${gatedManifest.routes.length} active route(s)` +
+            (prunedCount > 0 ? `, ${prunedCount} pruned` : '') +
+            (aliasCount > 0 ? `, ${aliasCount} aliased` : '') +
+            `.`,
+        );
+      } catch (cause) {
+        if (cause instanceof EvidenceGateAbortedError) {
+          console.error('✖ Clone aborted: the evidence review gate was aborted.');
+          process.exitCode = 1;
+          return;
+        }
+        throw cause;
+      }
+      manifest = gatedManifest;
+
       const plan = createPlanFromEvidence(manifest);
       const planPath = join(evidenceDir, PLAN_FILENAME);
       await writePlanFile(planPath, plan);
@@ -477,6 +511,7 @@ interface CloneOptions {
   viewport: string;
   scope?: string;
   yes: boolean;
+  noReview: boolean;
   force: boolean;
   verify: boolean;
 }
@@ -493,6 +528,7 @@ interface CrawlCliOptions {
 /** Options for the `plan` command. */
 interface PlanCliOptions {
   yes: boolean;
+  noReview: boolean;
   out?: string;
 }
 
@@ -522,10 +558,36 @@ program
   .description('Generate the authoritative plan from the evidence bundle and approve it interactively')
   .argument('[evidenceDir]', 'evidence directory (defaults to .apograph/evidence)', DEFAULT_EVIDENCE_DIR)
   .option('--yes', 'auto-approve the plan without interactive prompts')
+  .option('--no-review', 'skip the Gate 1 evidence review (automated filtering only)')
   .option('-o, --out <file>', 'custom plan output path (defaults to <evidenceDir>/apograph-plan.json)')
   .action(async (evidenceDir: string, options: PlanCliOptions) => {
     console.log(`→ Reading evidence from ${resolve(evidenceDir)}...`);
-    const manifest = await loadEvidenceManifest(evidenceDir);
+    let manifest = await loadEvidenceManifest(evidenceDir);
+
+    // Gate 1: evidence review before any plan generation (spec s3).
+    console.log('→ Reviewing capture evidence (Gate 1)...');
+    try {
+      const gated = await runEvidenceReviewGate(manifest, resolve(evidenceDir), {
+        nonInteractive: options.yes || options.noReview,
+        reCrawlRoute: (routeIndex) => recrawlRoute(manifest, routeIndex, resolve(evidenceDir)),
+      });
+      manifest = gated.manifest;
+      const prunedCount = gated.record.pruned.length;
+      const aliasCount = gated.record.aliases.length;
+      console.log(
+        `→ Gate 1 complete: ${manifest.routes.length} active route(s)` +
+          (prunedCount > 0 ? `, ${prunedCount} pruned` : '') +
+          (aliasCount > 0 ? `, ${aliasCount} aliased` : '') +
+          `.`,
+      );
+    } catch (cause) {
+      if (cause instanceof EvidenceGateAbortedError) {
+        console.error('✖ Plan cancelled: the evidence review gate was aborted.');
+        process.exitCode = 1;
+        return;
+      }
+      throw cause;
+    }
 
     console.log(`→ Deriving plan from ${manifest.routes.length} crawled route(s)...`);
     const plan = createPlanFromEvidence(manifest);
@@ -600,6 +662,7 @@ program
   .option('--viewport <mode>', 'viewports to screenshot and verify: both, desktop, or mobile', 'both')
   .option('--scope <mode>', 'crawl scope for subpath URLs: single, subtree, or site')
   .option('--yes', 'auto-approve the plan without interactive prompts')
+  .option('--no-review', 'skip the Gate 1 evidence review (automated filtering only)')
   .option('--force', 'overwrite the output directory completely instead of merging')
   .option('--no-verify', 'skip the 3-tier verification pass')
   .action(async (url: string, options: CloneOptions) => {
@@ -641,6 +704,7 @@ program
       maxDepth: parseNumber(options.maxDepth, 2),
       maxPages: parseNumber(options.maxPages, 10),
       yes: options.yes,
+      noReview: options.noReview,
       force: options.force,
       verify: options.verify,
       interactive,
@@ -678,6 +742,7 @@ program
       evidenceDir: checkpoint.evidenceDir,
       viewport: checkpoint.viewport,
       requestedScope: undefined,
+      noReview: true,
       maxDepth: 2,
       maxPages: 10,
       yes: !interactive,
