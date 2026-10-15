@@ -11,6 +11,7 @@
  *   apograph config               Configure the LLM provider (stored in ~/.apograph/config.json).
  *   apograph doctor               Check environment health (Node, Chromium, LLM, Ollama).
  *   apograph setup                Install the apograph MCP server into your coding agent.
+ *   apograph mcp                  Start the apograph MCP server over stdio.
  */
 
 import { Command } from 'commander';
@@ -28,6 +29,7 @@ import { runVerification } from './verifier/engine.js';
 import { printVerificationSummary, writeVerificationReport } from './verifier/report.js';
 import { runDoctor } from './commands/doctor.js';
 import { runSetup } from './commands/setup.js';
+import { runMcpServer } from './mcp/server.js';
 import { getVersion } from './version.js';
 import { runConfigCommand } from './commands/config.js';
 import { runStatusCommand } from './commands/status.js';
@@ -765,10 +767,19 @@ program
   });
 
 program
+  .command('mcp')
+  .alias('serve')
+  .description('Start the apograph MCP server over stdio (for AI coding agents and DSH)')
+  .action(async () => {
+    await runMcpServer();
+  });
+
+program
   .command('setup')
-  .description('Install the apograph MCP server into your AI coding agent (Claude Desktop, Cursor, Claude Code, Windsurf, OpenCode)')
-  .option('-c, --client <name>', 'only configure a specific agent (claude-desktop, cursor, claude-code, windsurf, opencode)')
-  .action(async (options: { client?: string }) => {
+  .description('Install the apograph MCP server into your AI coding agent (Claude Desktop, Cursor, Claude Code, Windsurf, OpenCode, DSH)')
+  .option('-c, --client <name>', 'only configure a specific agent (claude-desktop, cursor, claude-code, windsurf, opencode, dsh, custom)')
+  .option('-p, --config-path <file>', 'with --client custom: path of the mcpServers JSON config to write or merge')
+  .action(async (options: { client?: string; configPath?: string }) => {
     await runSetup(options);
   });
 

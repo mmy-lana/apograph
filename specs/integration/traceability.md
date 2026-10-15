@@ -5,16 +5,16 @@ Test IDs are defined in `spec.md` §10 (TEST-01…TEST-05). "Planned" = test doe
 | Requirement | Issue | Acceptance criterion (summary) | Verification | Test | Plan phase | Status |
 |---|---|---|---|---|---|---|
 | PKG-01 naming/invocation | IS-01 | README commands run verbatim, no E404 | Packed-tarball smoke | TEST-03, TEST-05 | P3 | Planned |
-| PKG-02 `mcp` subcommand | IS-03 | `npx -y apograph-agents mcp` completes MCP initialize | Scripted handshake | TEST-01, TEST-03 | P1 | Planned |
-| PKG-03 version single-source | IS-04 | `--version` and MCP serverInfo = package version | CLI + MCP assertions | TEST-01, TEST-02, TEST-03 | P1 | Planned |
-| MCP-01 shared server, stdio | IS-03 | Identical tool lists from both entry points | tools/list snapshot | TEST-01 | P1 | Planned |
-| MCP-02 graceful shutdown | — | stdin close / SIGTERM ⇒ exit 0 ≤ 2 s | Spawn-and-kill test | TEST-01 | P1 | Planned |
+| PKG-02 `mcp` subcommand | IS-03 | `npx -y apograph-agents mcp` completes MCP initialize | Scripted handshake | TEST-01, TEST-03 | P1 | **Verified locally** (handshake via `node dist/cli.js mcp`: serverInfo v0.1.1; published-tarball check pending) |
+| PKG-03 version single-source | IS-04 | `--version` and MCP serverInfo = package version | CLI + MCP assertions | TEST-01, TEST-02, TEST-03 | P1 | **Verified** (both report 0.1.1) |
+| MCP-01 shared server, stdio | IS-03 | Identical tool lists from both entry points | tools/list snapshot | TEST-01 | P1 | **Verified** (bin and `mcp` subcommand both list apograph_crawl, apograph_clone) |
+| MCP-02 graceful shutdown | — | stdin close / SIGTERM ⇒ exit 0 ≤ 2 s | Spawn-and-kill test | TEST-01 | P1 | **Partially verified** (SIGTERM ⇒ exit 0 observed; stdin-close assertion pending in TEST-01) |
 | MCP-03 contracts = docs | IS-10 | tools/list dump matches README tables | Snapshot + doc diff | TEST-01, TEST-05 | P3 | Planned |
-| MCP-04 error containment | — | Throwing tool ⇒ MCP error result, server alive | Fault-injection test | TEST-01 | P1 | Planned |
+| MCP-04 error containment | — | Throwing tool ⇒ MCP error result, server alive | Fault-injection test | TEST-01 | P1 | Planned (server extracted for testability; fault test not yet written) |
 | MCP-05 security boundaries | — | Writes confined to documented cwd paths | Temp cwd inspection | TEST-02, TEST-03 | P2 | Planned |
-| DSH-01 dsh adapter | IS-02 | Valid preset entry; idempotent upsert; tools appear after reload | Writer test + live reload | TEST-02, TEST-03 | P2 | Planned |
+| DSH-01 dsh adapter | IS-02 | Valid preset entry; idempotent upsert; tools appear after reload | Writer test + live reload | TEST-02, TEST-03 | P2 | **Unit-verified** (15/15 node:test pass: creation, idempotency, print-fallback paths); **live DSH reload NOT yet executed** |
 | DSH-02 verification guidance | IS-02 | Documented reload procedure executed once | Checklist record | TEST-03 | P3 | Planned |
-| CLIENT-01 generic writer | IS-02 | Merge preserves keys; corrupt input aborts; creates file if missing | Writer tests | TEST-02 | P2 | Planned |
+| CLIENT-01 generic writer | IS-02 | Merge preserves keys; corrupt input aborts; creates file if missing | Writer tests | TEST-02 | P2 | **Verified** (unit tests: create, merge-preserving, idempotent no-op, abort-on-corrupt with backup) |
 | CLIENT-02 ranked roster | IS-07 | Each promoted client: verified path/shape + writer test | Per-adapter tests + docs | TEST-02, TEST-05 | P4 (post-approval) | Planned |
 | MODEL-01 provider independence | IS-08 | Resolution depends only on env + config file | Precedence unit tests | TEST-04 | P2 | Planned |
 | MODEL-02 config validation | IS-08 | WARN/FAIL with fix text for each failure mode; healthy passes | validate.ts unit tests | TEST-04, TEST-03 | P2 | Planned |

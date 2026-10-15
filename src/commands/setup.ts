@@ -7,13 +7,14 @@
  */
 
 import { platform } from 'node:process';
+import { existsSync } from 'node:fs';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 
 /** The MCP server definition injected into agent configs. */
-interface McpServerDefinition {
+export interface McpServerDefinition {
   command: string;
   args: string[];
 }
@@ -161,7 +162,7 @@ function backupPath(configPath: string): string {
 }
 
 /** Sanitizes a client option into a known agent key, or null. */
-function normalizeClientKey(client: string): string | null {
+export function normalizeClientKey(client: string): string | null {
   const normalized = client.toLowerCase().trim();
   const aliases: Record<string, string> = {
     'claude-desktop': 'claude-desktop',
@@ -174,8 +175,230 @@ function normalizeClientKey(client: string): string | null {
     windsurf: 'windsurf',
     opencode: 'opencode',
     'open-code': 'opencode',
+    dsh: 'dsh',
+    'deepseek-harness': 'dsh',
+    custom: 'custom',
   };
   return aliases[normalized] ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// DSH adapter (DSH-01)
+// ---------------------------------------------------------------------------
+
+/** The composition row registered with @deepseek-ai/dsh-mcp-client. */
+export interface DshEntry {
+  id: string;
+  name: string;
+  config: {
+    serverName: string;
+    transport: 'stdio';
+    command: string;
+    args: string[];
+  };
+}
+
+/** Builds the mcp-apograph row: package-name launch, no absolute paths. */
+export function dshEntryDefinition(): DshEntry {
+  return {
+    id: 'mcp-apograph',
+    name: '@deepseek-ai/dsh-mcp-client',
+    config: {
+      serverName: 'apograph',
+      transport: 'stdio',
+      command: 'npx',
+      args: ['-y', 'apograph-agents', 'mcp'],
+    },
+  };
+}
+
+/**
+ * Resolves the DSH home directory: `$DSH_HOME` when set, else `~/.dsh` when
+ * it exists as a directory, else null (print-fallback territory).
+ */
+export function resolveDshHome(
+  env: NodeJS.ProcessEnv = process.env,
+  home = homedir(),
+): string | null {
+  if (env.DSH_HOME !== undefined && env.DSH_HOME.length > 0) return env.DSH_HOME;
+  const fallback = join(home, '.dsh');
+  return existsSync(fallback) ? fallback : null;
+}
+
+/** The apograph agent-preset composition file inside a DSH home. */
+export function dshPresetPath(dshHome: string): string {
+  return join(dshHome, '.agent-presets', 'apograph', 'cordis.yml');
+}
+
+/** Renders the DSH composition row as copy-pasteable JSON (valid YAML). */
+export function renderDshPrintBlock(): string {
+  return JSON.stringify([dshEntryDefinition()], null, 2);
+}
+
+/**
+ * Result of a DSH setup attempt: wrote a fresh preset, found the entry
+ * already present (idempotent no-op), or printed the fallback block.
+ */
+export type DshSetupResult = 'created' | 'unchanged' | 'printed';
+
+/**
+ * Registers apograph with DSH (DSH-01). Writes a dedicated agent-preset
+ * composition file when the DSH home is locatable and does not yet contain
+ * the entry; when an existing preset lacks the row, or no DSH home is
+ * found, prints the copy-pasteable block instead of blind-merging YAML
+ * (this project carries no YAML dependency).
+ */
+export async function runDshSetup(
+  dshHome: string | null,
+  log: (message: string) => void = console.log,
+  errLog: (message: string) => void = console.error,
+): Promise<DshSetupResult> {
+  const entry = dshEntryDefinition();
+
+  if (dshHome === null) {
+    errLog('✖ No DSH home found (set $DSH_HOME or create ~/.dsh).');
+    log('');
+    log('Add this entry to your DSH composition (cordis.patch.yml or an agent');
+    log('preset cordis.yml) to register the apograph MCP server:');
+    log('');
+    log(renderDshPrintBlock());
+    log('');
+    log("After a harness reload the tools appear as mcp__apograph__apograph_crawl and mcp__apograph__apograph_clone.");
+    return 'printed';
+  }
+
+  const presetPath = dshPresetPath(dshHome);
+  const existing = await readIfExists(presetPath);
+
+  if (existing !== null) {
+    if (existing.includes(entry.id)) {
+      log(`✓ ${entry.id} already present in ${presetPath} — nothing to do.`);
+      return 'unchanged';
+    }
+    // Existing preset without our row: never blind-merge YAML without a
+    // parser — print the block for manual insertion.
+    log(`✖ ${presetPath} exists but does not contain ${entry.id}.`);
+    log('Add this entry to the file (JSON is valid YAML), then reload DSH:');
+    log('');
+    log(renderDshPrintBlock());
+    return 'printed';
+  }
+
+  const body = [
+    `# apograph MCP server — written by \`apograph setup --client dsh\`.`,
+    `# Tools appear as mcp__apograph__apograph_crawl and mcp__apograph__apograph_clone`,
+    `# after the harness reloads this composition.`,
+    `- id: ${entry.id}`,
+    `  name: '${entry.name}'`,
+    `  config:`,
+    `    serverName: ${entry.config.serverName}`,
+    `    transport: ${entry.config.transport}`,
+    `    command: ${entry.config.command}`,
+    `    args:`,
+    ...entry.config.args.map((arg) => `      - '${arg}'`),
+    '',
+  ].join('\n');
+
+  try {
+    await mkdir(dirname(presetPath), { recursive: true });
+    await writeFile(presetPath, body, 'utf8');
+  } catch (cause) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    errLog(`✖ Could not write ${presetPath} — ${reason}`);
+    log('');
+    log('Add this entry manually to your DSH composition (JSON is valid YAML):');
+    log('');
+    log(renderDshPrintBlock());
+    return 'printed';
+  }
+  log(`✓ DSH agent preset written: ${presetPath}`);
+  log('  Load the preset in your DSH session and reload to get mcp__apograph__* tools.');
+  return 'created';
+}
+
+// ---------------------------------------------------------------------------
+// Generic client writer (CLIENT-01): standard mcpServers JSON
+// ---------------------------------------------------------------------------
+
+/**
+ * Portable MCP launch definition used by the dsh and custom writers: starts
+ * the server through the published package name (PKG-01/PKG-02), so the
+ * generated configuration carries no machine-specific absolute paths.
+ */
+export function portableServerDefinition(): McpServerDefinition {
+  return { command: 'npx', args: ['-y', 'apograph-agents', 'mcp'] };
+}
+
+/** The standard `mcpServers` JSON block for clients without a dedicated adapter. */
+export function renderMcpServersPrintBlock(): string {
+  const server = portableServerDefinition();
+  return JSON.stringify(
+    { mcpServers: { apograph: { command: server.command, args: server.args } } },
+    null,
+    2,
+  );
+}
+
+/** Outcome of a generic mcpServers JSON write. */
+export type McpServersWriteResult = 'created' | 'updated' | 'unchanged';
+
+/**
+ * Writes (or merges) the standard `mcpServers.apograph` entry into a JSON
+ * config file (CLIENT-01). Idempotent: an existing identical entry is left
+ * untouched (no backup, no write). Existing keys — including other MCP
+ * servers — are preserved. Invalid JSON aborts without modifying the file.
+ */
+export async function writeMcpServersConfig(
+  configPath: string,
+  server: McpServerDefinition,
+  log: (message: string) => void = console.log,
+): Promise<McpServersWriteResult> {
+  const original = await readIfExists(configPath);
+  const desired = { command: server.command, args: server.args };
+
+  let config: Record<string, unknown>;
+  if (original !== null) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(original);
+    } catch (cause) {
+      const reason = cause instanceof Error ? cause.message : String(cause);
+      throw new Error(
+        `${configPath} is not valid JSON (${reason}) — refusing to modify it. Fix or remove the file, then re-run.`,
+      );
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error(`${configPath} is not a JSON object — refusing to modify it.`);
+    }
+    config = parsed as Record<string, unknown>;
+  } else {
+    config = {};
+  }
+
+  const mcpServers = ensureObject(config, 'mcpServers');
+  const current = mcpServers.apograph;
+  if (
+    typeof current === 'object' &&
+    current !== null &&
+    JSON.stringify(current) === JSON.stringify(desired)
+  ) {
+    log(`✓ apograph MCP entry already present in ${configPath} — nothing to do.`);
+    return 'unchanged';
+  }
+
+  if (original !== null) {
+    await writeFile(backupPath(configPath), original, 'utf8');
+  }
+  mcpServers.apograph = desired;
+  await mkdir(dirname(configPath), { recursive: true });
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+  log(
+    original === null
+      ? `✓ Created ${configPath} with the apograph MCP entry.`
+      : `✓ Updated ${configPath} (backup saved) — apograph MCP entry added.`,
+  );
+  return original === null ? 'created' : 'updated';
 }
 
 /** Installs the apograph MCP server into one agent config. */
@@ -211,30 +434,63 @@ async function setupAgent(target: AgentTarget, server: McpServerDefinition): Pro
 /**
  * Detects installed AI coding agents and injects the apograph MCP server
  * into their configs, backing up any existing config first. When
- * `options.client` is provided, only that agent is configured.
+ * `options.client` is provided, only that agent is configured. `dsh` and
+ * `custom` are handled before file discovery because both work without a
+ * pre-existing config file.
  */
-export async function runSetup(options: { client?: string }): Promise<void> {
+export async function runSetup(options: {
+  client?: string;
+  configPath?: string;
+}): Promise<void> {
   const server = apographServerDefinition();
 
-  let targets = await discoverAgents();
-
-  if (options.client) {
+  if (options.client !== undefined) {
     const key = normalizeClientKey(options.client);
+    if (key === 'dsh') {
+      await runDshSetup(resolveDshHome());
+      return;
+    }
+    if (key === 'custom') {
+      if (options.configPath !== undefined && options.configPath.length > 0) {
+        await writeMcpServersConfig(options.configPath, portableServerDefinition());
+      } else {
+        console.log(
+          'Add this standard mcpServers JSON to your client\'s MCP configuration:',
+        );
+        console.log('');
+        console.log(renderMcpServersPrintBlock());
+        console.log('');
+        console.log(
+          "Or write it directly: apograph setup --client custom --config-path <path-to-config.json>",
+        );
+      }
+      return;
+    }
     if (!key) {
       console.error(
-        `✖ Unknown client "${options.client}". Supported: claude-desktop, cursor, claude-code, windsurf, opencode.`,
+        `✖ Unknown client "${options.client}". Supported: claude-desktop, cursor, claude-code, windsurf, opencode, dsh, custom.`,
       );
       return;
     }
-    const selected = targets.find((target) => target.key === key);
+    const selected = (await discoverAgents()).find((target) => target.key === key);
     if (!selected) {
       console.error(
         `✖ ${options.client} config not found. Open the agent once so it creates its config, then re-run \`apograph setup --client ${key}\`.`,
       );
       return;
     }
-    targets = [selected];
+    try {
+      await setupAgent(selected, server);
+    } catch (cause) {
+      const reason = cause instanceof Error ? cause.message : String(cause);
+      console.warn(`✖ ${selected.name}: setup failed — ${reason}`);
+    }
+    console.log('');
+    console.log('✔ Done. Restart your agent to load the apograph MCP tools.');
+    return;
   }
+
+  let targets = await discoverAgents();
 
   if (targets.length === 0) {
     console.log('No AI coding agent configs were detected.');
@@ -245,6 +501,10 @@ export async function runSetup(options: { client?: string }): Promise<void> {
     console.log('  Claude Code     ~/.claude.json');
     console.log('  Windsurf        ~/.codeium/windsurf/mcp_config.json');
     console.log('  OpenCode        ~/.config/opencode/opencode.json');
+    console.log('');
+    console.log('Additional options that work without a pre-existing config:');
+    console.log('  DSH             apograph setup --client dsh (agent preset or printed entry)');
+    console.log('  Custom          apograph setup --client custom [--config-path <file>] (mcpServers JSON)');
     console.log('');
     console.log('Open your agent once so it creates its config file, then re-run `apograph setup`.');
     return;

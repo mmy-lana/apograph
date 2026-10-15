@@ -1,5 +1,10 @@
 # Apograph SDD — Issue List
 
+> **Phase 03 update.**
+> - **IS-02** — **Implemented (code-complete, DSH live-reload pending)**: `setup --client dsh` writes a dedicated DSH agent preset (`~/.dsh/.agent-presets/apograph/cordis.yml`, idempotent) or prints the copy-pasteable composition entry (approved D2 fallback: no DSH home, preset exists without the row, or the write fails); `setup --client custom [--config-path <file>]` writes/merges standard mcpServers JSON (approved D3) with backup, merge-preserving unrelated keys, and abort-on-corrupt. 15 unit tests (node:test) green.
+> - **IS-03** — **Implemented and verified**: `apograph mcp` (alias `serve`) starts the shared stdio server (`src/mcp/server.ts`, MCP-01); both the `apograph-mcp` bin and the subcommand report identical `serverInfo` (v0.1.1, handshake observed) and the same two tools; SIGTERM ⇒ exit 0 (MCP-02). Writers emit the portable `npx -y apograph-agents mcp` launch (PKG-01/02).
+> - Remaining for DSH-02 (Gate C): a live DSH reload proving `mcp__apograph__*` tools appear — not yet executed; do not document DSH support in README until that passes (P3).
+>
 > **Phase 02 update.** Local repairs landed (unpublished, per no-publish rule):
 > - **IS-01** — README commands corrected to `npx apograph-agents` + global-install line + package-name note. *Fixed locally; the published 0.1.1 tarball still carries the broken README until the next authorized release* (unpkg check: 0 occurrences of `npx apograph-agents` in the published README). Full closure requires TEST-03 + publish.
 > - **IS-04** — **Fixed and verified**: version single-sourced from `package.json` via new `src/version.ts`; CLI `--version` and MCP `serverInfo` both report `0.1.1` (observed locally and from a tarball install).
