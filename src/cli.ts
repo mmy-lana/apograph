@@ -23,7 +23,11 @@ import type { CrawlScope, EvidenceManifest, ViewportMode } from './types.js';
 import type { ApographPlan } from './plan/schema.js';
 import { crawlEvidence } from './crawler/engine.js';
 import { urlHasSubpath } from './crawler/urls.js';
-import { synthesizeModularProject, copyMirroredAssets } from './synthesizer/modular.js';
+import {
+  synthesizeModularProject,
+  copyMirroredAssets,
+  generatePageTemplate,
+} from './synthesizer/modular.js';
 import { emitProject } from './emitter/scaffold.js';
 import { runVerification } from './verifier/engine.js';
 import { printVerificationSummary, writeVerificationReport } from './verifier/report.js';
@@ -269,6 +273,27 @@ async function runModularSynthesis(
         : ''),
   );
 
+  // Post-synthesis existence check: every included route must have a
+  // non-empty page file in result.files. Backfill with the deterministic
+  // template rather than emitting a broken project.
+  const includedRoutes = plan.routes.filter((r) => r.included);
+  for (const route of includedRoutes) {
+    const expectedPath = `src/pages/${route.componentName}.tsx`;
+    const existing = result.files.find(
+      (f) => f.path === expectedPath && f.content.trim().length > 0,
+    );
+    if (existing === undefined) {
+      console.warn(
+        `[apograph] post-synthesis: ${expectedPath} missing or empty — ` +
+          `backfilling with deterministic template for route ${route.path}`,
+      );
+      result.files.push({
+        path: expectedPath,
+        content: generatePageTemplate(route),
+      });
+    }
+  }
+
   console.log(`→ Emitting project to ${resolve(outDir)}...`);
   const { writtenFiles, projectDir } = await emitProject(result.files, outDir, plan.appName, {
     force: options.force,
@@ -476,7 +501,9 @@ async function runClonePipeline(options: ClonePipelineOptions): Promise<void> {
       interactive,
       verify,
       viewport,
-      skipRoutePaths: existingPagePaths(approved, outDir),
+      skipRoutePaths: (resumeFrom !== undefined ? false : force)
+        ? []
+        : existingPagePaths(approved, outDir),
       onRouteCompleted: (path) => {
         completedRoutePaths.add(path);
       },

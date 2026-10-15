@@ -689,7 +689,12 @@ async function runVisionStage(
 
   try {
     const files = await generateFilesWithVision(text, SYSTEM_GUIDELINES, screenshots);
-    if (files.length === 0) throw new Error('model returned no files');
+    if (
+      files.length === 0 ||
+      files.every((f) => f.content.trim().length === 0)
+    ) {
+      throw new Error('model returned no files or all files had empty content');
+    }
     result.visionStages.push(stage);
     progress?.stop('Done');
     return files;
