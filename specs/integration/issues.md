@@ -1,5 +1,9 @@
 # Apograph SDD — Issue List
 
+> **Phase 05 update.**
+> - **IS-07** — **Implemented (documentation + verified generic route)**: `specs/integration/clients.md` is the authoritative client compatibility matrix (Tier 1 adapters incl. dsh with locations/schemas/reload/limitations; Tier 2 universal `--client custom` with copy-pasteable block and env-var handling). Unknown client names now print actionable guidance referencing `--client custom` (`unknownClientMessage`, unit-tested, zero filesystem writes). Tier 2 expansion (Zed/Continue/Cline dedicated adapters) remains deferred per approved D4 — no brittle adapters written without verified demand.
+> - **IS-02** — setup side complete and regression-protected (42/42 tests incl. new Tier 1 resolution/payload and unknown-client routing tests); the only open item remains the DSH live reload (Gate C, DSH-02).
+>
 > **Phase 04 update.**
 > - **IS-08** — **Implemented and unit-verified**: `src/config/validate.ts` (MODEL-02/03) adds `validateProviderConfig()` (classified checks: missing-credentials / malformed-url / unreachable / auth-rejection / model-mismatch; gateway `GET /models` probe warn-only), `probeModelCapabilities()` (structured-output + vision probes, report-only), `maskSecret()`/`redactSecrets()`; `models.ts` resolution extracted into pure injectable `resolveProvider()`/`resolveModelId()` with identical behavior (Ollama fallback preserved, no routing changes); `doctor` now prints active provider/model + redacted credential hint + structured-output and vision `[PASS]/[WARN]` lines and uses `[FAIL]` for validation failures. 21 new tests in `tests/config.test.ts` (36 total across both suites, all green). Capability detection is report-only — pipeline behavior unchanged.
 >

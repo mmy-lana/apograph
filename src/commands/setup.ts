@@ -50,11 +50,22 @@ function mcpScriptPath(): string {
 }
 
 /** Builds the apograph MCP server definition for this installation. */
-function apographServerDefinition(): McpServerDefinition {
+export function apographServerDefinition(): McpServerDefinition {
   return {
     command: process.execPath,
     args: [mcpScriptPath()],
   };
+}
+
+/** Actionable error text for an unrecognized client name (CLIENT-01). */
+export function unknownClientMessage(client: string): string {
+  return (
+    `✖ Unknown client "${client}". Supported: claude-desktop, cursor, claude-code, windsurf, opencode, dsh, custom.\n` +
+    `  For any other MCP-compatible client (Zed, Continue, Cline, …), use:\n` +
+    `    apograph setup --client custom               → copy-pasteable mcpServers JSON\n` +
+    `    apograph setup --client custom --config-path <file>  → write/merge it for you\n` +
+    `  The generated entry works with any client that supports stdio MCP servers.`
+  );
 }
 
 /** Ensures `config[key]` is a plain object and returns it. */
@@ -467,9 +478,7 @@ export async function runSetup(options: {
       return;
     }
     if (!key) {
-      console.error(
-        `✖ Unknown client "${options.client}". Supported: claude-desktop, cursor, claude-code, windsurf, opencode, dsh, custom.`,
-      );
+      console.error(unknownClientMessage(options.client));
       return;
     }
     const selected = (await discoverAgents()).find((target) => target.key === key);

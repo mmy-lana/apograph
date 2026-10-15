@@ -20,9 +20,91 @@ import {
   runDshSetup,
   writeMcpServersConfig,
   normalizeClientKey,
+  apographServerDefinition,
+  unknownClientMessage,
+  runSetup,
 } from '../dist/commands/setup.js';
 
 const SERVER = { command: 'npx', args: ['-y', 'apograph-agents', 'mcp'] };
+
+/** The Tier 1 roster (CLIENT-02): dedicated adapters, incl. dsh. */
+const TIER1_CLIENTS = [
+  'claude-desktop',
+  'cursor',
+  'claude-code',
+  'windsurf',
+  'opencode',
+  'dsh',
+  'custom',
+] as const;
+
+describe('Tier 1 client resolution and payloads', () => {
+  test('every Tier 1 client name resolves through normalizeClientKey', () => {
+    for (const name of TIER1_CLIENTS) {
+      assert.equal(normalizeClientKey(name), name, `${name} must resolve`);
+    }
+    // Documented aliases still resolve.
+    assert.equal(normalizeClientKey('claude'), 'claude-desktop');
+    assert.equal(normalizeClientKey('deepseek-harness'), 'dsh');
+  });
+
+  test('apographServerDefinition produces a valid stdio payload (node + mcp.js)', () => {
+    const def = apographServerDefinition();
+    assert.equal(typeof def.command, 'string');
+    assert.ok(def.command.length > 0);
+    assert.equal(def.args.length, 1);
+    assert.ok(def.args[0].endsWith('mcp.js'));
+  });
+
+  test('dsh and custom payload builders emit valid, parseable JSON', () => {
+    assert.deepEqual(JSON.parse(renderDshPrintBlock()), [dshEntryDefinition()]);
+    const custom = JSON.parse(renderMcpServersPrintBlock());
+    assert.equal(custom.mcpServers.apograph.command, 'npx');
+    assert.deepEqual(custom.mcpServers.apograph.args, ['-y', 'apograph-agents', 'mcp']);
+  });
+});
+
+describe('unknown client guidance (CLIENT-01)', () => {
+  test('unknown names produce an actionable message referencing --client custom', () => {
+    const message = unknownClientMessage('unknown-client');
+    assert.ok(message.includes('Unknown client "unknown-client"'));
+    assert.ok(message.includes('--client custom'));
+    assert.ok(message.includes('--config-path'));
+  });
+
+  test('runSetup routes unknown clients to the actionable error without writing files', async () => {
+    const dir = await tempDir();
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (message: string) => errors.push(message);
+    try {
+      await runSetup({ client: 'unknown-client' });
+    } finally {
+      console.error = originalError;
+    }
+    assert.ok(errors.some((m) => m.includes('--client custom')));
+    const written = (await readdir(dir)).length;
+    assert.equal(written, 0, 'no files may be created for an unknown client');
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test('runSetup --client custom --config-path writes the mcpServers JSON', async () => {
+    const dir = await tempDir();
+    const file = join(dir, 'client.json');
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (message: string) => logs.push(message);
+    try {
+      await runSetup({ client: 'custom', configPath: file });
+    } finally {
+      console.log = originalLog;
+    }
+    const parsed = JSON.parse(await readFile(file, 'utf8'));
+    assert.deepEqual(parsed.mcpServers.apograph, { command: 'npx', args: ['-y', 'apograph-agents', 'mcp'] });
+    assert.ok(logs.some((m) => m.includes('Updated') || m.includes('Created')));
+    await rm(dir, { recursive: true, force: true });
+  });
+});
 
 /** Creates one temp workspace directory per test. */
 async function tempDir(): Promise<string> {
