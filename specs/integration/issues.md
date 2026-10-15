@@ -1,4 +1,12 @@
-# Apograph SDD — Issue List (Phase 00)
+# Apograph SDD — Issue List
+
+> **Phase 01 update.** Priorities and dependencies below are superseded by `spec.md` / `plan.md`:
+> - **P1 (plan phase P1):** IS-03, IS-04 (+ new work MCP-02/04 lifecycle & error containment, folded here rather than tracked as separate issues).
+> - **P2:** IS-02 (now decomposed into spec requirements DSH-01, CLIENT-01, MODEL-01/02/03), IS-08.
+> - **P3:** IS-01, IS-06, IS-09 (+ IS-10 documentation part).
+> - **P4 (evidence-gated, needs D4):** IS-07.
+> - Dropped from implementation scope: none; IS-10's tool-parity part remains a tracked non-goal (spec §2, MCP-03 documents the gap honestly).
+> Original Phase 00 list retained below for evidence traceability.
 
 Prioritized, deduplicated. Priority: P0 blocks the advertised happy path; P1 blocks stated objectives (DSH/custom clients/providers); P2 quality/verification. Dependencies reference other issue IDs. Phase-01 prerequisites are marked in `decisions-needed.md`.
 

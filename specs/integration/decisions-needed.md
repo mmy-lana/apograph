@@ -46,4 +46,19 @@ Minor: `bump:*` scripts call `npm version` inside a pnpm repo (audit §1). Keep 
 
 ---
 
+# Phase 01 update — decision states and recommended defaults
+
+The spec (`spec.md`) is implementation-ready only upon approval of these defaults. Each lists alternatives, trade-offs, and a recommended default; none are silently resolved.
+
+| ID | Decision | Alternatives (trade-off) | Recommended default |
+|---|---|---|---|
+| D1 | Package naming | A: docs use `npx apograph-agents` (cheapest); B: also publish an `apograph` alias package (README literal, extra package to maintain; requires confirming name ownership); C: rename package (breaking) | **A** + `mcp` subcommand |
+| D2 | DSH write target | A: profile patch `~/.dsh/profiles/web/cordis.patch.yml` (all sessions affected); B: agent preset `~/.dsh/.agent-presets/apograph/cordis.yml` (session-scoped, opt-in, safest); C: print entry only (zero risk, manual) | **B**, with C as automatic fallback |
+| D3 | Generic client format | mcpServers JSON (de-facto standard, merges into Claude-family configs); printed snippet only; OpenCode-style arrays (non-standard, rejected) | **mcpServers JSON**, create file if missing (confirmed non-TTY), backup + abort-on-corrupt |
+| D4 | Tier-1 roster order | spec §9 ranks by documented evidence: VS Code, Gemini CLI, Zed, Codex CLI, Cline/Continue — **demand order is an assumption**; confirm, reorder, or defer P4 | Confirm or defer |
+| D5 | Test framework | `node:test` (zero deps, Node ≥ 20 builtin); vitest (nicer DX, new devDependency) | **node:test** |
+| D6 | `npm version` in bump scripts | keep (functional); pnpm equivalent (cosmetic consistency) | Keep unless P3 touches release scripts anyway |
+
+**Blocking question for Gate A:** do you approve the spec and defaults D1/D2/D3/D5, and do you want P4 (Tier-1 adapters) in scope — if so, in what order?
+
 **Not asked** (already answered by evidence): whether the CLI is `apograph-agents` (yes, via bin), what the current clients are (five, in `src/commands/setup.ts`), how DSH registers MCP servers (dsh-mcp-client entries, audit §1), what providers are supported (gateway/anthropic/openai/ollama, `src/config/models.ts`), and why `npx apograph` fails (no such npm package).
