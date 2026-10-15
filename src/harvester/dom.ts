@@ -287,12 +287,6 @@ export interface RawTextSpan {
   parentTag: string;
 }
 
-/** Semantic ancestor tags used to resolve `parentTag` (spec s5.1). */
-const SEMANTIC_ANCESTORS = new Set([
-  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-  'p', 'li', 'a', 'button', 'blockquote', 'figcaption', 'summary', 'label', 'dt', 'dd',
-]);
-
 /** True when a computed color is fully transparent (alpha 0). */
 export function isTransparentColor(color: string): boolean {
   const trimmed = color.trim().toLowerCase();
@@ -343,11 +337,27 @@ export function buildTextSpans(raw: RawTextSpan[]): TextSpan[] {
   return spans;
 }
 
-/** In-page collector harvesting raw visible text-node data in document order. */
+/**
+ * In-page collector harvesting raw visible text-node data in document order.
+ *
+ * Patch spec s2.1 (integration/patch-capture-scrolling): this function is
+ * serialized into Chromium's isolated browser V8 context by
+ * `page.evaluate`, so it must be 100% lexically self-contained. The
+ * semantic-ancestor lookup set and the ancestor-walking helper are declared
+ * INSIDE this body; referencing any Node module-scope identifier would
+ * throw `ReferenceError` in the browser at runtime.
+ */
 function collectRawTextSpans(): RawTextSpan[] {
   if (document.body === null) return [];
   const raw: RawTextSpan[] = [];
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+
+  // Semantic ancestor tags used to resolve `parentTag` — internal to this
+  // evaluated closure (patch spec s2.1 Rule 1).
+  const SEMANTIC_ANCESTORS = new Set([
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'p', 'li', 'a', 'button', 'blockquote', 'figcaption', 'summary', 'label', 'dt', 'dd',
+  ]);
 
   const semanticAncestor = (el: Element | null): string | null => {
     let current: Element | null = el;

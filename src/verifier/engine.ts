@@ -403,19 +403,54 @@ function conformToDimensions(source: PNG, width: number, height: number): PNG {
 }
 
 /** Result of one pixelmatch comparison. */
-interface ComparisonResult {
+export interface ComparisonResult {
   mismatchPercent: number;
   diffImage: string;
   diffBuffer: Buffer;
+  /** Present when the reference was cropped to the viewport height (patch spec s3.2). */
+  cropNote?: string;
+}
+
+/** The structural shape of a decoded PNG the comparison pipeline needs. */
+interface DecodedPng {
+  width: number;
+  height: number;
+  data: Buffer;
+}
+
+/**
+ * Crops a reference PNG to its top `height` pixels (top-anchored), used when
+ * a full-page reference screenshot is taller than the verification viewport
+ * (patch spec s3.2).
+ */
+function cropToHeight<T extends DecodedPng>(source: T, height: number): T {
+  if (source.height <= height) return source;
+  const cropped = new PNG({ width: source.width, height });
+  for (let row = 0; row < height; row += 1) {
+    const start = row * source.width * 4;
+    source.data.copy(cropped.data, row * source.width * 4, start, start + source.width * 4);
+  }
+  return cropped as unknown as T;
 }
 
 /** Compares a current screenshot buffer against a reference buffer. */
-function compareScreenshots(
+export function compareScreenshots(
   reference: Buffer,
   current: Buffer,
   diffPath: string,
+  viewportHeight?: number,
 ): ComparisonResult {
-  const referencePng = PNG.sync.read(reference);
+  let referencePng: ReturnType<typeof PNG.sync.read> = PNG.sync.read(reference);
+
+  // Full-page reference taller than the verification viewport: crop the
+  // reference to its top viewport-height slice (top-anchored; the scroll
+  // reset guarantees both captures are in the at-top state).
+  let cropNote: string | undefined;
+  if (viewportHeight !== undefined && referencePng.height > viewportHeight) {
+    cropNote = `reference cropped from ${referencePng.height} px to viewport height`;
+    referencePng = cropToHeight(referencePng, viewportHeight);
+  }
+
   const currentPng = conformToDimensions(
     PNG.sync.read(current),
     referencePng.width,
@@ -436,6 +471,7 @@ function compareScreenshots(
     mismatchPercent: (mismatched / (referencePng.width * referencePng.height)) * 100,
     diffImage: diffPath,
     diffBuffer: PNG.sync.write(diff),
+    ...(cropNote !== undefined ? { cropNote } : {}),
   };
 }
 
@@ -561,7 +597,7 @@ export async function verifyVisuals(
           await page.waitForTimeout(150);
           const current = (await page.screenshot({ type: 'png' })) as Buffer;
 
-          const comparison = compareScreenshots(reference, current, diffPath);
+          const comparison = compareScreenshots(reference, current, diffPath, viewport.size.height);
           await writeFile(diffPath, comparison.diffBuffer);
 
           checks.push({
@@ -572,6 +608,7 @@ export async function verifyVisuals(
             mismatchPercent: comparison.mismatchPercent,
             thresholdPercent,
             passed: comparison.mismatchPercent < thresholdPercent,
+            ...(comparison.cropNote !== undefined ? { note: comparison.cropNote } : {}),
           });
         } catch (cause) {
           const reason = cause instanceof Error ? cause.message : String(cause);

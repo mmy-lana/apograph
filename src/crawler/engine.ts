@@ -33,6 +33,7 @@ import {
   classifyRedirect,
 } from './health.js';
 import type { CaptureHealth } from './health.js';
+import { autoScrollWithReset } from './scroll.js';
 import {
   createScopeFilter,
   isCrawlablePage,
@@ -236,13 +237,20 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         }
       }
 
-      // DOM snapshot + a11y tree + design tokens (shared harvester logic).
-      const snapshot = await captureDOMSnapshot(page, path);
+      // Patch spec s3.1 capture ordering: goto settle -> auto-scroll ->
+      // settle delay -> scroll reset (0,0) -> reset delay, before any
+      // snapshot, node count, or screenshot.
+      const scroll = await autoScrollWithReset(page);
+      if (scroll.terminatedBy !== 'bottom') {
+        skip(
+          entry.url,
+          `auto-scroll terminated by ${scroll.terminatedBy} after ${scroll.steps} step(s) ` +
+            '(probable infinite scroll); capture proceeded within bounds',
+        );
+      }
 
-      // SEO / OpenGraph metadata extraction.
-      const metadata = await extractRouteMetadata(page, title);
-
-      // Viewport-gated screenshots.
+      // Viewport-gated full-page screenshots (patch spec s3.2). Captured at
+      // the top of the page; full-page mode records below-the-fold content.
       const slug = slugForPath(path);
       const desktopScreenshot = captureDesktop
         ? join(screenshotsDir, `${slug}-desktop.png`)
@@ -253,11 +261,11 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
 
       if (captureDesktop) {
         await page.setViewportSize({ ...DESKTOP_VIEWPORT });
-        await page.screenshot({ path: desktopScreenshot as string, type: 'png' });
+        await page.screenshot({ path: desktopScreenshot as string, type: 'png', fullPage: true });
       }
       if (captureMobile) {
         await page.setViewportSize({ ...MOBILE_VIEWPORT });
-        await page.screenshot({ path: mobileScreenshot as string, type: 'png' });
+        await page.screenshot({ path: mobileScreenshot as string, type: 'png', fullPage: true });
       }
       if (captureDesktop) {
         await page.setViewportSize({ ...DESKTOP_VIEWPORT });
@@ -277,6 +285,13 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         const png = await readFile(desktopScreenshot);
         health = checkCaptureHealth(png, visibleNodeCount);
       }
+
+      // DOM snapshot + a11y tree + design tokens + text corpus (shared
+      // harvester logic), captured at rest at the top of the page.
+      const snapshot = await captureDOMSnapshot(page, path);
+
+      // SEO / OpenGraph metadata extraction.
+      const metadata = await extractRouteMetadata(page, title);
 
       // Instant redirect classification (spec s2.2): when the initial
       // navigation settled instantly (< 500ms) onto a distinct URL and the
