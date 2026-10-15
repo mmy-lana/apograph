@@ -7,11 +7,20 @@
 
 > **Turn any website into a standalone, verified React project with your coding agent.**
 
-Apograph (v0.1.1) is a four-phase cleanroom engine: it crawls a site headlessly across multiple pages, derives a schema-validated plan you approve interactively, synthesizes a fresh React 19 + Tailwind CSS v4 frontend with a multimodal vision LLM, and proves the result with a 3-tier verification pipeline — build, route smoke checks, and pixel-diff visual comparison against the original screenshots.
+Apograph (v0.3.0) is a four-phase cleanroom engine: it crawls a site headlessly across multiple pages, derives a schema-validated plan you approve interactively, synthesizes a fresh React 19 + Tailwind CSS v4 frontend with a multimodal vision LLM, and proves the result with a 3-tier verification pipeline — build, route smoke checks, and pixel-diff visual comparison against the original screenshots.
 
 > **Package note:** the published npm package is **`apograph-agents`**. Its executables are `apograph-agents`, `apograph`, and `apograph-mcp`. When running without installing, use the package name: `npx apograph-agents <command>` (`npx apograph <command>` fails with E404 because `apograph` is a bin name, not the package name).
 
 No scraping guesswork. No prompt archaeology. No proprietary source — the LLM only ever sees derived artifacts: screenshots, accessibility trees, design tokens, and an approved plan.
+
+### What's new in v0.3.0
+
+- **Gate 1 evidence review** — capture health checks flag blank frames and instant redirect transition frames before synthesis; interactive review with selective re-crawl, prune, and alias controls (`--no-review` to skip; automated filtering in non-interactive runs).
+- **Canvas theme extraction** — the source site's computed body background (e.g. dark `#080f1c`) becomes the generated app's canvas; no more hardcoded light-mode wrappers on dark sites.
+- **DOM text corpus feed** — visible text spans (including gradient headline text) are harvested and fed to the vision model verbatim, so headlines no longer depend on OCR.
+- **Single-turn visual diff repair** — failing pixelmatch comparisons trigger one localized, diff-overlay-guided repair turn per route before the report is finalized.
+- **Cloud vision presets** — first-class GLM 5.3 Flash gateway preset in `apograph config` (provider `z-ai`), with dynamic `${provider} (${modelId})` progress reporting.
+- **Capture resilience** — bounded auto-scroll triggers lazy-loaded content, full-page captures, and a hardened scroll reset so sticky navbars land at the top of every screenshot.
 
 ---
 
@@ -132,6 +141,7 @@ Options:
   --viewport <mode>      viewports to screenshot and verify: both, desktop, or mobile
   --scope <mode>         crawl scope for subpath URLs: single, subtree, or site
   --yes                  auto-approve the plan without interactive prompts
+  --no-review            skip the Gate 1 evidence review (automated filtering only)
   --force                overwrite the output directory completely instead of merging
   --no-verify            skip the 3-tier verification pass
 ```
@@ -188,6 +198,8 @@ Apograph resolves its synthesis model with zero configuration by default. Enviro
 | 2 | `ANTHROPIC_API_KEY` set | `claude-3-7-sonnet-latest` |
 | 3 | `OPENAI_API_KEY` set | `gpt-4o` |
 | 4 | Nothing set | Local Ollama (`apograph-qwen35:9b-8k` at `http://localhost:11434/v1`) |
+
+`apograph config` also ships first-class cloud vision presets — including **GLM 5.3 Flash** (provider `z-ai`, an OpenAI-compatible gateway at `https://api.z.ai/api/paas/v4`) — so a high-throughput cloud vision model is a menu selection rather than manual assembly. Config prompts are non-destructive: empty input keeps existing values, and unknown keys in `config.json` are preserved.
 
 Set `APOGRAPH_MODEL` (or the model field saved by `apograph config`) to override the model id for **whichever provider is active** — it applies to the gateway, Anthropic, OpenAI, and Ollama routes alike (verified in `src/config/models.ts`: environment variables always take precedence over `~/.apograph/config.json`).
 
