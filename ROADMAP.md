@@ -1,74 +1,90 @@
 # Apograph Engineering Roadmap
 
-This roadmap outlines the technical evolution of Apograph from its initial cleanroom recreation baseline to advanced authenticated workflow capture, multi-framework synthesis, and autonomous visual convergence.
+This roadmap outlines the technical evolution of Apograph from its cleanroom recreation baseline toward advanced authenticated workflow capture, multi-framework synthesis, and autonomous visual convergence.
+
+Apograph has moved away from rigid semver-numbered milestones. Version numbers in `package.json` track published artifacts; they no longer sequence engineering work. Instead, work is organized in three operational horizons: **Now**, **Next**, and **Later**. An item's horizon reflects its operational priority and readiness, not a promised release version. Items graduate between horizons as evidence — captured failure modes, verification metrics, and user demand — accumulates.
 
 ---
 
-## Milestone v0.1.0: Core Recreation Engine (Current)
+## Now: Visual Fidelity & Capture Resilience
 
-- [x] Automated multi-page crawling via headless Chromium.
-- [x] Subpath scoping (single page, subtree, full site) and canonical redirect resolution.
-- [x] Schema-validated plan approval gate (`apograph-plan.json`).
-- [x] Multi-stage multimodal vision prompting with desktop and mobile screenshot pairs.
-- [x] Standalone React 19.3 + Vite + React Router v7 + Tailwind CSS v4 output.
-- [x] 3-tier verification: build checks, ephemeral route loading, and pixelmatch visual diffs.
-- [x] Local vision model execution via Ollama (`apograph-qwen35:9b-8k`).
-- [x] Process controls: SIGINT pause/save modal, stage checkpointing, and `apograph status`.
+The immediate focus is eliminating the failure modes surfaced by the Nirantara clone run (`https://nirantara.id/`) against the GLM 5.3 Flash gateway: blank redirect frames entering synthesis, hardcoded light-mode canvas overriding the authentic dark theme, dropped gradient text, and an overwhelming CSS token vocabulary that forced monochrome fallbacks.
+
+### 1. Gate 1: Evidence Review Gate
+- Automated blank screenshot detection before synthesis: flag captures with 0 DOM nodes or >95% uniform pixel coverage.
+- Automated instant redirect detection: alias `/` to its resolved destination (`/en`) instead of capturing the empty 50ms transition frame as a dead `routes[0]`.
+- Interactive CLI review workflow after crawl: evidence summary table, system file manager launcher for `.apograph/evidence/screenshots/`, selective route re-crawl selection (e.g. routes 2, 5, 7), and route prune/alias controls.
+- Non-interactive / MCP behavior: automatically prune suspect redirect frames so headless pipelines never synthesize from a blank frame.
+- Full specification: `specs/integration/visual-resilience.md`.
+
+### 2. Canvas Theme Extraction
+- Extract the computed `document.body` background color during crawl (e.g. `#080f1c`) and propagate it as the canonical canvas token.
+- Eliminate hardcoded light wrappers: `bg-white text-neutral-900` in `App.tsx` and `--color-background: #ffffff` in `index.css` are replaced with dynamically resolved theme tokens.
+- Remove hardcoded light-mode assumptions from component templates so dark canvases survive synthesis.
+
+### 3. DOM Text Corpus Feed
+- Harvest visible DOM text spans (including gradient headline spans such as "TECHNOLOGY & AI PARTNER" and "BUSINESS") alongside the accessibility tree.
+- Feed the text corpus to the vision LLM so string-level fidelity no longer depends on visual OCR.
+- Specification target: `src/harvester/dom.ts`.
+
+### 4. Cloud Vision Presets
+- First-class GLM 5.3 Flash OpenAI-compatible gateway configuration alongside local models.
+- Dynamic terminal progress reporting: replace the hardcoded `via local model` spinner with `${provider} (${modelId})` resolved from the active model route.
+- Non-destructive `apograph config` prompts with presets for custom OpenAI-compatible gateways.
+
+### 5. Closed-Loop Visual Diff Repair
+- Connect the tier-3 pixelmatch verifier directly back into the vision synthesis engine.
+- Single-turn repair pass: when a generated route exceeds the visual threshold, pass the diff overlay image and the failing component back to the model with localized correction prompts, instead of re-synthesizing from scratch.
 
 ---
 
-## Milestone v0.2.0: Framework Flexibility & Environmental Resilience
+## Next: Multi-Framework & Advanced Convergence
 
-### 1. Headed Challenge Pass-Through
+Once capture is trustworthy at the evidence level, breadth work resumes.
+
+### 1. Multi-Breakpoint Alignment
+- Expand viewport capture and verification beyond desktop (1280x800) and mobile (390x844) to tablet (768x1024) and widescreen (1920x1080).
+- Per-breakpoint diff attribution so repair prompts name the breakpoint responsible for a mismatch.
+
+### 2. Headed Challenge Pass-Through
 - Detect Cloudflare or perimeter WAF challenge pages during initial navigation.
-- Temporarily launch a visible browser window allowing human verification, capture valid session cookies, and seamlessly transition back to automated headless crawling.
+- Temporarily launch a visible browser window allowing human verification, capture valid session cookies, and transition back to automated headless crawling.
 
-### 2. Multi-Stack Target Adapters (`--stack`)
-- Add Next.js (App Router) target alongside Vite (`--stack nextjs`).
+### 3. Multi-Stack Targets
+- Add Next.js (App Router) as a synthesis target alongside Vite (`--stack nextjs`).
 - Output clean server/client component boundaries with static export capabilities (`output: 'export'`).
 
-### 3. Dual-Theme Extraction (Dark Mode)
-- Inspect stylesheets for `@media (prefers-color-scheme: dark)` and CSS root dark variables.
-- Extract complementary light/dark token sets and generate working theme toggle components with Tailwind `dark:` utilities.
-
-### 4. Cloud Vision Model Presets
-- Add first-class flags and provider adapters for high-throughput cloud vision models (e.g. Claude 3.7 Sonnet, GPT-4o, GLM-Flash).
-
 ---
 
-## Milestone v0.3.0: Authenticated Sessions & Stateful Dashboards
+## Later: Deep Capture & State
+
+Deep interactivity and autonomy work, deferred until the Now horizon holds a verified fidelity floor.
 
 ### 1. Authenticated Session Attachment
 - Support attaching to an existing browser profile or authenticated Chromium session.
-- Enable recreation of authorized, user-accessible views (e.g., settings panels, account pages, and internal dashboard routes) by leveraging active session cookies and storage.
+- Enable recreation of authorized views (settings panels, account pages, internal dashboard routes) using active session cookies and storage.
 
-### 2. Deep Interaction & State Exploration
-- Perform automated synthetic interactions during capture: trigger mobile menus, click tabs, expand disclosure items, and open modal dialogs.
-- Record secondary state screenshots (`<slug>-dialog-open.png`) to provide explicit visual evidence for nested UI behaviors.
+### 2. Synthetic Interaction Discovery
+- Perform automated synthetic interactions during capture: trigger mobile menus, click tabs, expand disclosures, open modal dialogs and drawers.
+- Record secondary state screenshots (`<slug>-dialog-open.png`) as explicit visual evidence for nested UI behaviors.
 
-### 3. Mock Endpoint & API Emulation
+### 3. Client-side API Capture & Typed MSW Generation
 - Capture client-side API requests, query parameters, and response structures during page exploration.
-- Synthesize typed mock API handlers (e.g., Mock Service Worker or local mock endpoints) so recreated forms, lists, and search inputs respond realistically with sample data.
+- Synthesize typed Mock Service Worker handlers so recreated forms, lists, and search inputs respond realistically with sample data.
 
----
-
-## Milestone v0.4.0: Autonomous Visual Convergence
-
-### 1. Closed-Loop Visual Diff Repair
-- Connect the tier-3 pixelmatch verifier directly back into the vision synthesis engine.
-- If a generated route exceeds the visual threshold, pass the diff overlay image and failing component back to the model with specific localized correction prompts.
-- Iterate up to a configurable pass budget to systematically drive visual mismatch below 2%.
-
-### 2. Multi-Breakpoint Responsive Alignment
-- Expand viewport capture and verification beyond desktop (1280x800) and mobile (390x844) to include tablet (768x1024) and widescreen (1920x1080) targets.
-
----
-
-## Milestone v1.0.0: Autonomous Agent Ecosystem
-
-### 1. Complete Model Context Protocol (MCP) Parity
+### 4. Complete MCP Autonomous Ecosystem
 - Maintain full parity between the CLI engine and the MCP server.
-- Expose all inspection, planning, synthesis, and verification capabilities as structured tools for AI coding agents (Cursor, Claude Code, Windsurf, OpenCode).
+- Expose inspection, planning, synthesis, verification, and repair capabilities as structured tools for AI coding agents (Cursor, Claude Code, Windsurf, OpenCode).
+- Extend the multi-pass visual convergence budget beyond the single-turn repair of the Now horizon toward a configurable autonomous loop.
 
-### 2. Single-Command Self-Hosted Package Generation
-- Provide bundled, zero-configuration Docker and deployment scaffolds for one-command local hosting of all synthesized assets and frontend services.
+---
+
+## Horizon History
+
+Legacy semver-numbered milestones are retained for traceability only:
+
+- **v0.1.0 — Core Recreation Engine** (shipped): headless Chromium crawling, subpath scoping, schema-validated plan gate, multi-stage multimodal prompting, React 19.3 + Vite + React Router v7 + Tailwind CSS v4 output, 3-tier verification, local Ollama vision execution, process controls.
+- **v0.2.0 — Framework Flexibility & Environmental Resilience** (shipped as package version; its visual-fidelity scope moved into **Now**; multi-stack and challenge pass-through moved into **Next**).
+- **v0.3.0 — Authenticated Sessions & Stateful Dashboards** (absorbed into **Later**).
+- **v0.4.0 — Autonomous Visual Convergence** (closed-loop repair moved up into **Now**; multi-breakpoint alignment into **Next**).
+- **v1.0.0 — Autonomous Agent Ecosystem** (absorbed into **Later**).
