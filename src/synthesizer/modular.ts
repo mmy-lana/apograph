@@ -24,6 +24,8 @@ import type { ApographPlan, PlanRoute } from '../plan/schema.js';
 import type { ProgressHandle } from '../utils/progress.js';
 import { NULL_PROGRESS } from '../utils/progress.js';
 import { resolveModelId, resolveProviderName } from '../config/models.js';
+import { redactSecrets } from '../config/validate.js';
+import { ProviderAuthError } from './llm.js';
 import {
   formatA11yTreeForVisionPrompt,
   formatAssetMapForPrompt,
@@ -707,7 +709,10 @@ async function runVisionStage(
   const progress = startProgressFn ? startProgressFn(label) : null;
 
   try {
-    const files = await generateFilesWithVision(text, SYSTEM_GUIDELINES, screenshots);
+    const files = await generateFilesWithVision(text, SYSTEM_GUIDELINES, screenshots, {
+      // Surface bounded-retry waits on the live spinner while waiting.
+      onRetry: (message) => progress?.message(message),
+    });
     if (
       files.length === 0 ||
       files.every((f) => f.content.trim().length === 0)
@@ -718,8 +723,11 @@ async function runVisionStage(
     progress?.stop(`${label} — done`);
     return files;
   } catch (cause) {
+    // Invalid credentials (HTTP 401/403) abort the run — they must never be
+    // silently masked by a deterministic template fallback.
+    if (cause instanceof ProviderAuthError) throw cause;
     const reason = cause instanceof Error ? cause.message : String(cause);
-    console.warn(`[apograph] ${stage}: vision synthesis unavailable (${reason}); using deterministic template.`);
+    console.warn(`[apograph] ${stage}: vision synthesis unavailable (${redactSecrets(reason)}); using deterministic template.`);
     result.fallbackStages.push(stage);
     progress?.stop(`${label} — fallback`);
     return fallback();

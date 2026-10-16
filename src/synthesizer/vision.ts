@@ -11,7 +11,7 @@ import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { A11yNode, CrawlRoute, DesignTokens, TextSpan } from '../types.js';
 import { buildPromptParts, generateStructuredFilesFromParts } from './llm.js';
-import type { PromptPart } from './llm.js';
+import type { PromptPart, SynthesisCallOptions } from './llm.js';
 import type { ProjectFile } from '../types.js';
 
 /** Max A11y tree depth serialized into prompts. */
@@ -222,19 +222,22 @@ export function formatTextSpansForPrompt(spans: TextSpan[]): string {
  * Generates project files from a vision prompt: the text context plus the
  * route's screenshots as AI SDK image parts. Screenshots are ordered
  * desktop-first; the text block always comes last so models that weight the
- * final text segment see the instructions after the images.
+ * final text segment see the instructions after the images. Optional
+ * `options` threads the bounded-retry hooks (model override, spinner
+ * updates) into the underlying synthesis call.
  */
 export async function generateFilesWithVision(
   text: string,
   systemPrompt: string,
   screenshots: ScreenshotImage[],
+  options: SynthesisCallOptions = {},
 ): Promise<ProjectFile[]> {
   const parts: PromptPart[] = buildPromptParts(
     text,
     screenshots.map((shot) => ({ dataUrl: shot.dataUrl })),
   );
 
-  return generateStructuredFilesFromParts(parts, systemPrompt);
+  return generateStructuredFilesFromParts(parts, systemPrompt, options);
 }
 
 /** Joins the evidence directory with its screenshots subdirectory. */

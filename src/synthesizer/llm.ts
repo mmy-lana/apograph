@@ -9,9 +9,10 @@
 
 import { generateObject, generateText } from 'ai';
 import { z } from 'zod';
-import type { ImagePart, TextPart } from 'ai';
+import type { ImagePart, LanguageModel, TextPart } from 'ai';
 import type { ProjectFile } from '../types.js';
 import { getSynthesizerModel, getFastParserModel } from '../config/models.js';
+import { redactSecrets } from '../config/validate.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -43,6 +44,204 @@ function llmTimeoutSignal(): AbortSignal {
     ? Math.min(configured, 30 * 60 * 1000)
     : DEFAULT_LLM_TIMEOUT_MS;
   return AbortSignal.timeout(timeout);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded transient retry policy
+// ---------------------------------------------------------------------------
+
+/** Maximum attempts per synthesis call (initial attempt included). */
+export const MAX_ATTEMPTS = 3;
+
+/** Hard cap on total backoff wait time across all retries of one call. */
+export const BACKOFF_BUDGET_MS = 90_000;
+
+/**
+ * Backoff schedule: after failed attempt N, wait `baseMs ± jitterMs`.
+ * With MAX_ATTEMPTS = 3 the loop consumes the first two slots between its
+ * three attempts; the third entry documents the terminal slot of the policy
+ * schedule and backs the exported policy helper.
+ */
+export const BACKOFF_SCHEDULE: ReadonlyArray<{ baseMs: number; jitterMs: number }> = [
+  { baseMs: 3_000, jitterMs: 500 },
+  { baseMs: 7_000, jitterMs: 1_000 },
+  { baseMs: 15_000, jitterMs: 1_500 },
+];
+
+/** Transient status codes worth retrying (bounded). */
+const RETRYABLE_STATUS = new Set([429, 502, 503, 408]);
+
+/** Auth status codes: abort the run, never retry, never fall back. */
+const AUTH_STATUS = new Set([401, 403]);
+
+/**
+ * Fatal provider authentication failure (HTTP 401/403). Thrown instead of a
+ * deterministic fallback so an invalid credential can never masquerade as a
+ * successfully degraded clone — callers abort the run with this error.
+ */
+export class ProviderAuthError extends Error {
+  readonly statusCode: number;
+
+  constructor(statusCode: number, detail: string) {
+    super(
+      `Provider credential rejected (HTTP ${statusCode}): ${detail} — ` +
+        'verify the API key (`apograph config --show`) or the ' +
+        'APOGRAPH_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY environment ' +
+        'variable, then re-run.',
+    );
+    this.name = 'ProviderAuthError';
+    this.statusCode = statusCode;
+  }
+}
+
+/** How the retry policy reacts to one failed attempt. */
+export type RetryDecision = 'retry' | 'auth-abort' | 'raise';
+
+/**
+ * Follows RetryError-style shells (`lastError` / `errors[]`) down to the
+ * underlying provider error so status/header extraction can never be
+ * blinded by wrapper errors. Bounded to a short chain.
+ */
+function unwrapProviderError(error: unknown): unknown {
+  let current: unknown = error;
+  for (let depth = 0; depth < 3; depth += 1) {
+    const lastError = (current as { lastError?: unknown } | null)?.lastError;
+    if (lastError !== undefined && lastError !== null) {
+      current = lastError;
+      continue;
+    }
+    const errors = (current as { errors?: unknown } | null)?.errors;
+    if (Array.isArray(errors) && errors.length > 0) {
+      current = errors[errors.length - 1];
+      continue;
+    }
+    break;
+  }
+  return current;
+}
+
+/** Reads a numeric `statusCode` off a provider error, or null. */
+function extractStatusCode(error: unknown): number | null {
+  const status = (unwrapProviderError(error) as { statusCode?: unknown } | null)?.statusCode;
+  return typeof status === 'number' ? status : null;
+}
+
+/** Reads a `Retry-After` hint (ms) off a provider error, or null. */
+function extractRetryAfterMs(error: unknown): number | null {
+  const headers = (unwrapProviderError(error) as { responseHeaders?: unknown } | null)
+    ?.responseHeaders;
+  if (typeof headers !== 'object' || headers === null) return null;
+  const record = headers as Record<string, unknown>;
+  const raw = record['retry-after'] ?? record['Retry-After'];
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return Math.max(0, raw * 1000);
+  }
+  if (typeof raw !== 'string' || raw.length === 0) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const dateMs = Date.parse(raw);
+  return Number.isNaN(dateMs) ? null : Math.max(0, dateMs - Date.now());
+}
+
+/** True when an error is an abort/timeout (terminal — never retried). */
+function isAbortLike(error: unknown): boolean {
+  const candidate = error as { name?: unknown; isAbortError?: unknown } | null;
+  return (
+    candidate?.name === 'AbortError' ||
+    candidate?.name === 'TimeoutError' ||
+    candidate?.isAbortError === true
+  );
+}
+
+/**
+ * Classifies one failed attempt by `statusCode`:
+ * - abort/timeout expiry is terminal (`raise`);
+ * - 401/403 abort the run (`auth-abort`);
+ * - 429/502/503/408 are transient (`retry`);
+ * - everything else (400/404/500/unknown) raises immediately.
+ */
+export function classifyProviderError(error: unknown): RetryDecision {
+  if (isAbortLike(error)) return 'raise';
+
+  const status = extractStatusCode(error);
+  if (status !== null && AUTH_STATUS.has(status)) return 'auth-abort';
+  if (status !== null && RETRYABLE_STATUS.has(status)) return 'retry';
+  return 'raise';
+}
+
+/**
+ * Backoff wait for a failed `attempt` (1-based): `baseMs ± jitterMs` from
+ * {@link BACKOFF_SCHEDULE}, deterministically driven by the injectable
+ * `random` (0 -> base - jitter, 1 -> base + jitter).
+ */
+export function computeBackoffMs(attempt: number, random: () => number = Math.random): number {
+  const index = Math.min(Math.max(attempt, 1), BACKOFF_SCHEDULE.length) - 1;
+  const slot = BACKOFF_SCHEDULE[index] as { baseMs: number; jitterMs: number };
+  return Math.round(slot.baseMs + (random() * 2 - 1) * slot.jitterMs);
+}
+
+/** Injectable collaborators for the retry loop (tests use deterministic fakes). */
+export interface TransientRetryOptions {
+  /** Receives a user-facing message before each retry wait (spinner hook). */
+  onRetry?: (message: string) => void;
+  /** Sleep primitive for retry waits. Defaults to setTimeout. */
+  sleep?: (ms: number) => Promise<void>;
+  /** RNG for backoff jitter. Defaults to Math.random. */
+  random?: () => number;
+}
+
+/** Options accepted by synthesis calls; extends the retry hooks with a model. */
+export interface SynthesisCallOptions extends TransientRetryOptions {
+  /** Model override (tests inject a deterministic mock). */
+  model?: LanguageModel;
+}
+
+/**
+ * Runs one synthesis attempt inside the single bounded transient retry loop:
+ * at most {@link MAX_ATTEMPTS} attempts, exponential backoff with jitter,
+ * `Retry-After` honored when present (clamped to the remaining budget), and a
+ * hard {@link BACKOFF_BUDGET_MS} total-wait cap. `maxRetries: 0` stays set on
+ * the underlying AI SDK calls — retries never stack. HTTP 401/403 raise
+ * {@link ProviderAuthError} immediately; abort/timeout expiry is terminal.
+ */
+export async function withTransientRetry<T>(
+  run: (attempt: number) => Promise<T>,
+  options: TransientRetryOptions = {},
+): Promise<T> {
+  const sleep =
+    options.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+  const random = options.random ?? Math.random;
+  let waitedMs = 0;
+
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await run(attempt);
+    } catch (cause) {
+      const decision = classifyProviderError(cause);
+
+      if (decision === 'auth-abort') {
+        throw new ProviderAuthError(
+          extractStatusCode(cause) ?? 401,
+          redactSecrets(cause instanceof Error ? cause.message : String(cause)),
+        );
+      }
+      if (decision !== 'retry' || attempt >= MAX_ATTEMPTS) throw cause;
+
+      const remainingMs = BACKOFF_BUDGET_MS - waitedMs;
+      if (remainingMs <= 0) throw cause;
+
+      // Retry-After (bounded) wins over the computed backoff.
+      const requestedMs = extractRetryAfterMs(cause) ?? computeBackoffMs(attempt, random);
+      const waitMs = Math.min(requestedMs, remainingMs);
+      waitedMs += waitMs;
+
+      options.onRetry?.(
+        `Gateway at capacity — retrying in ${Math.round(waitMs / 1000)}s ` +
+          `(attempt ${attempt + 1}/${MAX_ATTEMPTS})`,
+      );
+      await sleep(waitMs);
+    }
+  }
 }
 
 /** One prompt part: text or an image (base64 data URL). */
@@ -134,32 +333,43 @@ function extractJsonBlock(text: string): string {
  * rejects native `json_schema` structured output (400 / unsupported
  * parameter — typical of local SLMs and OpenAI-compatible proxies), falls
  * back to `generateText` and parses the JSON block out of the raw response.
+ * The whole call runs inside the single bounded transient retry policy
+ * (429/502/503/408 retried, 401/403 abort the run, everything else raises).
  */
 export async function generateStructuredFilesFromParts(
   parts: PromptPart[],
   systemPrompt?: string,
+  options: SynthesisCallOptions = {},
 ): Promise<ProjectFile[]> {
-  const model = getSynthesizerModel();
+  const model = options.model ?? getSynthesizerModel();
+  let structuredUnsupported = false;
 
-  try {
-    const result = await generateObject({
-      model,
-      schema: GeneratedProjectSchema,
-      schemaName: 'project_files',
-      maxRetries: 0,
-      abortSignal: llmTimeoutSignal(),
-      ...(systemPrompt !== undefined ? { system: systemPrompt } : {}),
-      messages: [{ role: 'user', content: parts }],
-    });
+  return withTransientRetry(async () => {
+    if (!structuredUnsupported) {
+      try {
+        const result = await generateObject({
+          model,
+          schema: GeneratedProjectSchema,
+          schemaName: 'project_files',
+          maxRetries: 0,
+          abortSignal: llmTimeoutSignal(),
+          ...(systemPrompt !== undefined ? { system: systemPrompt } : {}),
+          messages: [{ role: 'user', content: parts }],
+        });
 
-    return result.object.files;
-  } catch (cause) {
-    if (!isStructuredOutputUnsupported(cause)) throw cause;
+        return result.object.files;
+      } catch (cause) {
+        if (!isStructuredOutputUnsupported(cause)) throw cause;
 
-    console.warn(
-      '[apograph] structured output unsupported by model; ' +
-        'falling back to generateText JSON extraction.',
-    );
+        // Protocol capability fallback — not a transient failure; subsequent
+        // retry attempts skip straight to the generateText path.
+        structuredUnsupported = true;
+        console.warn(
+          '[apograph] structured output unsupported by model; ' +
+            'falling back to generateText JSON extraction.',
+        );
+      }
+    }
 
     const textResult = await generateText({
       model,
@@ -188,7 +398,7 @@ export async function generateStructuredFilesFromParts(
     );
 
     return parsed.files;
-  }
+  }, options);
 }
 
 /**
@@ -198,10 +408,12 @@ export async function generateStructuredFilesFromParts(
 export async function generateStructuredFiles(
   prompt: string,
   systemPrompt?: string,
+  options: SynthesisCallOptions = {},
 ): Promise<ProjectFile[]> {
   return generateStructuredFilesFromParts(
     [{ type: 'text', text: prompt }],
     systemPrompt,
+    options,
   );
 }
 
@@ -213,34 +425,38 @@ export async function generateStructuredFiles(
  * Repairs a failing source file using the fast/cheap parser model to keep
  * token usage minimal. The model receives the current content plus the exact
  * compiler/linter errors and must return the corrected raw file content
- * only — any markdown fences are stripped before returning.
+ * only — any markdown fences are stripped before returning. Runs inside the
+ * single bounded transient retry policy shared with synthesis.
  */
 export async function repairCodeFile(
   filePath: string,
   currentContent: string,
   errors: string[],
+  options: SynthesisCallOptions = {},
 ): Promise<string> {
-  const model = getFastParserModel();
+  const model = options.model ?? getFastParserModel();
 
   const errorList =
     errors.length > 0 ? errors.map((error, index) => `${index + 1}. ${error}`).join('\n') : '(none)';
 
-  const result = await generateText({
-    model,
-    maxRetries: 0,
-    abortSignal: llmTimeoutSignal(),
-    system:
-      'You are a code repair agent. You receive one source file and a list of ' +
-      'compiler or linter errors. Respond with ONLY the corrected raw file ' +
-      'content. Zero markdown fences, zero explanations, zero commentary. ' +
-      'Do not truncate. Preserve all parts of the file that are not implicated ' +
-      'by the errors.',
-    prompt:
-      `File: ${filePath}\n\n` +
-      `Errors:\n${errorList}\n\n` +
-      `Current content:\n${currentContent}\n\n` +
-      'Return the full corrected file content only.',
-  });
+  return withTransientRetry(async () => {
+    const result = await generateText({
+      model,
+      maxRetries: 0,
+      abortSignal: llmTimeoutSignal(),
+      system:
+        'You are a code repair agent. You receive one source file and a list of ' +
+        'compiler or linter errors. Respond with ONLY the corrected raw file ' +
+        'content. Zero markdown fences, zero explanations, zero commentary. ' +
+        'Do not truncate. Preserve all parts of the file that are not implicated ' +
+        'by the errors.',
+      prompt:
+        `File: ${filePath}\n\n` +
+        `Errors:\n${errorList}\n\n` +
+        `Current content:\n${currentContent}\n\n` +
+        'Return the full corrected file content only.',
+    });
 
-  return stripFences(result.text);
+    return stripFences(result.text);
+  }, options);
 }
