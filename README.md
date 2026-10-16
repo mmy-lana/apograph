@@ -70,6 +70,7 @@ PHASE 4 — VERIFICATION
 | `apograph resume [dir]` | Resume interrupted clone |
 | `apograph synthesize <dir>` | Synthesize from approved plan |
 | `apograph verify <dir>` | 3-tier verification |
+| `apograph clone-verify <url> <dir>` | Compare clone against live original site |
 | `apograph status` | Show generated projects |
 | `apograph config` | Configure LLM provider |
 | `apograph doctor` | Environment health check |

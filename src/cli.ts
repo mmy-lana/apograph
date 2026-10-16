@@ -6,6 +6,7 @@
  *   apograph plan [dir]           Generate the authoritative plan from evidence and approve it interactively.
  *   apograph crawl <url>          Headless evidence crawl: screenshots, a11y trees, tokens, mirrored assets.
  *   apograph clone <url>          Full pipeline: crawl -> plan (approval gate) -> modular synthesize -> emit -> verify.
+ *   apograph clone-verify <url> <dir>  Side-by-side comparison of the cloned dev server against the live original site.
  *   apograph synthesize <dir>     Modular synthesis from an approved apograph-plan.json.
  *   apograph verify <dir> [dir2]  3-tier verification: build, route smoke, visual comparison.
  *   apograph config               Configure the LLM provider (stored in ~/.apograph/config.json).
@@ -31,6 +32,11 @@ import {
 import { emitProject } from './emitter/scaffold.js';
 import { runVerification } from './verifier/engine.js';
 import { printVerificationSummary, writeVerificationReport } from './verifier/report.js';
+import { runCloneVerify } from './verifier/cloneVerify.js';
+import {
+  printCloneVerifyReport,
+  writeCloneVerifyReport,
+} from './verifier/cloneVerifyReport.js';
 import { runDoctor } from './commands/doctor.js';
 import { runSetup } from './commands/setup.js';
 import { runMcpServer } from './mcp/server.js';
@@ -565,6 +571,13 @@ interface VerifyCliOptions {
   viewport: string;
 }
 
+/** Options for the `clone-verify` command (commander passes numbers as strings). */
+interface CloneVerifyCliOptions {
+  threshold: string;
+  port: string;
+  viewport: string;
+}
+
 /** Options for the `synthesize` command. */
 interface SynthesizeOptions {
   out?: string;
@@ -831,6 +844,32 @@ program
     console.log(`✔ Verification report: ${reportPath}`);
 
     if (!report.overall.passed) {
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command('clone-verify')
+  .description('Compare cloned output side-by-side against the live original site')
+  .argument('<url>', 'original site URL')
+  .argument('<outputDir>', 'cloned project directory')
+  .option('--threshold <number>', 'minimum pixel similarity to pass (default 70)', '70')
+  .option('--port <number>', 'port for cloned dev server (default 5174)', '5174')
+  .option('--viewport <mode>', 'viewport to compare: both, desktop, or mobile', 'desktop')
+  .action(async (url: string, outputDir: string, options: CloneVerifyCliOptions) => {
+    const result = await runCloneVerify({
+      url,
+      outputDir,
+      threshold: parseNumber(options.threshold, 70),
+      port: parseNumber(options.port, 5174),
+      viewport: parseViewportOption(options.viewport),
+    });
+
+    printCloneVerifyReport(result);
+    const reportPath = await writeCloneVerifyReport(outputDir, result);
+    console.log(`Report: ${reportPath}`);
+
+    if (result.summary.passedRoutes !== result.summary.totalRoutes) {
       process.exitCode = 1;
     }
   });
