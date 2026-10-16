@@ -10,9 +10,9 @@
 
 ## 1. Scope & Problem Statement
 
-This specification governs the "Now" horizon: visual fidelity and capture resilience. It is written in direct response to the Nirantara clone run (`https://nirantara.id/`) executed against the OpenAI-compatible gateway (`z-ai/glm-5.3-flash`), which failed visual fidelity through six distinct, independently diagnosable failure modes.
+This specification governs the "Now" horizon: visual fidelity and capture resilience. It is written in direct response to the dark-canvas SPA case study (`https://example-spa.com`) executed against the OpenAI-compatible gateway (`z-ai/glm-5.3-flash`), which failed visual fidelity through six distinct, independently diagnosable failure modes.
 
-### 1.1 Failure Mode Breakdown (Nirantara Post-Mortem)
+### 1.1 Failure Mode Breakdown (SPA capture failure analysis)
 
 | # | Failure Mode | Mechanism | Observed Symptom |
 |---|---|---|---|
@@ -144,7 +144,7 @@ const canvasToken = {
 };
 ```
 
-The crawl-scoped **dominant canvas** is the most frequent non-blank `backgroundColor` across healthy frames, normalized to a hex token (for Nirantara: `#080f1c`). It is recorded in the evidence set and the plan.
+The crawl-scoped **dominant canvas** is the most frequent non-blank `backgroundColor` across healthy frames, normalized to a hex token (for the dark-canvas SPA source site: `#080f1c`). It is recorded in the evidence set and the plan.
 
 ### 4.2 Elimination of Hardcoded Light Wrappers
 
@@ -203,7 +203,7 @@ type TextSpan = {
 
 - `apograph config` gains non-destructive prompts for vision provider selection: local (Ollama) or OpenAI-compatible gateway.
 - Gateway configuration collects: base URL, API key (stored via the existing secrets mechanism, never echoed in plaintext), model ID, and optional request tuning (timeout, concurrency).
-- A **GLM 5.3 Flash preset** ships as a first-class option (provider label `z-ai`, default model `glm-5.3-flash`) so the Nirantara-class gateway is a selection, not manual assembly.
+- A **GLM 5.3 Flash preset** ships as a first-class option (provider label `z-ai`, default model `glm-5.3-flash`) so the dark-canvas SPA-class gateway is a selection, not manual assembly.
 - All prompts default to current values on empty input; `apograph config` never rewrites a config file it did not intentionally change (non-destructive: unknown keys preserved, existing values surfaced as defaults).
 
 ---
@@ -275,7 +275,7 @@ Each shipped behavior must reference its spec section in the test file header co
 
 ## 9. Acceptance Criteria (Summary)
 
-The Now horizon is complete when, re-running the Nirantara clone against the GLM 5.3 Flash gateway:
+The Now horizon is complete when, re-running the dark-canvas SPA clone against the GLM 5.3 Flash gateway:
 
 1. No blank `routes[0]` exists; `/` is aliased to `/en` in the generated router.
 2. The generated app renders on the `#080f1c` canvas with no hardcoded white wrappers in `App.tsx` or `index.css`.

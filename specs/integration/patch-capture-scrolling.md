@@ -5,7 +5,7 @@
 - **Status:** Draft — patches the "Now" horizon of `specs/integration/visual-resilience.md`
 - **Amends:** `src/harvester/dom.ts` (s5.1), `src/crawler/engine.ts` (s2, s3), verification tier 3 assumptions
 - **Related:** `specs/integration/visual-resilience.md` (s2, s5, s8.4, s8.5)
-- **Discovered in:** Nirantara end-to-end run (`https://nirantara.id/`)
+- **Discovered in:** dark-canvas SPA end-to-end run (`https://example-spa.com`)
 - **Amendments:** A1 (hardened scroll reset contract — supersedes the fixed `RESET_DELAY_MS` blind wait in s3.1; see s8)
 
 ---
@@ -163,7 +163,7 @@ Pure, browser-free units are extracted so the contract is testable without Chrom
 
 ## 6. Acceptance Criteria (Summary)
 
-The patch is complete when, re-running the Nirantara clone end-to-end:
+The patch is complete when, re-running the dark-canvas SPA clone end-to-end:
 
 1. No `ReferenceError` from any `page.evaluate` call; the text corpus harvest completes on every route, including gradient headline spans.
 2. Below-the-fold content (lazy images, scroll-revealed sections) is present in the evidence screenshots and mirrored assets for both desktop and mobile captures.
@@ -188,7 +188,7 @@ The patch is complete when, re-running the Nirantara clone end-to-end:
 - **Status:** Draft
 - **Supersedes:** the fixed `RESET_DELAY_MS = 150` blind wait in s3.1 ("reset delay before any snapshot, visible-node count, or screenshot") for the reset phase specifically. All other s3.1 bounds (step cap, time cap, settle delay) and all other sections remain in force.
 - **Applies to:** `src/crawler/scroll.ts` (executor), `src/crawler/engine.ts` and `src/plan/evidenceGate.ts` (capture ordering consumers)
-- **Discovered in:** Nirantara full-page capture run (floating navbar rendered mid-page)
+- **Discovered in:** dark-canvas SPA full-page capture run (floating navbar rendered mid-page)
 
 ### 8.1 Defect Statement (D3 — Floating Navbar Displacement)
 
@@ -264,7 +264,7 @@ The existing suites (106 passing tests, including this patch's s5 assertions) mu
 
 ### 8.7 Acceptance Criteria (Amendment)
 
-The amendment is complete when, re-running the Nirantara clone end-to-end:
+The amendment is complete when, re-running the dark-canvas SPA clone end-to-end:
 
 1. The floating navbar rests at the top of every full-page desktop and mobile evidence screenshot, including Gate 1 re-crawls.
 2. On a page with `html { scroll-behavior: smooth }`, the reset confirms `scrollY === 0` within the poll window without relying on any fixed latency guess.

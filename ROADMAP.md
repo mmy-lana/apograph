@@ -8,7 +8,7 @@ Apograph has moved away from rigid semver-numbered milestones. Version numbers i
 
 ## Now: Visual Fidelity & Capture Resilience
 
-The immediate focus is eliminating the failure modes surfaced by the Nirantara clone run (`https://nirantara.id/`) against the GLM 5.3 Flash gateway: blank redirect frames entering synthesis, hardcoded light-mode canvas overriding the authentic dark theme, dropped gradient text, and an overwhelming CSS token vocabulary that forced monochrome fallbacks.
+The immediate focus is eliminating the failure modes surfaced by the dark-canvas SPA case study (`https://example-spa.com`) against the GLM 5.3 Flash gateway: blank redirect frames entering synthesis, hardcoded light-mode canvas overriding the authentic dark theme, dropped gradient text, and an overwhelming CSS token vocabulary that forced monochrome fallbacks.
 
 ### 1. Gate 1: Evidence Review Gate
 - Automated blank screenshot detection before synthesis: flag captures with 0 DOM nodes or >95% uniform pixel coverage.

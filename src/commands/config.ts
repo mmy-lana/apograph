@@ -39,7 +39,7 @@ export interface VisionPreset {
 
 /**
  * First-class vision presets selectable in `apograph config` (spec s6.2).
- * The GLM 5.3 Flash preset makes the Nirantara-class OpenAI-compatible
+ * The GLM 5.3 Flash preset makes the dark-canvas SPA-class OpenAI-compatible
  * gateway a selection rather than manual assembly.
  */
 export const VISION_PRESETS: VisionPreset[] = [

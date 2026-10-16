@@ -76,7 +76,7 @@ function makePlan(designSystem: ApographPlan['designSystem']): ApographPlan {
 // ---------------------------------------------------------------------------
 
 test('theme > extracts computed body background', () => {
-  // rgb() normalization to canonical #rrggbb (Nirantara canvas).
+  // rgb() normalization to canonical #rrggbb (dark-canvas SPA source site).
   assert.equal(normalizeColorToHex('rgb(8, 15, 28)'), '#080f1c');
   assert.equal(normalizeColorToHex('rgba(8, 15, 28, 1)'), '#080f1c');
   // Case and shorthand normalization.

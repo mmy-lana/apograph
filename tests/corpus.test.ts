@@ -39,7 +39,7 @@ function rawSpan(overrides: Partial<RawTextSpan>): RawTextSpan {
   };
 }
 
-const NIRANTARA_GRADIENT =
+const EXAMPLE_GRADIENT =
   'linear-gradient(90deg, rgb(6, 182, 212), rgb(59, 130, 246))';
 
 // ---------------------------------------------------------------------------
@@ -86,14 +86,14 @@ test('dom > captures gradient headline spans', () => {
       text: 'TECHNOLOGY & AI PARTNER',
       tag: 'span',
       parentTag: 'h1',
-      backgroundImage: NIRANTARA_GRADIENT,
+      backgroundImage: EXAMPLE_GRADIENT,
       backgroundClip: 'text',
       webkitTextFillColor: 'transparent',
       color: 'rgb(6, 182, 212)',
     }),
   ]);
   assert.equal(clip.length, 1);
-  assert.equal(clip[0]?.gradient, NIRANTARA_GRADIENT);
+  assert.equal(clip[0]?.gradient, EXAMPLE_GRADIENT);
 
   // -webkit-text-fill-color: transparent route (without explicit clip).
   const fill = buildTextSpans([
@@ -101,19 +101,19 @@ test('dom > captures gradient headline spans', () => {
       text: 'BUSINESS',
       tag: 'span',
       parentTag: 'h1',
-      backgroundImage: NIRANTARA_GRADIENT,
+      backgroundImage: EXAMPLE_GRADIENT,
       backgroundClip: 'border-box',
       webkitTextFillColor: 'transparent',
     }),
   ]);
   assert.equal(fill.length, 1);
-  assert.equal(fill[0]?.gradient, NIRANTARA_GRADIENT);
+  assert.equal(fill[0]?.gradient, EXAMPLE_GRADIENT);
 
   // Gradient background without text-clip/fill-transparent is NOT gradient text.
   const plain = buildTextSpans([
     rawSpan({
       text: 'Banner',
-      backgroundImage: NIRANTARA_GRADIENT,
+      backgroundImage: EXAMPLE_GRADIENT,
       webkitTextFillColor: 'rgb(255, 255, 255)',
     }),
   ]);
@@ -123,7 +123,7 @@ test('dom > captures gradient headline spans', () => {
 test('dom > gradient predicate matches clip-text and transparent fill', () => {
   assert.equal(
     isGradientText({
-      backgroundImage: NIRANTARA_GRADIENT,
+      backgroundImage: EXAMPLE_GRADIENT,
       backgroundClip: 'text',
       webkitTextFillColor: 'rgb(0, 0, 0)',
     }),
@@ -131,7 +131,7 @@ test('dom > gradient predicate matches clip-text and transparent fill', () => {
   );
   assert.equal(
     isGradientText({
-      backgroundImage: NIRANTARA_GRADIENT,
+      backgroundImage: EXAMPLE_GRADIENT,
       backgroundClip: 'border-box',
       webkitTextFillColor: 'rgba(255, 255, 255, 0)',
     }),
@@ -183,7 +183,7 @@ test('prompt > corpus is priority-ordered with verbatim gradient definitions', (
   const spans: TextSpan[] = [
     { text: 'Body paragraph.', color: 'rgb(148, 163, 184)', tag: 'span', parentTag: 'p' },
     { text: 'TECHNOLOGY & AI PARTNER', color: 'rgb(59, 130, 246)', tag: 'span', parentTag: 'h1' },
-    { text: 'BUSINESS', color: 'rgb(6, 182, 212)', tag: 'span', parentTag: 'h1', gradient: NIRANTARA_GRADIENT },
+    { text: 'BUSINESS', color: 'rgb(6, 182, 212)', tag: 'span', parentTag: 'h1', gradient: EXAMPLE_GRADIENT },
     { text: 'Sub heading', color: 'rgb(148, 163, 184)', tag: 'span', parentTag: 'h2' },
   ];
 
@@ -196,7 +196,7 @@ test('prompt > corpus is priority-ordered with verbatim gradient definitions', (
   assert.match(lines[2] as string, /Sub heading/);
   assert.match(lines[3] as string, /Body paragraph\./);
   // Gradient definition embedded verbatim.
-  assert.ok(prompt.includes(NIRANTARA_GRADIENT));
+  assert.ok(prompt.includes(EXAMPLE_GRADIENT));
   // Verbatim reproduction instruction present.
   assert.ok(prompt.includes('verbatim'));
 });

@@ -162,8 +162,8 @@ test('classifyRedirect > aliases instant client-side redirect', () => {
   // / settled in 50ms onto /en; pre-redirect frame blank, /en healthy.
   const pre = checkCaptureHealth(solidPng(64, 64, [255, 255, 255]), 0);
   const post = healthyVerdict(412);
-  const verdict = classifyRedirect('https://nirantara.id/', 'https://nirantara.id/en', 50, pre, post);
-  assert.deepEqual(verdict, { alias: true, from: 'https://nirantara.id/', to: 'https://nirantara.id/en' });
+  const verdict = classifyRedirect('https://example-spa.com/', 'https://example-spa.com/en', 50, pre, post);
+  assert.deepEqual(verdict, { alias: true, from: 'https://example-spa.com/', to: 'https://example-spa.com/en' });
 });
 
 test('classifyRedirect > preserves slow-transition frame', () => {

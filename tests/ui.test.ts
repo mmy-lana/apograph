@@ -26,7 +26,7 @@ import { resolveProvider, resolveModelId } from '../dist/config/models.js';
 // ---------------------------------------------------------------------------
 
 test('progress > reports dynamic provider', () => {
-  // Cloud gateway route (Nirantara run).
+  // Cloud gateway route (dark-canvas SPA run).
   assert.equal(
     formatModelRouteLabel('z-ai', 'glm-5.3-flash'),
     'via z-ai (glm-5.3-flash)',
