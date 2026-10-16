@@ -10,6 +10,7 @@
  *   apograph synthesize <dir>     Modular synthesis from an approved apograph-plan.json.
  *   apograph verify <dir> [dir2]  3-tier verification: build, route smoke, visual comparison.
  *   apograph config               Configure the LLM provider (stored in ~/.apograph/config.json).
+ *   apograph config set --model   Non-interactively set the active model ID.
  *   apograph doctor               Check environment health (Node, Chromium, LLM, Ollama).
  *   apograph setup                Install the apograph MCP server into your coding agent.
  *   apograph mcp                  Start the apograph MCP server over stdio.
@@ -41,7 +42,7 @@ import { runDoctor } from './commands/doctor.js';
 import { runSetup } from './commands/setup.js';
 import { runMcpServer } from './mcp/server.js';
 import { getVersion } from './version.js';
-import { runConfigCommand } from './commands/config.js';
+import { runConfigCommand, runConfigSetCommand } from './commands/config.js';
 import { runStatusCommand } from './commands/status.js';
 import { startProgress } from './utils/progress.js';
 import type { ProgressHandle } from './utils/progress.js';
@@ -90,6 +91,17 @@ function outDirFromUrl(url: string): string {
 function parseNumber(value: string, fallback: number): number {
   const parsed = Number.parseInt(value, 10);
   return Number.isNaN(parsed) ? fallback : parsed;
+}
+
+/**
+ * Applies a non-empty `--model` override to the environment for this run
+ * (APOGRAPH_MODEL), so every downstream model resolution picks it up without
+ * signature changes. An empty `--model ""` is ignored.
+ */
+function applyModelOverride(model: string | undefined): void {
+  if (typeof model === 'string' && model.length > 0) {
+    process.env.APOGRAPH_MODEL = model;
+  }
 }
 
 /** Parses a --viewport option into a validated ViewportMode. */
@@ -547,6 +559,7 @@ interface CloneOptions {
   noReview: boolean;
   force: boolean;
   verify: boolean;
+  model?: string;
 }
 
 /** Options for the `crawl` command. */
@@ -584,6 +597,7 @@ interface SynthesizeOptions {
   force: boolean;
   verify: boolean;
   viewport: string;
+  model?: string;
 }
 
 const program = new Command('apograph');
@@ -705,7 +719,9 @@ program
   .option('--no-review', 'skip the Gate 1 evidence review (automated filtering only)')
   .option('--force', 'overwrite the output directory completely instead of merging')
   .option('--no-verify', 'skip the 3-tier verification pass')
+  .option('--model <id>', 'override the active model ID for this run')
   .action(async (url: string, options: CloneOptions) => {
+    applyModelOverride(options.model);
     const viewport = parseViewportOption(options.viewport);
     const interactive = isInteractive(options.yes);
 
@@ -801,7 +817,9 @@ program
   .option('--viewport <mode>', 'viewports to verify: both, desktop, or mobile', 'both')
   .option('--force', 'overwrite the output directory completely instead of merging')
   .option('--no-verify', 'skip the 3-tier verification pass')
+  .option('--model <id>', 'override the active model ID for this run')
   .action(async (dir: string, options: SynthesizeOptions) => {
+    applyModelOverride(options.model);
     const { plan, manifest, evidenceDir } = await loadPlanAndEvidence(dir);
 
     if (!plan.approved) {
@@ -882,7 +900,7 @@ program
     await runStatusCommand(options);
   });
 
-program
+const configCommand = program
   .command('config')
   .description('Configure the LLM provider (ollama, openai, anthropic, or gateway); stored in ~/.apograph/config.json')
   .option('--show', 'print the current configuration and exit')
@@ -890,10 +908,20 @@ program
     await runConfigCommand(options);
   });
 
+configCommand
+  .command('set')
+  .description('Non-interactively update configuration values (no prompts)')
+  .option('--model <id>', 'set the active model ID')
+  .action(async (options: { model?: string }) => {
+    await runConfigSetCommand(options);
+  });
+
 program
   .command('doctor')
   .description('Check environment health: Node.js, headless Chromium, LLM connectivity, Ollama')
-  .action(async () => {
+  .option('--model <id>', 'override the active model ID for this run')
+  .action(async (options: { model?: string }) => {
+    applyModelOverride(options.model);
     await runDoctor();
   });
 

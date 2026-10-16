@@ -154,6 +154,27 @@ export function isConfigProvider(value: unknown): value is ConfigProvider {
 }
 
 /**
+ * Parses raw config JSON into the typed shape, or null when the shape is
+ * invalid or the provider is unknown. Missing optional fields are tolerated
+ * so a hand-edited file degrades instead of crashing the CLI.
+ */
+export function parseApographConfig(raw: unknown): ApographConfig | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+
+  const candidate = raw as Partial<ApographConfig>;
+  if (!isConfigProvider(candidate.provider)) {
+    return null;
+  }
+
+  return {
+    provider: candidate.provider,
+    ...(candidate.model !== undefined ? { model: candidate.model } : {}),
+    ...(candidate.apiKey !== undefined ? { apiKey: candidate.apiKey } : {}),
+    ...(candidate.baseUrl !== undefined ? { baseUrl: candidate.baseUrl } : {}),
+  };
+}
+
+/**
  * Loads the persisted config, or null when absent or invalid. Missing
  * optional fields are tolerated; the shape is validated loosely so a
  * hand-edited file degrades instead of crashing the CLI.
@@ -164,20 +185,7 @@ export function loadApographConfig(): ApographConfig | null {
   if (!existsSync(path)) return null;
 
   try {
-    const raw: unknown = JSON.parse(readFileSync(path, 'utf8'));
-    if (typeof raw !== 'object' || raw === null) return null;
-
-    const candidate = raw as Partial<ApographConfig>;
-    if (!isConfigProvider(candidate.provider)) {
-      return null;
-    }
-
-    return {
-      provider: candidate.provider,
-      ...(candidate.model !== undefined ? { model: candidate.model } : {}),
-      ...(candidate.apiKey !== undefined ? { apiKey: candidate.apiKey } : {}),
-      ...(candidate.baseUrl !== undefined ? { baseUrl: candidate.baseUrl } : {}),
-    };
+    return parseApographConfig(JSON.parse(readFileSync(path, 'utf8')));
   } catch {
     return null;
   }
@@ -203,6 +211,74 @@ export async function saveApographConfig(config: ApographConfig): Promise<string
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, JSON.stringify(merged, null, 2), 'utf8');
   return path;
+}
+
+// ---------------------------------------------------------------------------
+// Non-interactive updates (`apograph config set --model <id>`)
+// ---------------------------------------------------------------------------
+
+/** Options for {@link runConfigSetCommand}. */
+export interface ConfigSetCliOptions {
+  /** The model ID to persist (`--model <id>`). */
+  model?: string;
+  /** Overrides the config file location (tests inject a temp path). */
+  configPath?: string;
+}
+
+/** Result of a non-interactive model update. */
+export interface ConfigModelUpdate {
+  path: string;
+  model: string;
+}
+
+/**
+ * Non-interactively updates ONLY the `model` field of the persisted config
+ * (`apograph config set --model <id>`). Every other field — including
+ * unknown keys — survives via {@link mergeConfigWithUnknownKeys}, and no
+ * prompts are shown. Throws an actionable error when no model is given or
+ * when the config file is missing/unparseable, so a corrupt file is never
+ * silently rewritten.
+ */
+export async function setConfigModel(
+  model: string,
+  configPath?: string,
+): Promise<ConfigModelUpdate> {
+  if (model.length === 0) {
+    throw new Error('No model specified. Usage: apograph config set --model <id>');
+  }
+
+  const path = configPath ?? configFilePath();
+
+  let existingRaw: unknown = null;
+  if (existsSync(path)) {
+    try {
+      existingRaw = JSON.parse(readFileSync(path, 'utf8'));
+    } catch {
+      throw new Error(
+        `Could not parse ${path} as JSON. Fix (or delete) the file, then run \`apograph config\` first.`,
+      );
+    }
+  }
+
+  const existing = parseApographConfig(existingRaw);
+  if (existing === null) {
+    throw new Error(
+      `No valid configuration found at ${path}. Run \`apograph config\` first to configure a provider, then set the model.`,
+    );
+  }
+
+  const merged = mergeConfigWithUnknownKeys(existingRaw, { ...existing, model });
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(merged, null, 2), 'utf8');
+
+  return { path, model };
+}
+
+/** Runs `apograph config set --model <id>` (no interactive prompts). */
+export async function runConfigSetCommand(options: ConfigSetCliOptions): Promise<void> {
+  const model = typeof options.model === 'string' ? options.model : '';
+  const updated = await setConfigModel(model, options.configPath);
+  console.log(`Model updated to: ${updated.model}`);
 }
 
 /** Masks an API key for display (keeps the first 4 and last 2 characters). */

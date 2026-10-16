@@ -60,12 +60,20 @@ export function resolveProviderName(): 'gateway' | 'anthropic' | 'openai' | 'loc
   return resolveProvider(env, persistedConfig);
 }
 
-/** Resolves the model id for a provider (env override > config > default). Pure. */
+/**
+ * Resolves the model id for a provider. Precedence: a non-empty `cliOverride`
+ * (the `--model` CLI flag) > `APOGRAPH_MODEL` env > config > default. Pure.
+ * An empty override is ignored, preserving the env/config resolution below.
+ */
 export function resolveModelId(
   provider: 'gateway' | 'anthropic' | 'openai' | 'local',
   env: Record<string, string | undefined> = process.env,
   config: ApographConfig | null = persistedConfig,
+  cliOverride?: string,
 ): string {
+  if (cliOverride !== undefined && cliOverride.length > 0) {
+    return cliOverride;
+  }
   if (env.APOGRAPH_MODEL !== undefined && env.APOGRAPH_MODEL.length > 0) {
     return env.APOGRAPH_MODEL;
   }

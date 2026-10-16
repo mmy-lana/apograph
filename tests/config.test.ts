@@ -7,6 +7,9 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   validateProviderConfig,
   maskSecret,
@@ -15,6 +18,7 @@ import {
   probeModelCapabilities,
 } from '../dist/config/validate.js';
 import { resolveProvider, resolveModelId } from '../dist/config/models.js';
+import { setConfigModel, runConfigSetCommand } from '../dist/commands/config.js';
 
 const GATEWAY_ENV = {
   APOGRAPH_BASE_URL: 'https://gw.example.com/v1',
@@ -261,5 +265,137 @@ describe('probeModelCapabilities (MODEL-03)', () => {
     assert.equal(capabilities.structuredOutput, false);
     assert.equal(capabilities.vision, true);
     assert.ok(capabilities.error !== undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CLI model override precedence (--model / cliOverride)
+// ---------------------------------------------------------------------------
+
+describe('CLI model override precedence (resolveModelId cliOverride)', () => {
+  test('cliOverride wins over APOGRAPH_MODEL env and config model', () => {
+    assert.equal(
+      resolveModelId(
+        'gateway',
+        { APOGRAPH_MODEL: 'env-model' },
+        { provider: 'gateway', model: 'cfg-model' },
+        'cli-model',
+      ),
+      'cli-model',
+    );
+  });
+
+  test('cliOverride wins over every provider default', () => {
+    assert.equal(resolveModelId('gateway', {}, null, 'cli-wins'), 'cli-wins');
+    assert.equal(resolveModelId('anthropic', {}, null, 'cli-wins'), 'cli-wins');
+    assert.equal(resolveModelId('openai', {}, null, 'cli-wins'), 'cli-wins');
+    assert.equal(resolveModelId('local', {}, null, 'cli-wins'), 'cli-wins');
+  });
+
+  test('empty cliOverride is ignored (env > config > default preserved)', () => {
+    assert.equal(
+      resolveModelId('gateway', { APOGRAPH_MODEL: 'env-model' }, { provider: 'gateway', model: 'cfg-model' }, ''),
+      'env-model',
+    );
+    assert.equal(
+      resolveModelId('gateway', {}, { provider: 'gateway', model: 'cfg-model' }, ''),
+      'cfg-model',
+    );
+    assert.equal(
+      resolveModelId('gateway', {}, { provider: 'gateway', model: 'cfg-model' }, undefined),
+      'cfg-model',
+    );
+    assert.equal(resolveModelId('gateway', {}, null, ''), 'gpt-4o');
+    assert.equal(resolveModelId('local', {}, null, ''), 'apograph-qwen35:9b-8k');
+    assert.equal(resolveModelId('anthropic', {}, null, ''), 'claude-3-7-sonnet-latest');
+  });
+
+  test('existing 3-argument calls resolve unchanged (back-compat)', () => {
+    assert.equal(resolveModelId('gateway', { APOGRAPH_MODEL: 'env-model' }, null), 'env-model');
+    assert.equal(resolveModelId('gateway', {}, { provider: 'gateway', model: 'cfg-model' }), 'cfg-model');
+    assert.equal(resolveModelId('local', {}, null), 'apograph-qwen35:9b-8k');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// config set --model (non-interactive model update)
+// ---------------------------------------------------------------------------
+
+describe('config set --model (non-interactive model update)', () => {
+  async function writeTempConfig(raw: Record<string, unknown>): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), 'apograph-config-set-'));
+    const path = join(dir, 'config.json');
+    await writeFile(path, JSON.stringify(raw, null, 2), 'utf8');
+    return path;
+  }
+
+  test('updates only the model field and preserves unknown keys', async () => {
+    const path = await writeTempConfig({
+      provider: 'gateway',
+      model: 'old-model',
+      apiKey: 'sk-test-key-1234567890',
+      baseUrl: 'https://gw.example.com/v1',
+      customKey: 'keep-me',
+    });
+
+    const result = await setConfigModel('new-model', path);
+    assert.equal(result.model, 'new-model');
+    assert.equal(result.path, path);
+
+    const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+    assert.equal(saved.model, 'new-model');
+    assert.equal(saved.provider, 'gateway');
+    assert.equal(saved.apiKey, 'sk-test-key-1234567890');
+    assert.equal(saved.baseUrl, 'https://gw.example.com/v1');
+    assert.equal(saved.customKey, 'keep-me');
+  });
+
+  test('empty model is rejected without touching the file', async () => {
+    const path = await writeTempConfig({ provider: 'gateway', model: 'keep' });
+    await assert.rejects(() => setConfigModel('', path), /No model specified/);
+    const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+    assert.equal(saved.model, 'keep');
+  });
+
+  test('missing config file fails with an actionable error', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'apograph-config-set-'));
+    await assert.rejects(
+      () => setConfigModel('x', join(dir, 'nope.json')),
+      /apograph config/,
+    );
+  });
+
+  test('unparseable config file is never silently rewritten', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'apograph-config-set-'));
+    const path = join(dir, 'config.json');
+    await writeFile(path, '{ not json', 'utf8');
+    await assert.rejects(() => setConfigModel('x', path), /Could not parse/);
+    assert.equal(await readFile(path, 'utf8'), '{ not json');
+  });
+
+  test('runConfigSetCommand prints "Model updated to: <id>" without prompts', async () => {
+    const path = await writeTempConfig({ provider: 'gateway', model: 'old', apiKey: 'sk-x' });
+
+    const printed: string[] = [];
+    const originalLog = console.log;
+    console.log = (...args: unknown[]): void => {
+      printed.push(args.map(String).join(' '));
+    };
+    try {
+      await runConfigSetCommand({ model: 'brand-new', configPath: path });
+    } finally {
+      console.log = originalLog;
+    }
+
+    assert.deepEqual(printed, ['Model updated to: brand-new']);
+    const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+    assert.equal(saved.model, 'brand-new');
+  });
+
+  test('runConfigSetCommand with empty --model rejects', async () => {
+    const path = await writeTempConfig({ provider: 'gateway', model: 'keep' });
+    await assert.rejects(() => runConfigSetCommand({ model: '', configPath: path }), /No model specified/);
+    const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+    assert.equal(saved.model, 'keep');
   });
 });
