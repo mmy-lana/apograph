@@ -29,6 +29,9 @@ import {
   synthesizeModularProject,
   copyMirroredAssets,
   generatePageTemplate,
+  computeRunStatus,
+  exitCodeForRunStatus,
+  upsertStageOutcome,
 } from './synthesizer/modular.js';
 import { emitProject } from './emitter/scaffold.js';
 import { runVerification } from './verifier/engine.js';
@@ -242,6 +245,8 @@ interface ModularSynthesisOptions {
   interactive: boolean;
   verify: boolean;
   viewport: ViewportMode;
+  /** Exit 0 even when synthesis used fallback templates (`--allow-degraded`). */
+  allowDegraded?: boolean;
   /** Route paths to skip because their page files already exist. */
   skipRoutePaths?: string[];
   /** Receives route paths as their pages finish synthesizing. */
@@ -309,6 +314,19 @@ async function runModularSynthesis(
         path: expectedPath,
         content: generatePageTemplate(route),
       });
+
+      // The route's final artifact is now a deterministic template: record
+      // it as degraded so the run can never present itself as fully
+      // synthesized. A stage that already failed keeps its stronger signal.
+      const stageName = `stage-3: route ${route.path}`;
+      const prior = result.stageOutcomes.find((outcome) => outcome.stage === stageName);
+      if (prior?.status !== 'failed') {
+        upsertStageOutcome(result.stageOutcomes, {
+          stage: stageName,
+          status: 'degraded-fallback',
+          reason: `synthesized output missing ${expectedPath}; backfilled with deterministic template`,
+        });
+      }
     }
   }
 
@@ -345,10 +363,41 @@ async function runModularSynthesis(
     }
   }
 
+  // Explicit run-status reporting (no silent fallback): recompute after the
+  // backfill pass so template-only output is never presented as success.
+  result.runStatus = computeRunStatus(result.stageOutcomes);
+  const nonSynthesized = result.stageOutcomes.filter(
+    (outcome) => outcome.status !== 'synthesized',
+  );
+
+  if (result.runStatus === 'success') {
+    console.log('');
+    console.log('✔ Done.');
+    console.log(`  Output:  ${projectDir}`);
+    console.log('  Boot it: cd into the project and run pnpm install && pnpm dev');
+    return;
+  }
+
   console.log('');
-  console.log('✔ Done.');
-  console.log(`  Output:  ${projectDir}`);
-  console.log('  Boot it: cd into the project and run pnpm install && pnpm dev');
+  if (result.runStatus === 'degraded') {
+    console.log(
+      `⚠ DEGRADED CLONE — ${nonSynthesized.length} of ${result.stageOutcomes.length} stages used fallback templates`,
+    );
+  } else {
+    console.log('✖ CLONE FAILED');
+  }
+  for (const outcome of nonSynthesized) {
+    const reason = outcome.reason !== undefined ? `: ${outcome.reason}` : '';
+    console.log(`  - ${outcome.stage} [${outcome.status}]${reason}`);
+  }
+  if (result.runStatus === 'degraded') {
+    console.log('The output may not resemble the target site.');
+  }
+
+  const exitCode = exitCodeForRunStatus(result.runStatus, options.allowDegraded === true);
+  if (exitCode !== 0) {
+    process.exitCode = exitCode;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +418,8 @@ interface ClonePipelineOptions {
   force: boolean;
   verify: boolean;
   interactive: boolean;
+  /** Exit 0 even when synthesis used fallback templates (`--allow-degraded`). */
+  allowDegraded?: boolean;
   /** Checkpoint to resume from (skips crawl + approval gate). */
   resumeFrom?: CloneCheckpoint;
 }
@@ -392,6 +443,7 @@ async function runClonePipeline(options: ClonePipelineOptions): Promise<void> {
     force,
     verify,
     interactive,
+    allowDegraded,
     resumeFrom,
   } = options;
 
@@ -519,6 +571,7 @@ async function runClonePipeline(options: ClonePipelineOptions): Promise<void> {
       interactive,
       verify,
       viewport,
+      allowDegraded: allowDegraded === true,
       skipRoutePaths: (resumeFrom !== undefined ? false : force)
         ? []
         : existingPagePaths(approved, outDir),
@@ -560,6 +613,7 @@ interface CloneOptions {
   force: boolean;
   verify: boolean;
   model?: string;
+  allowDegraded?: boolean;
 }
 
 /** Options for the `crawl` command. */
@@ -720,6 +774,7 @@ program
   .option('--force', 'overwrite the output directory completely instead of merging')
   .option('--no-verify', 'skip the 3-tier verification pass')
   .option('--model <id>', 'override the active model ID for this run')
+  .option('--allow-degraded', 'exit 0 even when synthesis used fallback templates')
   .action(async (url: string, options: CloneOptions) => {
     applyModelOverride(options.model);
     const viewport = parseViewportOption(options.viewport);
@@ -764,6 +819,7 @@ program
       force: options.force,
       verify: options.verify,
       interactive,
+      allowDegraded: options.allowDegraded,
       resumeFrom,
     });
   });

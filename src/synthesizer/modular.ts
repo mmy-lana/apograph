@@ -66,6 +66,16 @@ export interface ModularSynthesisInput {
   callbacks?: ModularSynthesisCallbacks;
 }
 
+/** Outcome of one synthesis stage (explicit reporting — no silent fallback). */
+export interface StageOutcome {
+  /** Stage identifier (e.g. `stage-2: shared layout`, `stage-3: route /`). */
+  stage: string;
+  /** How the stage's output was produced. */
+  status: 'synthesized' | 'degraded-fallback' | 'failed';
+  /** Redacted failure reason (present on degraded-fallback / failed). */
+  reason?: string;
+}
+
 /** Result of a modular synthesis run. */
 export interface ModularSynthesisResult {
   files: ProjectFile[];
@@ -73,10 +83,56 @@ export interface ModularSynthesisResult {
   visionStages: string[];
   /** Stage labels completed via deterministic fallback templates. */
   fallbackStages: string[];
+  /** Per-stage outcomes: synthesized, degraded-fallback, or failed. */
+  stageOutcomes: StageOutcome[];
+  /** Overall run verdict derived from stageOutcomes. */
+  runStatus: 'success' | 'degraded' | 'failed';
   /** Route paths whose page files this run synthesized. */
   synthesizedRoutePaths: string[];
   /** Route paths skipped because they already existed (resumption). */
   skippedRoutePaths: string[];
+}
+
+/**
+ * Derives the run verdict from per-stage outcomes: any `failed` stage makes
+ * the run `failed`; otherwise any `degraded-fallback` makes it `degraded`;
+ * an empty outcome list (deterministic-only stages) is `success`.
+ */
+export function computeRunStatus(
+  stageOutcomes: StageOutcome[],
+): 'success' | 'degraded' | 'failed' {
+  if (stageOutcomes.some((outcome) => outcome.status === 'failed')) return 'failed';
+  if (stageOutcomes.some((outcome) => outcome.status === 'degraded-fallback')) {
+    return 'degraded';
+  }
+  return 'success';
+}
+
+/**
+ * Exit-code policy for one synthesis run: `success` exits 0; `degraded`
+ * exits 1 unless `--allow-degraded` is set; `failed` always exits 1.
+ */
+export function exitCodeForRunStatus(
+  runStatus: 'success' | 'degraded' | 'failed',
+  allowDegraded: boolean,
+): number {
+  if (runStatus === 'success') return 0;
+  if (runStatus === 'degraded' && allowDegraded) return 0;
+  return 1;
+}
+
+/**
+ * Records one stage outcome, replacing any prior outcome for the same stage
+ * name (used by the post-synthesis backfill to re-mark a stage whose emitted
+ * output was replaced by a deterministic template).
+ */
+export function upsertStageOutcome(
+  stageOutcomes: StageOutcome[],
+  outcome: StageOutcome,
+): void {
+  const index = stageOutcomes.findIndex((entry) => entry.stage === outcome.stage);
+  if (index === -1) stageOutcomes.push(outcome);
+  else stageOutcomes[index] = outcome;
 }
 
 // ---------------------------------------------------------------------------
@@ -720,17 +776,34 @@ async function runVisionStage(
       throw new Error('model returned no files or all files had empty content');
     }
     result.visionStages.push(stage);
+    result.stageOutcomes.push({ stage, status: 'synthesized' });
     progress?.stop(`${label} — done`);
     return files;
   } catch (cause) {
     // Invalid credentials (HTTP 401/403) abort the run — they must never be
     // silently masked by a deterministic template fallback.
     if (cause instanceof ProviderAuthError) throw cause;
-    const reason = cause instanceof Error ? cause.message : String(cause);
-    console.warn(`[apograph] ${stage}: vision synthesis unavailable (${redactSecrets(reason)}); using deterministic template.`);
+    const reason = redactSecrets(cause instanceof Error ? cause.message : String(cause));
+    console.warn(`[apograph] ${stage}: vision synthesis unavailable (${reason}); using deterministic template.`);
     result.fallbackStages.push(stage);
-    progress?.stop(`${label} — fallback`);
-    return fallback();
+    try {
+      const files = fallback();
+      if (files.length === 0 || files.every((f) => f.content.trim().length === 0)) {
+        throw new Error('deterministic fallback produced no usable files');
+      }
+      result.stageOutcomes.push({ stage, status: 'degraded-fallback', reason });
+      progress?.stop(`${label} — fallback`);
+      return files;
+    } catch (fallbackCause) {
+      // Even the deterministic fallback broke: record the stage as failed so
+      // the run can never report plain success.
+      const fallbackReason = redactSecrets(
+        fallbackCause instanceof Error ? fallbackCause.message : String(fallbackCause),
+      );
+      result.stageOutcomes.push({ stage, status: 'failed', reason: fallbackReason });
+      progress?.stop(`${label} — failed`);
+      return [];
+    }
   }
 }
 
@@ -759,6 +832,8 @@ export async function synthesizeModularProject(
     files: [],
     visionStages: [],
     fallbackStages: [],
+    stageOutcomes: [],
+    runStatus: 'success',
     synthesizedRoutePaths: [],
     skippedRoutePaths: [],
   };
@@ -973,6 +1048,8 @@ export async function synthesizeModularProject(
     [indexCss, ...layoutFiles, ...pageFiles, appTsx, mainTsx],
     manifest.assets,
   );
+
+  result.runStatus = computeRunStatus(result.stageOutcomes);
 
   return result;
 }

@@ -6,7 +6,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { generatePageTemplate } from '../dist/synthesizer/modular.js';
+import {
+  generatePageTemplate,
+  computeRunStatus,
+  exitCodeForRunStatus,
+  upsertStageOutcome,
+} from '../dist/synthesizer/modular.js';
+import type { StageOutcome } from '../dist/synthesizer/modular.js';
 import type { PlanRoute } from '../dist/plan/schema.js';
 
 function minimalRoute(overrides: Partial<PlanRoute> = {}): PlanRoute {
@@ -71,4 +77,87 @@ test('backfill > missing page file is generated with correct path and content', 
   assert.notEqual(page, undefined);
   assert.ok((page?.content ?? '').trim().length > 0);
   assert.ok((page?.content ?? '').includes('export function TestPage'));
+});
+
+// D — run-status derivation from per-stage outcomes.
+test('status > all-synthesized outcomes compute success', () => {
+  const outcomes: StageOutcome[] = [
+    { stage: 'stage-2: shared layout', status: 'synthesized' },
+    { stage: 'stage-3: route /', status: 'synthesized' },
+  ];
+  assert.equal(computeRunStatus(outcomes), 'success');
+  assert.equal(computeRunStatus([]), 'success');
+});
+
+test('status > a degraded-fallback outcome computes degraded', () => {
+  const outcomes: StageOutcome[] = [
+    { stage: 'stage-2: shared layout', status: 'degraded-fallback', reason: 'HTTP 503' },
+    { stage: 'stage-3: route /', status: 'synthesized' },
+  ];
+  assert.equal(computeRunStatus(outcomes), 'degraded');
+});
+
+test('status > a failed outcome wins over degraded siblings', () => {
+  const outcomes: StageOutcome[] = [
+    { stage: 'stage-2: shared layout', status: 'failed', reason: 'fallback broke' },
+    { stage: 'stage-3: route /', status: 'degraded-fallback', reason: 'HTTP 429' },
+  ];
+  assert.equal(computeRunStatus(outcomes), 'failed');
+});
+
+// E — exit-code policy for the CLI summary.
+test('exit codes > success exits 0 with and without --allow-degraded', () => {
+  assert.equal(exitCodeForRunStatus('success', false), 0);
+  assert.equal(exitCodeForRunStatus('success', true), 0);
+});
+
+test('exit codes > degraded exits 1 without --allow-degraded and 0 with it', () => {
+  assert.equal(exitCodeForRunStatus('degraded', false), 1);
+  assert.equal(exitCodeForRunStatus('degraded', true), 0);
+});
+
+test('exit codes > failed exits 1 even with --allow-degraded', () => {
+  assert.equal(exitCodeForRunStatus('failed', false), 1);
+  assert.equal(exitCodeForRunStatus('failed', true), 1);
+});
+
+// F — backfill marks routes degraded-fallback (inline replica of the
+// marking inserted into runModularSynthesis's backfill loop).
+function markBackfill(
+  stageOutcomes: StageOutcome[],
+  routePath: string,
+  expectedPath: string,
+): void {
+  const stageName = `stage-3: route ${routePath}`;
+  const prior = stageOutcomes.find((outcome) => outcome.stage === stageName);
+  if (prior?.status !== 'failed') {
+    upsertStageOutcome(stageOutcomes, {
+      stage: stageName,
+      status: 'degraded-fallback',
+      reason: `synthesized output missing ${expectedPath}; backfilled with deterministic template`,
+    });
+  }
+}
+
+test('backfill > backfilled route is marked degraded-fallback in stageOutcomes', () => {
+  const outcomes: StageOutcome[] = [
+    { stage: 'stage-3: route /test', status: 'synthesized' },
+  ];
+  markBackfill(outcomes, '/test', 'src/pages/TestPage.tsx');
+
+  assert.equal(outcomes.length, 1, 'the synthesized entry is replaced, not duplicated');
+  assert.equal(outcomes[0]?.status, 'degraded-fallback');
+  assert.match(outcomes[0]?.reason ?? '', /backfilled with deterministic template/);
+  assert.equal(computeRunStatus(outcomes), 'degraded');
+});
+
+test('backfill > a failed stage keeps its failed status after backfill', () => {
+  const outcomes: StageOutcome[] = [
+    { stage: 'stage-3: route /test', status: 'failed', reason: 'fallback broke' },
+  ];
+  markBackfill(outcomes, '/test', 'src/pages/TestPage.tsx');
+
+  assert.equal(outcomes[0]?.status, 'failed');
+  assert.equal(computeRunStatus(outcomes), 'failed');
+  assert.equal(exitCodeForRunStatus('failed', true), 1);
 });
