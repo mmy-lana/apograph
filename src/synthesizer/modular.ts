@@ -675,6 +675,25 @@ function isNavbarViable(content: string): boolean {
   return true;
 }
 
+/**
+ * Formats the SPA-aware modal capture section of the stage-3 page prompt:
+ * when the route has modalCaptures, each captured overlay is listed by
+ * accessible name and trigger so the synthesized page implements them as
+ * openable overlays driven by useState.
+ */
+function modalCapturePromptLines(route: CrawlRoute | undefined): string[] {
+  const modals = route?.modalCaptures ?? [];
+  if (modals.length === 0) return [];
+  return [
+    'Modal states captured (implement these as openable overlays with useState):',
+    ...modals.map(
+      (modal) =>
+        `- "${modal.modalName}" — triggered by ${modal.triggerSelector}`,
+    ),
+    '',
+  ];
+}
+
 /** Runs one vision LLM stage, falling back to deterministic output on failure. */
 async function runVisionStage(
   stage: string,
@@ -890,6 +909,7 @@ export async function synthesizeModularProject(
       'Accessibility tree of the reference page:',
       manifestRoute ? formatA11yTreeForVisionPrompt(manifestRoute.a11yTree) : '(not captured)',
       '',
+      ...(modalCapturePromptLines(manifestRoute)),
       formatTextSpansForPrompt(manifestRoute?.textSpans ?? []),
       '',
       'TEXT FIDELITY (critical): every span in the text corpus above must appear',

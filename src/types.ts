@@ -68,6 +68,33 @@ export interface RouteMetadata {
   ogImage?: string;
 }
 
+/**
+ * One hash-anchor sub-capture recorded on a route (SPA-aware crawl): the
+ * crawler scrolled to the `a[href^="#"]` target and screenshotted the
+ * resting state, without creating a new route entry.
+ */
+export interface HashCapture {
+  /** The hash target as it appeared in the anchor (e.g. `#pricing`). */
+  hash: string;
+  /** Local path of the desktop screenshot PNG of the scrolled state. */
+  screenshot: string;
+}
+
+/**
+ * One modal / overlay state discovered by interactively probing a page's
+ * clickable elements (SPA-aware crawl).
+ */
+export interface ModalCapture {
+  /** Readable selector of the element whose click revealed the overlay. */
+  triggerSelector: string;
+  /** Accessible name of the modal (aria-label / aria-labelledby / heading). */
+  modalName: string;
+  /** Local path of the desktop screenshot PNG (null when not captured). */
+  desktopScreenshot: string | null;
+  /** Local path of the mobile screenshot PNG (null when not captured). */
+  mobileScreenshot: string | null;
+}
+
 /** One crawled page's recorded evidence. */
 export interface CrawlRoute {
   /** The normalized URL of the page. */
@@ -88,6 +115,17 @@ export interface CrawlRoute {
   tokens: DesignTokens;
   /** Visible text corpus harvested in document order (spec s5.1). */
   textSpans?: TextSpan[];
+  /**
+   * Hash-anchor sub-captures (`#section` targets) recorded on this route
+   * without creating new route entries. Optional: older evidence bundles
+   * predate SPA-aware capture.
+   */
+  hashCaptures?: HashCapture[];
+  /**
+   * Modal / overlay states discovered by interactive probing. Optional:
+   * older evidence bundles predate SPA-aware capture.
+   */
+  modalCaptures?: ModalCapture[];
 }
 
 /** Lifecycle status of one mirrored asset. */

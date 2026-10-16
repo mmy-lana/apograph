@@ -20,8 +20,10 @@ import { join, resolve } from 'node:path';
 import { chromium } from 'playwright';
 import type { Browser, Frame, Page } from 'playwright';
 import type {
+  CrawlRoute,
   CrawlScope,
   EvidenceManifest,
+  HashCapture,
   RedirectAliasRecord,
   RouteMetadata,
   ViewportMode,
@@ -33,6 +35,7 @@ import {
   classifyRedirect,
 } from './health.js';
 import type { CaptureHealth } from './health.js';
+import { discoverInteractiveStates } from './interactions.js';
 import { autoScrollWithReset, scrollResetDiagnostic } from './scroll.js';
 import {
   createScopeFilter,
@@ -77,6 +80,15 @@ const DEFAULT_MAX_PAGES = 10;
 
 /** Per-page navigation timeout. */
 const NAVIGATION_TIMEOUT_MS = 30_000;
+
+/**
+ * Shared SPA-probe budget per page (hash anchors + interactive states):
+ * the added crawl time for one page never exceeds 30 seconds.
+ */
+const SPA_PROBE_BUDGET_MS = 30_000;
+
+/** Max unique hash-anchor targets captured per page. */
+const MAX_HASH_TARGETS = 10;
 
 /** One pending URL in the crawl frontier. */
 interface FrontierEntry {
@@ -334,7 +346,10 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         continue;
       }
 
-      routes.push({
+      // Route record is built as a mutable object so the SPA-aware passes
+      // (modals here, hash anchors after link discovery) can attach their
+      // captures to the very record stored in the manifest.
+      const routeRecord: CrawlRoute = {
         url: entry.url,
         path,
         title,
@@ -346,11 +361,42 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         ...(snapshot.textSpans !== undefined
           ? { textSpans: snapshot.textSpans }
           : {}),
-      });
+      };
+
+      // Shared SPA-probe budget: both passes must fit within 30s per page.
+      const spaDeadline = Date.now() + SPA_PROBE_BUDGET_MS;
+
+      // SPA-aware interactive state discovery (modals / overlays): probing
+      // happens before the route is stored so modalCaptures ride on the
+      // record; per-element failures are swallowed inside the discovery.
+      const modalCaptures = await discoverInteractiveStates(
+        page,
+        routeRecord,
+        screenshotsDir,
+        spaDeadline,
+      );
+      if (modalCaptures.length > 0) {
+        routeRecord.modalCaptures = modalCaptures;
+      }
+
+      routes.push(routeRecord);
 
       // Link discovery (scoped against the canonical root).
       const scopeFilter = createScopeFilter(canonicalRoot, scope);
       await enqueueLinks(page, entry, canonicalRoot, scopeFilter, maxDepth, maxPages, bookkeeping, skip);
+
+      // SPA-aware hash-anchor sub-captures: scroll to each `#target` on the
+      // current page and record desktop screenshots as sub-captures of this
+      // route (no new route entry is created).
+      const hashCaptures = await discoverHashAnchors(
+        page,
+        entry,
+        screenshotsDir,
+        spaDeadline,
+      );
+      if (hashCaptures.length > 0) {
+        routeRecord.hashCaptures = hashCaptures;
+      }
 
       // Asset discovery.
       for (const assetUrl of await discoverImageAssets(page)) {
@@ -565,6 +611,98 @@ async function enqueueLinks(
     });
     queued.add(normalized);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Hash-anchor sub-captures (SPA-aware)
+// ---------------------------------------------------------------------------
+
+/**
+ * In-page collector listing unique in-page hash targets (`a[href^="#"]`).
+ * Bare `#` anchors (no target id) are skipped.
+ */
+function collectHashTargets(): string[] {
+  const hashes: string[] = [];
+  for (const anchor of Array.from(document.querySelectorAll('a[href^="#"]'))) {
+    const href = anchor.getAttribute('href');
+    if (href === null || href.length < 2) continue;
+    if (!hashes.includes(href)) hashes.push(href);
+  }
+  return hashes;
+}
+
+/** Sanitizes a hash (e.g. `#pricing-faq`) for use inside a filename. */
+function hashNameForFile(hash: string): string {
+  const name = hash
+    .replace(/^#/, '')
+    .replace(/[^a-zA-Z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  return name.length > 0 ? name : 'target';
+}
+
+/**
+ * SPA-aware hash-anchor discovery: for every unique `a[href^="#"]` target
+ * on the current page, scrolls the element into view, waits for
+ * scroll-triggered animations, and records a desktop screenshot as a
+ * sub-capture of the current route. No new route entry is created — the
+ * caller attaches the returned captures to the existing route record.
+ *
+ * `deadlineAt` bounds the total added time (shared with the interactive
+ * state pass). Any per-target failure is caught and skipped silently.
+ */
+async function discoverHashAnchors(
+  page: Page,
+  entry: FrontierEntry,
+  screenshotsDir: string,
+  deadlineAt?: number,
+): Promise<HashCapture[]> {
+  const captures: HashCapture[] = [];
+  const slug = slugForPath(safePathname(entry.url));
+
+  let hashes: string[] = [];
+  try {
+    hashes = await page.evaluate(collectHashTargets);
+  } catch {
+    return captures;
+  }
+
+  await page.setViewportSize({ ...DESKTOP_VIEWPORT });
+
+  for (const hash of hashes.slice(0, MAX_HASH_TARGETS)) {
+    if (deadlineAt !== undefined && Date.now() > deadlineAt) break;
+    try {
+      const scrolled = await page.evaluate((target: string) => {
+        const el = document.querySelector(target);
+        if (el === null) return false;
+        el.scrollIntoView();
+        return true;
+      }, hash);
+      if (!scrolled) continue;
+
+      // Wait for scroll-triggered animations to settle.
+      await page.waitForTimeout(600);
+
+      const screenshot = join(
+        screenshotsDir,
+        `${slug}-hash-${hashNameForFile(hash)}-desktop.png`,
+      );
+      await page.screenshot({ path: screenshot, type: 'png' });
+      captures.push({ hash, screenshot });
+    } catch {
+      // Malformed selector / detached frame — skip this target silently.
+      continue;
+    }
+  }
+
+  // Return the page to its resting (top) state for subsequent passes.
+  try {
+    await page.evaluate(() => window.scrollTo(0, 0));
+  } catch {
+    // Page already navigated away — nothing to reset.
+  }
+
+  return captures;
 }
 
 /** Extracts a URL's pathname without throwing on malformed input. */
