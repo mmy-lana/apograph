@@ -192,7 +192,11 @@ export function generateFrontendScaffold(
       skipLibCheck: true,
       isolatedModules: true,
       useDefineForClassFields: true,
-      verbatimModuleSyntax: true,
+      // LLMs frequently emit `import { FormEvent } from 'react'` rather than
+      // `import type`; verbatimModuleSyntax turns that quirk into TS1484 and
+      // fails the whole build. Type-only elision below keeps such imports
+      // harmless while isolatedModules stays enabled.
+      verbatimModuleSyntax: false,
       types: ['vite/client'],
     },
     include: ['src'],

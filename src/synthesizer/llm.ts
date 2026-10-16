@@ -74,6 +74,17 @@ const RETRYABLE_STATUS = new Set([429, 502, 503, 408]);
 /** Auth status codes: abort the run, never retry, never fall back. */
 const AUTH_STATUS = new Set([401, 403]);
 
+/** Socket-level error codes that mark a transient network dropout. */
+const NETWORK_RESET_CODES = new Set([
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ECONNREFUSED',
+  'UND_ERR_CONNECT_TIMEOUT',
+]);
+
+/** Message fragments that mark a transient network/socket dropout. */
+const NETWORK_RESET_MESSAGES = ['fetch failed', 'read econnreset'];
+
 /**
  * Fatal provider authentication failure (HTTP 401/403). Thrown instead of a
  * deterministic fallback so an invalid credential can never masquerade as a
@@ -154,9 +165,41 @@ function isAbortLike(error: unknown): boolean {
 }
 
 /**
- * Classifies one failed attempt by `statusCode`:
+ * True when an error is a transient network/socket dropout (`ECONNRESET`,
+ * `ETIMEDOUT`, `ECONNREFUSED`, `UND_ERR_CONNECT_TIMEOUT`, or a `fetch
+ * failed` / `read ECONNRESET` message). Inspects `error.code`, the code on
+ * `error.cause`, and `error.message` — including inside RetryError-style
+ * wrappers. Such dropouts are retryable backoff candidates.
+ */
+export function isNetworkResetError(error: unknown): boolean {
+  const candidates: unknown[] = [error];
+  const unwrapped = unwrapProviderError(error);
+  if (unwrapped !== error) candidates.push(unwrapped);
+
+  for (const candidate of candidates) {
+    const record = candidate as { code?: unknown; cause?: { code?: unknown } } | null;
+    if (typeof record?.code === 'string' && NETWORK_RESET_CODES.has(record.code)) {
+      return true;
+    }
+    const causeCode = record?.cause?.code;
+    if (typeof causeCode === 'string' && NETWORK_RESET_CODES.has(causeCode)) {
+      return true;
+    }
+    const message = (
+      candidate instanceof Error ? candidate.message : String(candidate ?? '')
+    ).toLowerCase();
+    if (NETWORK_RESET_MESSAGES.some((fragment) => message.includes(fragment))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Classifies one failed attempt:
  * - abort/timeout expiry is terminal (`raise`);
  * - 401/403 abort the run (`auth-abort`);
+ * - network/socket dropouts are transient (`retry`, reason `network-reset`);
  * - 429/502/503/408 are transient (`retry`);
  * - everything else (400/404/500/unknown) raises immediately.
  */
@@ -165,6 +208,7 @@ export function classifyProviderError(error: unknown): RetryDecision {
 
   const status = extractStatusCode(error);
   if (status !== null && AUTH_STATUS.has(status)) return 'auth-abort';
+  if (isNetworkResetError(error)) return 'retry';
   if (status !== null && RETRYABLE_STATUS.has(status)) return 'retry';
   return 'raise';
 }

@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 
 import { formatModelRouteLabel } from '../dist/synthesizer/modular.js';
+import { generateFrontendScaffold } from '../dist/emitter/scaffold.js';
 import {
   applyVisionPreset,
   findVisionPreset,
@@ -167,4 +168,31 @@ test('source > config command retains the GLM preset as a first-class option', a
   assert.ok(configSource.includes("'glm-5.3-flash'"));
   assert.ok(configSource.includes('VISION_PRESETS'));
   assert.ok(configSource.includes('mergePromptAnswers'));
+});
+
+// ---------------------------------------------------------------------------
+// Emitted-project build resilience (verbatimModuleSyntax / TS1484)
+// ---------------------------------------------------------------------------
+
+test('scaffold > emitted tsconfig disables verbatimModuleSyntax and keeps isolatedModules', () => {
+  const files = generateFrontendScaffold('demo-app');
+  const tsconfig = files.find((file) => file.path === 'tsconfig.json');
+  assert.ok(tsconfig !== undefined);
+  const parsed = JSON.parse(tsconfig.content) as {
+    compilerOptions: { verbatimModuleSyntax?: boolean; isolatedModules?: boolean };
+  };
+  assert.equal(
+    parsed.compilerOptions.verbatimModuleSyntax,
+    false,
+    'type-only import quirks must not fail the emitted build (TS1484)',
+  );
+  assert.equal(parsed.compilerOptions.isolatedModules, true);
+});
+
+test('source > system guidelines mandate type-only React imports', async () => {
+  const modularSource = await readFile(
+    join(fileURLToPath(new URL('../src/synthesizer/modular.ts', import.meta.url))),
+    'utf8',
+  );
+  assert.ok(modularSource.includes('Always use type-only imports for React types'));
 });

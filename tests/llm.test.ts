@@ -12,6 +12,7 @@ import {
   generateStructuredFilesFromParts,
   repairCodeFile,
   classifyProviderError,
+  isNetworkResetError,
   computeBackoffMs,
   withTransientRetry,
   ProviderAuthError,
@@ -385,5 +386,64 @@ describe('generateStructuredFilesFromParts (retry integration)', () => {
     assert.equal(repaired, 'fixed code');
     assert.equal(calls, 2);
     assert.deepEqual(clock.sleeps, [3000]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Network/socket dropouts
+// ---------------------------------------------------------------------------
+
+describe('network/socket dropouts (transient reconnects)', () => {
+  test('an error with code ECONNRESET is classified as retryable', () => {
+    const reset = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    assert.equal(isNetworkResetError(reset), true);
+    assert.equal(classifyProviderError(reset), 'retry');
+  });
+
+  test('cause codes, undici codes, and messages all mark transient dropouts', () => {
+    // Node fetch failures: message 'fetch failed', code on error.cause.
+    const refused = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:1'), {
+        code: 'ECONNREFUSED',
+      }),
+    });
+    assert.equal(classifyProviderError(refused), 'retry');
+
+    const timedOut = Object.assign(new Error('socket timeout'), { code: 'ETIMEDOUT' });
+    assert.equal(classifyProviderError(timedOut), 'retry');
+
+    const undici = Object.assign(new Error('connect timeout'), {
+      code: 'UND_ERR_CONNECT_TIMEOUT',
+    });
+    assert.equal(classifyProviderError(undici), 'retry');
+
+    assert.equal(classifyProviderError(new Error('fetch failed')), 'retry');
+    assert.equal(classifyProviderError(new Error('read ECONNRESET')), 'retry');
+
+    // RetryError-style wrappers around a dropout stay retryable.
+    const wrapped = Object.assign(new Error('Failed after 1 attempts'), {
+      lastError: Object.assign(new Error('fetch failed'), { code: 'ECONNRESET' }),
+    });
+    assert.equal(classifyProviderError(wrapped), 'retry');
+
+    // Unrelated errors keep raising immediately.
+    assert.equal(classifyProviderError(new Error('boom')), 'raise');
+    assert.equal(isNetworkResetError(new Error('boom')), false);
+  });
+
+  test('network dropouts trigger the bounded backoff loop', async () => {
+    const clock = fakeClock();
+    let calls = 0;
+    const result = await withTransientRetry(
+      async () => {
+        calls += 1;
+        if (calls <= 2) throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+        return 'ok';
+      },
+      clock,
+    );
+    assert.equal(result, 'ok');
+    assert.equal(calls, 3);
+    assert.deepEqual(clock.sleeps, [3000, 7000]);
   });
 });

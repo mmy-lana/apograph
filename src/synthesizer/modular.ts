@@ -182,6 +182,7 @@ const SYSTEM_GUIDELINES = [
   "   localStorage.setItem('apograph_submissions', ...).",
   '8. Every file must be complete and compile-ready — no placeholders, no TODOs,',
   '   no truncation, no markdown fences inside file contents.',
+  '- Always use type-only imports for React types: `import type { FormEvent, ReactNode } from \'react\'`.',
 ].join('\n');
 
 // ---------------------------------------------------------------------------
