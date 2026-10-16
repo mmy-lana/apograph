@@ -36,7 +36,12 @@ import {
 } from './health.js';
 import type { CaptureHealth } from './health.js';
 import { discoverInteractiveStates } from './interactions.js';
-import { autoScrollWithReset, scrollResetDiagnostic } from './scroll.js';
+import {
+  autoScrollWithReset,
+  readinessDiagnostic,
+  scrollResetDiagnostic,
+  waitForPageReadiness,
+} from './scroll.js';
 import {
   createScopeFilter,
   isCrawlablePage,
@@ -263,6 +268,13 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
       // Amendment A1 R3: record an unconfirmed reset as a diagnostic.
       if (!scroll.confirmedTop) {
         skip(entry.url, scrollResetDiagnostic(scroll));
+      }
+
+      // Post-scroll readiness (fonts, network settle, lazy images) before any
+      // capture; incomplete readiness is recorded as a diagnostic.
+      const readinessNote = readinessDiagnostic(await waitForPageReadiness(page));
+      if (readinessNote !== null) {
+        skip(entry.url, readinessNote);
       }
 
       // Viewport-gated full-page screenshots (patch spec s3.2). Captured at

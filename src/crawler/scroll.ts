@@ -17,10 +17,31 @@
 export const MAX_SCROLL_STEPS = 30;
 
 /** Maximum wall-clock duration of the whole scroll pass, in ms. */
-export const SCROLL_TIMEOUT_MS = 5000;
+export const SCROLL_TIMEOUT_MS = 20000;
 
 /** Settle delay at the bottom before capture, in ms. */
 export const SETTLE_DELAY_MS = 750;
+
+/**
+ * Hard budget for the post-scroll readiness pipeline, in ms. Together with
+ * the step caps below it bounds the added per-page time at 8s.
+ */
+export const POST_SCROLL_READINESS_TIMEOUT_MS = 8000;
+
+/** Cap for the `document.fonts.ready` wait, in ms. */
+export const FONTS_READY_TIMEOUT_MS = 3000;
+
+/** Cap for the networkidle settle wait, in ms. */
+export const NETWORK_IDLE_TIMEOUT_MS = 5000;
+
+/** Cap for the image-completion poll, in ms. */
+export const IMAGES_READY_TIMEOUT_MS = 3000;
+
+/** Poll interval for the image-completion check, in ms. */
+export const IMAGE_POLL_INTERVAL_MS = 200;
+
+/** Final layout settle after the readiness gates, in ms. */
+export const LAYOUT_SETTLE_MS = 500;
 
 /** Poll interval for the verified zero-scroll guard, in ms (amendment A1 R3). */
 export const CONFIRM_TOP_INTERVAL_MS = 50;
@@ -315,4 +336,216 @@ export async function autoScrollWithReset(
     ...outcome,
     operations,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Post-scroll page readiness (fonts, network settle, lazy images)
+// ---------------------------------------------------------------------------
+
+/** Outcome of the bounded post-scroll readiness pipeline. */
+export interface PageReadiness {
+  /** True when `document.fonts.ready` resolved within its cap. */
+  fontsReady: boolean;
+  /** True when the page reached networkidle within its cap. */
+  networkSettled: boolean;
+  /** True when every sourced `<img>` completed with real pixels. */
+  imagesReady: boolean;
+  /** Name of the step that hit its time cap ('fonts' | 'network' | 'images' | 'budget'). */
+  cappedAt?: string;
+}
+
+/** Minimal page surface the readiness pipeline needs (Playwright Page fits). */
+export interface ReadinessPage {
+  evaluate<A, R>(fn: (arg: A) => R | Promise<R>, arg: A): Promise<R>;
+  waitForTimeout(ms: number): Promise<void>;
+  /** Absent only on test fakes: network settle then cannot be verified. */
+  waitForLoadState?(state?: string, options?: { timeout?: number }): Promise<unknown>;
+}
+
+/** Configurable bounds for the readiness pipeline (tests inject tiny caps). */
+export interface PageReadinessOptions {
+  /** Overall budget in ms. Defaults to POST_SCROLL_READINESS_TIMEOUT_MS. */
+  timeoutMs?: number;
+  /** Per-step caps override (tests keep the guards fast). */
+  stepCaps?: {
+    fontsMs?: number;
+    networkMs?: number;
+    imagesMs?: number;
+    settleMs?: number;
+  };
+}
+
+/** In-page probe: true once `document.fonts.ready` has resolved. */
+async function fontsReadyInPage(): Promise<boolean> {
+  try {
+    await document.fonts.ready;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** In-page probe: true when every sourced <img> is complete with pixels. */
+function imagesSettledInPage(): boolean {
+  for (const img of Array.from(document.querySelectorAll('img'))) {
+    const sourced =
+      img.getAttribute('src') !== null || img.getAttribute('srcset') !== null;
+    if (!sourced) continue;
+    if (!img.complete) return false;
+    if (img.naturalWidth <= 0) return false;
+  }
+  return true;
+}
+
+/** Resolves with the promise's value, or null when `ms` elapses first. */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise<T | null>((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(null);
+      },
+    );
+  });
+}
+
+/** Polls the in-page image probe until all images settle or the cap hits. */
+async function pollImagesReady(page: ReadinessPage, budgetMs: number): Promise<boolean> {
+  const maxPolls = Math.max(1, Math.ceil(budgetMs / IMAGE_POLL_INTERVAL_MS) + 1);
+  for (let poll = 0; poll < maxPolls; poll += 1) {
+    let ready = false;
+    try {
+      ready = (await page.evaluate(imagesSettledInPage, null)) === true;
+    } catch {
+      ready = false;
+    }
+    if (ready) return true;
+    if (poll < maxPolls - 1) {
+      try {
+        await page.waitForTimeout(
+          Math.max(0, Math.min(IMAGE_POLL_INTERVAL_MS, budgetMs - poll * IMAGE_POLL_INTERVAL_MS)),
+        );
+      } catch {
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Bounded post-scroll readiness pipeline, run after the hardened scroll
+ * reset and immediately before any capture: fonts ready (3s cap) ->
+ * networkidle (5s cap, wrapped so persistent connections can never hang
+ * the crawl) -> lazy-image completion poll (200ms interval, 3s cap) ->
+ * a final layout settle (500ms). The whole pipeline is bounded by
+ * POST_SCROLL_READINESS_TIMEOUT_MS (8s) by default. Never throws: each
+ * step records its own outcome and `cappedAt` names the first step that
+ * ran out of budget ('fonts' | 'network' | 'images' | 'budget').
+ */
+export async function waitForPageReadiness(
+  page: ReadinessPage,
+  options: PageReadinessOptions = {},
+): Promise<PageReadiness> {
+  const readiness: PageReadiness = {
+    fontsReady: false,
+    networkSettled: false,
+    imagesReady: false,
+  };
+  let cappedAt: string | undefined;
+  const markCap = (step: string): void => {
+    if (cappedAt === undefined) cappedAt = step;
+  };
+
+  try {
+    const caps = {
+      fontsMs: options.stepCaps?.fontsMs ?? FONTS_READY_TIMEOUT_MS,
+      networkMs: options.stepCaps?.networkMs ?? NETWORK_IDLE_TIMEOUT_MS,
+      imagesMs: options.stepCaps?.imagesMs ?? IMAGES_READY_TIMEOUT_MS,
+      settleMs: options.stepCaps?.settleMs ?? LAYOUT_SETTLE_MS,
+    };
+    const budgetMs = options.timeoutMs ?? POST_SCROLL_READINESS_TIMEOUT_MS;
+    const startedAt = Date.now();
+    const remainingMs = (): number => budgetMs - (Date.now() - startedAt);
+
+    // Step 1: fonts (bounded).
+    const fontsWindow = Math.min(caps.fontsMs, remainingMs());
+    if (fontsWindow <= 0) {
+      markCap('budget');
+    } else {
+      const fonts = await withTimeout(page.evaluate(fontsReadyInPage, null), fontsWindow);
+      readiness.fontsReady = fonts === true;
+      if (fonts !== true) markCap(fontsWindow < caps.fontsMs ? 'budget' : 'fonts');
+    }
+
+    // Step 2: network settle (bounded; networkidle must never hang).
+    const networkWindow = Math.min(caps.networkMs, remainingMs());
+    if (networkWindow <= 0) {
+      markCap('budget');
+    } else if (typeof page.waitForLoadState !== 'function') {
+      readiness.networkSettled = false;
+      markCap('network');
+    } else {
+      const settled = await withTimeout(
+        (async () => {
+          try {
+            await page.waitForLoadState?.('networkidle', { timeout: networkWindow });
+            return true;
+          } catch {
+            return false;
+          }
+        })(),
+        networkWindow,
+      );
+      readiness.networkSettled = settled === true;
+      if (settled !== true) markCap(networkWindow < caps.networkMs ? 'budget' : 'network');
+    }
+
+    // Step 3: lazy-image completion poll (bounded).
+    const imagesWindow = Math.min(caps.imagesMs, remainingMs());
+    if (imagesWindow <= 0) {
+      markCap('budget');
+    } else {
+      readiness.imagesReady = await pollImagesReady(page, imagesWindow);
+      if (!readiness.imagesReady) {
+        markCap(imagesWindow < caps.imagesMs ? 'budget' : 'images');
+      }
+    }
+
+    // Step 4: final layout settle (bounded).
+    const settleWindow = Math.min(caps.settleMs, remainingMs());
+    if (settleWindow > 0) {
+      try {
+        await page.waitForTimeout(settleWindow);
+      } catch {
+        // Page tore down mid-settle — readiness flags already recorded.
+      }
+    }
+  } catch {
+    // Never throws: unexpected failures leave the recorded flags as-is.
+  }
+
+  return cappedAt === undefined ? readiness : { ...readiness, cappedAt };
+}
+
+/**
+ * Consumer-facing diagnostic when the readiness pipeline could not confirm
+ * a fully settled page (mirror of scrollResetDiagnostic). Returns null when
+ * every gate passed.
+ */
+export function readinessDiagnostic(readiness: PageReadiness): string | null {
+  if (readiness.fontsReady && readiness.networkSettled && readiness.imagesReady) {
+    return null;
+  }
+  const gaps: string[] = [];
+  if (!readiness.fontsReady) gaps.push('fonts');
+  if (!readiness.networkSettled) gaps.push('network idle');
+  if (!readiness.imagesReady) gaps.push('images');
+  const cap = readiness.cappedAt !== undefined ? ` (capped at: ${readiness.cappedAt})` : '';
+  return `post-scroll readiness incomplete: ${gaps.join(', ')}${cap}; capture proceeded`;
 }

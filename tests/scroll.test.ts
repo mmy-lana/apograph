@@ -17,8 +17,14 @@ import {
   autoScrollWithReset,
   planConfirmTop,
   scrollResetDiagnostic,
+  waitForPageReadiness,
+  readinessDiagnostic,
   MAX_SCROLL_STEPS,
   SETTLE_DELAY_MS,
+  LAYOUT_SETTLE_MS,
+  IMAGE_POLL_INTERVAL_MS,
+  SCROLL_TIMEOUT_MS,
+  POST_SCROLL_READINESS_TIMEOUT_MS,
 } from '../dist/crawler/scroll.js';
 import type { ScrollTickResult } from '../dist/crawler/scroll.js';
 import { compareScreenshots } from '../dist/verifier/engine.js';
@@ -296,6 +302,211 @@ test('scroll > recrawlRoute adopts full-page captures and the same ordering', as
   const screenshotIdx = gateText.indexOf("page.screenshot({ path: desktopPath, type: 'png', fullPage: true })");
   assert.ok(scrollIdx > -1 && screenshotIdx > -1);
   assert.ok(scrollIdx < screenshotIdx, 'auto-scroll must precede re-capture screenshots');
+});
+
+// ---------------------------------------------------------------------------
+// Post-scroll readiness (fonts, network settle, lazy images)
+// ---------------------------------------------------------------------------
+
+interface ReadinessCall {
+  kind: 'fonts' | 'images' | 'network' | 'settle';
+  ms?: number;
+}
+
+interface ReadinessBehavior {
+  fonts?: 'ok' | 'hang' | 'fail';
+  network?: 'ok' | 'hang' | 'reject' | 'absent';
+  /** Per-poll image results; the last value repeats when polls overrun. */
+  images?: boolean[];
+}
+
+/** Fake readiness page: dispatches evaluate calls by in-page source markers. */
+function makeReadinessPage(behavior: ReadinessBehavior): {
+  page: Parameters<typeof waitForPageReadiness>[0];
+  calls: ReadinessCall[];
+} {
+  const calls: ReadinessCall[] = [];
+
+  const page: Record<string, unknown> = {
+    evaluate: async (fn: unknown, _arg: unknown): Promise<unknown> => {
+      const source = String(fn);
+      if (source.includes('document.fonts')) {
+        calls.push({ kind: 'fonts' });
+        if (behavior.fonts === 'hang') return new Promise(() => {});
+        return behavior.fonts !== 'fail';
+      }
+      if (source.includes('naturalWidth')) {
+        calls.push({ kind: 'images' });
+        const results = behavior.images ?? [true];
+        const poll = calls.filter((call) => call.kind === 'images').length - 1;
+        return results[Math.min(poll, results.length - 1)] ?? true;
+      }
+      throw new Error(`unexpected evaluate: ${source.slice(0, 60)}`);
+    },
+    waitForTimeout: async (ms: number): Promise<void> => {
+      calls.push({ kind: 'settle', ms });
+    },
+  };
+
+  if (behavior.network !== 'absent') {
+    page.waitForLoadState = async (_state?: string, _options?: { timeout?: number }): Promise<void> => {
+      calls.push({ kind: 'network' });
+      if (behavior.network === 'hang') return new Promise<void>(() => {});
+      if (behavior.network === 'reject') throw new Error('Timeout 5000ms exceeded');
+    };
+  }
+
+  return {
+    page: page as unknown as Parameters<typeof waitForPageReadiness>[0],
+    calls,
+  };
+}
+
+/** Tiny caps so timeout-guard tests stay fast. */
+const FAST_CAPS = { fontsMs: 25, networkMs: 25, imagesMs: 100, settleMs: 5 };
+
+test('readiness > budgets match the spec caps', () => {
+  assert.equal(SCROLL_TIMEOUT_MS, 20000);
+  assert.equal(POST_SCROLL_READINESS_TIMEOUT_MS, 8000);
+  assert.equal(LAYOUT_SETTLE_MS, 500);
+  assert.equal(IMAGE_POLL_INTERVAL_MS, 200);
+});
+
+test('readiness > step ordering: fonts, network, images poll, layout settle', async () => {
+  const { page, calls } = makeReadinessPage({ fonts: 'ok', network: 'ok', images: [true] });
+  const readiness = await waitForPageReadiness(page, {
+    stepCaps: { fontsMs: 200, networkMs: 200, imagesMs: 200, settleMs: 10 },
+  });
+
+  assert.equal(readiness.fontsReady, true);
+  assert.equal(readiness.networkSettled, true);
+  assert.equal(readiness.imagesReady, true);
+  assert.equal(readiness.cappedAt, undefined);
+  assert.equal(readinessDiagnostic(readiness), null);
+
+  const fontsIdx = calls.findIndex((call) => call.kind === 'fonts');
+  const networkIdx = calls.findIndex((call) => call.kind === 'network');
+  const imagesIdx = calls.findIndex((call) => call.kind === 'images');
+  const settleIdx = calls.findIndex((call) => call.kind === 'settle' && call.ms === 10);
+  assert.ok(fontsIdx > -1, 'fonts wait must run');
+  assert.ok(networkIdx > fontsIdx, 'network settle must follow the fonts wait');
+  assert.ok(imagesIdx > networkIdx, 'the image poll must follow the network settle');
+  assert.ok(settleIdx > imagesIdx, 'the final layout settle must close the sequence');
+});
+
+test('readiness > fonts wait is bounded and records cappedAt fonts', async () => {
+  const { page } = makeReadinessPage({ fonts: 'hang', network: 'ok', images: [true] });
+  const startedAt = Date.now();
+  const readiness = await waitForPageReadiness(page, { stepCaps: FAST_CAPS });
+
+  assert.equal(readiness.fontsReady, false);
+  assert.equal(readiness.cappedAt, 'fonts');
+  assert.ok(Date.now() - startedAt < 2000, 'the fonts guard must not hang');
+  assert.notEqual(readinessDiagnostic(readiness), null);
+});
+
+test('readiness > persistent connections cannot hang the pipeline', async () => {
+  const { page } = makeReadinessPage({ fonts: 'ok', network: 'hang', images: [true] });
+  const startedAt = Date.now();
+  const readiness = await waitForPageReadiness(page, { stepCaps: FAST_CAPS });
+
+  assert.equal(readiness.networkSettled, false);
+  assert.equal(readiness.cappedAt, 'network');
+  assert.ok(Date.now() - startedAt < 2000, 'networkidle must be wrapped in a bounded guard');
+
+  // A rejected networkidle settle (timeout) degrades the same way.
+  const rejected = makeReadinessPage({ fonts: 'ok', network: 'reject', images: [true] });
+  const after = await waitForPageReadiness(rejected.page, { stepCaps: FAST_CAPS });
+  assert.equal(after.networkSettled, false);
+  assert.equal(after.cappedAt, 'network');
+});
+
+test('readiness > image poll retries at 200ms intervals until settled', async () => {
+  const { page, calls } = makeReadinessPage({
+    fonts: 'ok',
+    network: 'ok',
+    images: [false, false, true],
+  });
+  const readiness = await waitForPageReadiness(page, {
+    stepCaps: { fontsMs: 200, networkMs: 200, imagesMs: 2000, settleMs: 5 },
+  });
+
+  assert.equal(readiness.imagesReady, true);
+  assert.equal(readiness.cappedAt, undefined);
+  assert.equal(calls.filter((call) => call.kind === 'images').length, 3);
+  const intervals = calls.filter(
+    (call) => call.kind === 'settle' && call.ms === IMAGE_POLL_INTERVAL_MS,
+  );
+  assert.equal(intervals.length, 2, 'two 200ms interval waits between three polls');
+});
+
+test('readiness > image poll is bounded by its cap', async () => {
+  const { page } = makeReadinessPage({ fonts: 'ok', network: 'ok', images: [false] });
+  const startedAt = Date.now();
+  const readiness = await waitForPageReadiness(page, { stepCaps: FAST_CAPS });
+
+  assert.equal(readiness.imagesReady, false);
+  assert.equal(readiness.cappedAt, 'images');
+  assert.ok(Date.now() - startedAt < 2000, 'the image poll must terminate');
+});
+
+test('readiness > overall budget bounds the total added time', async () => {
+  const { page } = makeReadinessPage({ fonts: 'hang', network: 'ok', images: [true] });
+  const startedAt = Date.now();
+  const readiness = await waitForPageReadiness(page, {
+    timeoutMs: 60,
+    stepCaps: { fontsMs: 10000, networkMs: 10000, imagesMs: 10000, settleMs: 5000 },
+  });
+
+  assert.equal(readiness.fontsReady, false);
+  assert.equal(readiness.cappedAt, 'budget', 'the overall budget is what capped the fonts step');
+  assert.ok(Date.now() - startedAt < 2000);
+  assert.notEqual(readinessDiagnostic(readiness), null);
+});
+
+test('readiness > readinessDiagnostic names gaps and stays null when ready', () => {
+  assert.equal(
+    readinessDiagnostic({ fontsReady: true, networkSettled: true, imagesReady: true }),
+    null,
+  );
+  const note = readinessDiagnostic({
+    fontsReady: false,
+    networkSettled: true,
+    imagesReady: false,
+    cappedAt: 'fonts',
+  });
+  assert.ok(note !== null);
+  assert.match(note, /fonts/);
+  assert.match(note, /images/);
+  assert.ok(!note.includes('network idle'));
+});
+
+test('readiness > in-page readiness probes are lexically self-contained', async () => {
+  const scrollText = await readFile(join(SRC_ROOT, 'src', 'crawler', 'scroll.ts'), 'utf8');
+  assertSelfContained(scrollText, 'fontsReadyInPage');
+  assertSelfContained(scrollText, 'imagesSettledInPage');
+});
+
+test('readiness > engine and recrawlRoute gate readiness before captures', async () => {
+  const engineText = await readFile(join(SRC_ROOT, 'src', 'crawler', 'engine.ts'), 'utf8');
+  const scrollIdx = engineText.indexOf('await autoScrollWithReset(page)');
+  const readinessIdx = engineText.indexOf('await waitForPageReadiness(page)');
+  const screenshotIdx = engineText.indexOf(
+    "page.screenshot({ path: desktopScreenshot as string, type: 'png', fullPage: true })",
+  );
+  assert.ok(scrollIdx > -1 && readinessIdx > -1 && screenshotIdx > -1);
+  assert.ok(readinessIdx > scrollIdx, 'readiness must follow the scroll reset');
+  assert.ok(readinessIdx < screenshotIdx, 'readiness must precede screenshots');
+
+  const gateText = await readFile(join(SRC_ROOT, 'src', 'plan', 'evidenceGate.ts'), 'utf8');
+  const gateScrollIdx = gateText.indexOf('await autoScrollWithReset(page)');
+  const gateReadinessIdx = gateText.indexOf('await waitForPageReadiness(page)');
+  const gateShotIdx = gateText.indexOf(
+    "page.screenshot({ path: desktopPath, type: 'png', fullPage: true })",
+  );
+  assert.ok(gateScrollIdx > -1 && gateReadinessIdx > -1 && gateShotIdx > -1);
+  assert.ok(gateReadinessIdx > gateScrollIdx, 're-crawl readiness must follow the scroll reset');
+  assert.ok(gateReadinessIdx < gateShotIdx, 're-crawl readiness must precede screenshots');
 });
 
 // ---------------------------------------------------------------------------

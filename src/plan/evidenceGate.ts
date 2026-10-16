@@ -23,7 +23,12 @@ import * as p from '@clack/prompts';
 import type { A11yNode, CrawlRoute, EvidenceManifest } from '../types.js';
 import { checkCaptureHealth } from '../crawler/health.js';
 import type { CaptureHealth } from '../crawler/health.js';
-import { autoScrollWithReset, scrollResetDiagnostic } from '../crawler/scroll.js';
+import {
+  autoScrollWithReset,
+  readinessDiagnostic,
+  scrollResetDiagnostic,
+  waitForPageReadiness,
+} from '../crawler/scroll.js';
 import { captureDOMSnapshot } from '../harvester/dom.js';
 import { launchHeadlessChromium } from '../crawler/engine.js';
 
@@ -504,6 +509,13 @@ export async function recrawlRoute(
       console.warn(
         `[apograph] re-crawl ${route.path}: ${scrollResetDiagnostic(scroll)}`,
       );
+    }
+
+    // Post-scroll readiness (fonts, network settle, lazy images) before any
+    // capture; incomplete readiness is a diagnostic, never an error.
+    const readinessNote = readinessDiagnostic(await waitForPageReadiness(page));
+    if (readinessNote !== null) {
+      console.warn(`[apograph] re-crawl ${route.path}: ${readinessNote}`);
     }
 
     // Full-page captures for both viewports (patch spec s3.2).
