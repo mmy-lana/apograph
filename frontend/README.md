@@ -1,0 +1,1 @@
+This is the documentation site for apograph-agents. It is a static site with no build step. To deploy: point Cloudflare Pages or GitHub Pages at this folder. To preview locally: open frontend/index.html in a browser.

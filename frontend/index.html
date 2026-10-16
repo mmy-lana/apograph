@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Apograph — a frontend cloning engine for coding agents. Crawl any public website and get a deployable React project.">
+  <title>Apograph — Frontend Cloning Engine</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <header class="hero">
+    <div class="container">
+      <h1>Apograph — Frontend Cloning Engine</h1>
+      <p class="subtitle">Crawl any public website. Get a deployable React project. Expect 70–85% fidelity and a few hours of polishing.</p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="https://github.com/mmy-lana/apograph" rel="noopener">View on GitHub</a>
+        <button class="btn btn-secondary" id="install-btn" type="button" aria-expanded="false">Install via npm</button>
+      </div>
+      <pre class="install-cmd hidden" id="install-cmd" aria-hidden="true"><code>npx apograph-agents clone &lt;url&gt;</code></pre>
+    </div>
+  </header>
+
+  <main>
+    <section class="section" id="how-it-works">
+      <div class="container">
+        <h2>How it works</h2>
+        <div class="steps">
+          <article class="step-card">
+            <span class="step-number" aria-hidden="true">1</span>
+            <h3>Crawl</h3>
+            <p>Headless Chromium captures screenshots, accessibility trees, and design tokens from every page</p>
+          </article>
+          <article class="step-card">
+            <span class="step-number" aria-hidden="true">2</span>
+            <h3>Plan</h3>
+            <p>A schema-validated plan is generated. You review and approve it before anything is synthesized.</p>
+          </article>
+          <article class="step-card">
+            <span class="step-number" aria-hidden="true">3</span>
+            <h3>Synthesize</h3>
+            <p>A vision LLM writes React 19 + Tailwind CSS components from the evidence</p>
+          </article>
+          <article class="step-card">
+            <span class="step-number" aria-hidden="true">4</span>
+            <h3>Verify</h3>
+            <p>3-tier verification: TypeScript build, route smoke test, and pixel-diff against the original screenshots</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-alt" id="fidelity">
+      <div class="container">
+        <h2>What to expect</h2>
+        <div class="fidelity">
+          <div class="fidelity-row">
+            <span class="fidelity-label">Page structure &amp; layout</span>
+            <span class="fidelity-bar-track"><span class="fidelity-bar bar-green" data-width="90"></span></span>
+            <span class="fidelity-value">90%</span>
+          </div>
+          <div class="fidelity-row">
+            <span class="fidelity-label">Color system &amp; palette</span>
+            <span class="fidelity-bar-track"><span class="fidelity-bar bar-green" data-width="92"></span></span>
+            <span class="fidelity-value">92%</span>
+          </div>
+          <div class="fidelity-row">
+            <span class="fidelity-label">Typography</span>
+            <span class="fidelity-bar-track"><span class="fidelity-bar bar-green" data-width="85"></span></span>
+            <span class="fidelity-value">85%</span>
+          </div>
+          <div class="fidelity-row">
+            <span class="fidelity-label">Navigation</span>
+            <span class="fidelity-bar-track"><span class="fidelity-bar bar-yellowgreen" data-width="80"></span></span>
+            <span class="fidelity-value">80%</span>
+          </div>
+          <div class="fidelity-row">
+            <span class="fidelity-label">Static content</span>
+            <span class="fidelity-bar-track"><span class="fidelity-bar bar-yellow" data-width="75"></span></span>
+            <span class="fidelity-value">75%</span>
+          </div>
+          <div class="fidelity-row">
+            <span class="fidelity-label">CSS animations</span>
+            <span class="fidelity-bar-track"><span class="fidelity-bar bar-orange" data-width="35"></span></span>
+            <span class="fidelity-value">35%</span>
+          </div>
+          <div class="fidelity-row">
+            <span class="fidelity-label">JS-driven interactions</span>
+            <span class="fidelity-bar-track"><span class="fidelity-bar bar-orange" data-width="45"></span></span>
+            <span class="fidelity-value">45%</span>
+          </div>
+          <div class="fidelity-row">
+            <span class="fidelity-label">Authenticated flows</span>
+            <span class="fidelity-bar-track"><span class="fidelity-bar bar-red" data-width="0"></span></span>
+            <span class="fidelity-value fidelity-notsupported">Not supported</span>
+          </div>
+        </div>
+        <aside class="callout">
+          <p>These are realistic averages on typical company and portfolio sites. Animation-heavy sites, heavily JavaScript-driven SPAs, and sites behind authentication will need significantly more manual work.</p>
+        </aside>
+      </div>
+    </section>
+
+    <section class="section" id="quick-start">
+      <div class="container">
+        <h2>Quick start</h2>
+        <ol class="quickstart">
+          <li>
+            <h3>1. Install</h3>
+            <pre class="codeblock"><code>npm i -g apograph-agents</code></pre>
+          </li>
+          <li>
+            <h3>2. Clone a site</h3>
+            <pre class="codeblock"><code>apograph clone https://yoursite.com</code></pre>
+          </li>
+          <li>
+            <h3>3. Boot the result</h3>
+            <pre class="codeblock"><code>cd output/yoursite-com &amp;&amp; pnpm install &amp;&amp; pnpm dev</code></pre>
+          </li>
+        </ol>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      <p>MIT License · Built with Playwright, Vercel AI SDK, and React 19 · Not affiliated with any cloned site</p>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
