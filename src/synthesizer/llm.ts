@@ -30,6 +30,21 @@ const GeneratedProjectSchema = z.object({
 /** The parsed payload of {@link GeneratedProjectSchema}. */
 type GeneratedProject = z.infer<typeof GeneratedProjectSchema>;
 
+/**
+ * Hard upper bound for one model request. The previous implementation had no
+ * abort signal, so a stalled gateway could hold a paid request indefinitely.
+ * Override for slower local models, but keep the bound finite.
+ */
+const DEFAULT_LLM_TIMEOUT_MS = 10 * 60 * 1000;
+
+function llmTimeoutSignal(): AbortSignal {
+  const configured = Number.parseInt(process.env.APOGRAPH_LLM_TIMEOUT_MS ?? '', 10);
+  const timeout = Number.isFinite(configured) && configured > 0
+    ? Math.min(configured, 30 * 60 * 1000)
+    : DEFAULT_LLM_TIMEOUT_MS;
+  return AbortSignal.timeout(timeout);
+}
+
 /** One prompt part: text or an image (base64 data URL). */
 export type PromptPart = TextPart | ImagePart;
 
@@ -131,6 +146,8 @@ export async function generateStructuredFilesFromParts(
       model,
       schema: GeneratedProjectSchema,
       schemaName: 'project_files',
+      maxRetries: 0,
+      abortSignal: llmTimeoutSignal(),
       ...(systemPrompt !== undefined ? { system: systemPrompt } : {}),
       messages: [{ role: 'user', content: parts }],
     });
@@ -146,6 +163,8 @@ export async function generateStructuredFilesFromParts(
 
     const textResult = await generateText({
       model,
+      maxRetries: 0,
+      abortSignal: llmTimeoutSignal(),
       ...(systemPrompt !== undefined ? { system: systemPrompt } : {}),
       messages: [
         {
@@ -208,6 +227,8 @@ export async function repairCodeFile(
 
   const result = await generateText({
     model,
+    maxRetries: 0,
+    abortSignal: llmTimeoutSignal(),
     system:
       'You are a code repair agent. You receive one source file and a list of ' +
       'compiler or linter errors. Respond with ONLY the corrected raw file ' +

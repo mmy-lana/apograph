@@ -715,13 +715,13 @@ async function runVisionStage(
       throw new Error('model returned no files or all files had empty content');
     }
     result.visionStages.push(stage);
-    progress?.stop('Done');
+    progress?.stop(`${label} — done`);
     return files;
   } catch (cause) {
     const reason = cause instanceof Error ? cause.message : String(cause);
     console.warn(`[apograph] ${stage}: vision synthesis unavailable (${reason}); using deterministic template.`);
     result.fallbackStages.push(stage);
-    progress?.stop('Fallback');
+    progress?.stop(`${label} — fallback`);
     return fallback();
   }
 }

@@ -89,11 +89,27 @@ function mapA11yNode(
 
   visited.add(node.nodeId);
 
-  for (const childId of node.childIds ?? []) {
-    if (visited.has(childId)) continue;
-    const child = byId.get(childId);
-    if (!child || child.ignored) continue;
+  /**
+   * Ignored AX nodes are often presentational/container nodes. They should
+   * not become output nodes, but their descendants can still contain the
+   * visible semantic tree. Flatten them instead of dropping the subtree.
+   */
+  const appendChild = (child: CdpA11yNode): void => {
+    if (visited.has(child.nodeId)) return;
+    if (child.ignored) {
+      visited.add(child.nodeId);
+      for (const descendantId of child.childIds ?? []) {
+        const descendant = byId.get(descendantId);
+        if (descendant !== undefined) appendChild(descendant);
+      }
+      return;
+    }
     mapped.children?.push(mapA11yNode(child, byId, visited));
+  };
+
+  for (const childId of node.childIds ?? []) {
+    const child = byId.get(childId);
+    if (child !== undefined) appendChild(child);
   }
 
   return mapped;
