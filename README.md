@@ -57,7 +57,9 @@ Vision LLM produces React 19 + Tailwind CSS components
 
 PHASE 4 — VERIFICATION
 3-tier check: build → route smoke → pixel diff
-→ Diff report shows where cloning succeeded and where it needs work
+→ Bounded visual repair can keep improvements and revert regressions
+→ Optional live original-vs-clone comparison can retry once
+→ Reports show where cloning succeeded and where it needs work
 
 
 ## CLI Reference
@@ -69,13 +71,44 @@ PHASE 4 — VERIFICATION
 | `apograph clone <url>` | Full pipeline |
 | `apograph resume [dir]` | Resume interrupted clone |
 | `apograph synthesize <dir>` | Synthesize from approved plan |
-| `apograph verify <dir>` | 3-tier verification |
+| `apograph verify <dir>` | 3-tier verification; use `--no-repair` or `--max-repair-turns <n>` to control bounded visual repair |
 | `apograph clone-verify <url> <dir>` | Compare clone against live original site |
 | `apograph status` | Show generated projects |
 | `apograph config` | Configure LLM provider |
 | `apograph doctor` | Environment health check |
 | `apograph mcp` | Start MCP server for coding agents |
 | `apograph setup` | Install into your coding agent |
+
+## Live comparison and repair workflow
+
+For a small, controlled clone run with a final live comparison:
+
+```bash
+npx apograph-agents clone https://example.com/ \
+  --max-depth 1 \
+  --max-pages 3 \
+  --viewport desktop \
+  --live-verify \
+  --live-threshold 70 \
+  --live-retry
+```
+
+The crawl limit is an upper bound; the site may expose fewer than three healthy routes. The normal verifier compares against stable screenshots captured during the crawl. The live gate separately compares the running output against a fresh capture of the original URL. With `--live-retry`, it performs no more than one additional live comparison.
+
+When a route fails visual verification, apograph may ask the configured vision model for a localized repair. Repair is bounded and conservative: a candidate is retained only if its score improves and it does not regress the compared route viewports. Failed or non-improving repairs are reverted. The repair loop does not guarantee a perfect clone and does not automatically delete output or start a new clone.
+
+## Realistic fidelity expectations
+
+Apograph is a reconstruction accelerator, not a guarantee of pixel-perfect reproduction. A successful build and HTTP route check only prove that the generated project runs. Visual similarity is affected by image availability, image crops, font rendering, browser timing, animations, dynamic content, responsive breakpoints, and the quality of the selected model.
+
+Use per-route live similarity as the practical acceptance signal:
+
+- **70%+**: useful recognizable clone for the tested viewport.
+- **80–90%+**: strong result, but still inspect assets, typography, and responsive behavior.
+- **Below 70%**: treat the route as requiring targeted repair; do not hide the result by only raising the threshold.
+- **100%**: generally unrealistic for dynamic or photographic production sites without identical assets and runtime state.
+
+The project may produce a good result on one route and a poor result on another. Always inspect `verification-report.json`, `clone-verify-report.json`, diff images, and the generated screenshots before calling a clone finished.
 
 ## LLM Configuration
 

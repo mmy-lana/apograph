@@ -32,9 +32,17 @@ The immediate focus is eliminating the failure modes surfaced by the dark-canvas
 - Dynamic terminal progress reporting: replace the hardcoded `via local model` spinner with `${provider} (${modelId})` resolved from the active model route.
 - Non-destructive `apograph config` prompts with presets for custom OpenAI-compatible gateways.
 
-### 5. Closed-Loop Visual Diff Repair
+### 5. Closed-Loop Visual Diff Repair — shipped
 - Connect the tier-3 pixelmatch verifier directly back into the vision synthesis engine.
-- Single-turn repair pass: when a generated route exceeds the visual threshold, pass the diff overlay image and the failing component back to the model with localized correction prompts, instead of re-synthesizing from scratch.
+- Bounded route-local repair turns target the worst current viewport with localized correction prompts.
+- Keep/revert protection retains only measurable improvements and restores regressions, failed builds, and no-progress candidates.
+- `verify` exposes `--no-repair` and `--max-repair-turns <n>` controls.
+
+### 6. Live Original Comparison — shipped
+- `clone-verify` compares the running clone against fresh screenshots from the live original URL and reports per-route pixel similarity, fonts, colors, and missing animation names.
+- `clone` can run a final live gate with `--live-verify`, `--live-threshold <percent>`, and an optional single `--live-retry`.
+- First and second live attempts are preserved separately; failed live verification never triggers destructive recloning automatically.
+- The live gate is a measurement and bounded retry mechanism, not a promise of perfect cloning.
 
 ---
 
@@ -75,7 +83,7 @@ Deep interactivity and autonomy work, deferred until the Now horizon holds a ver
 ### 4. Complete MCP Autonomous Ecosystem
 - Maintain full parity between the CLI engine and the MCP server.
 - Expose inspection, planning, synthesis, verification, and repair capabilities as structured tools for AI coding agents (Cursor, Claude Code, Windsurf, OpenCode).
-- Extend the multi-pass visual convergence budget beyond the single-turn repair of the Now horizon toward a configurable autonomous loop.
+- Extend the bounded route-local repair budget toward a configurable, explicitly authorized autonomous loop with full cross-route regression checks.
 
 ---
 
@@ -86,5 +94,5 @@ Legacy semver-numbered milestones are retained for traceability only:
 - **v0.1.0 — Core Recreation Engine** (shipped): headless Chromium crawling, subpath scoping, schema-validated plan gate, multi-stage multimodal prompting, React 19.3 + Vite + React Router v7 + Tailwind CSS v4 output, 3-tier verification, local Ollama vision execution, process controls.
 - **v0.2.0 — Framework Flexibility & Environmental Resilience** (shipped as package version; its visual-fidelity scope moved into **Now**; multi-stack and challenge pass-through moved into **Next**).
 - **v0.3.0 — Authenticated Sessions & Stateful Dashboards** (absorbed into **Later**).
-- **v0.4.0 — Autonomous Visual Convergence** (closed-loop repair moved up into **Now**; multi-breakpoint alignment into **Next**).
+- **v0.4.0 — Autonomous Visual Convergence** (bounded keep/revert repair and optional one-retry live comparison moved into **Now**; unbounded autonomy remains **Later**; multi-breakpoint alignment remains **Next**).
 - **v1.0.0 — Autonomous Agent Ecosystem** (absorbed into **Later**).

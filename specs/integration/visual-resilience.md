@@ -2,7 +2,7 @@
 
 - **Spec ID:** `integration/visual-resilience`
 - **Project:** apograph-agents
-- **Status:** Draft — Now horizon
+- **Status:** Implemented with bounded repair and live verification follow-up
 - **Supersedes:** visual-repair scope formerly deferred to roadmap milestone v0.4.0
 - **Related:** `ROADMAP.md` (Now: Visual Fidelity & Capture Resilience), `specs/integration/spec.md`, `specs/integration/traceability.md`
 
@@ -32,14 +32,16 @@ A seventh, roadmap-level defect: `ROADMAP.md` listed `v0.1.0` as current and def
 - Canvas theme extraction and removal of hardcoded light-mode styling.
 - DOM text corpus harvesting.
 - Cloud vision presets with dynamic provider reporting.
-- Single-turn closed-loop visual diff repair.
+- Bounded closed-loop visual diff repair with keep/revert.
+- Optional live original-vs-clone comparison with one retry.
 
 ### 1.3 Out of Scope
 
 - Multi-breakpoint capture beyond existing desktop/mobile pairs (Next horizon).
 - Headed challenge pass-through, multi-stack targets (Next horizon).
 - Authenticated sessions, synthetic interaction discovery, MSW generation, full MCP autonomy (Later horizon).
-- Iterative multi-turn visual convergence budgets beyond the single-turn repair pass.
+- Unbounded autonomous convergence or repeated full reclones without explicit user authorization.
+- Full cross-route regression detection after every page-level repair; current repair verification is route-local.
 
 ---
 
@@ -208,12 +210,21 @@ type TextSpan = {
 
 ---
 
-## 7. Closed-Loop Visual Diff Repair (Single-Turn)
+## 7. Bounded Closed-Loop Visual Diff Repair
 
-- When tier-3 pixelmatch verification reports a route exceeding the visual threshold, the verifier output (diff overlay image + per-region mismatch metrics + the failing component's source path) is fed back to the synthesis model in a **single repair turn**.
-- The repair prompt is localized: it names the failing component file, embeds the original screenshot and the diff overlay side by side, and instructs a targeted correction (not a from-scratch re-synthesis of the route).
-- The repaired component re-enters verification. One repair pass per failing route per run; multi-turn convergence budgets remain in the Later horizon.
-- Repair pass outcomes are recorded in the verification report: routes repaired, threshold before/after, and unrepaired residuals — feeding future fidelity metrics.
+- When tier-3 pixelmatch verification reports a route exceeding the visual threshold, the verifier output (reference screenshot, diff overlay, mismatch metric, and failing component source) is fed back to the synthesis model.
+- The repair prompt is localized: it names the failing component file, embeds the reference screenshot and diff overlay, and requests a targeted correction rather than a from-scratch route rewrite.
+- Each route receives at most `maxRepairTurnsPerRoute` turns, defaulting to `2`; `--max-repair-turns 0` or `--no-repair` disables mutation.
+- A candidate is kept only when it improves at least one comparable viewport without increasing another. Equal, regressing, failed-build, or incomplete-verification candidates are reverted and rebuilt from the last accepted source.
+- Repair outcomes record before/after metrics. A repair record with a non-improving after value is residual evidence, not a success claim.
+
+## 7.1 Optional Live Original Comparison
+
+- The evidence verifier compares against stable screenshots captured during crawl. The separate live verifier compares the running clone against a fresh capture of the original URL.
+- `clone` may run the live gate with `--live-verify`, `--live-threshold <percent>` (default `70`), and `--live-retry`.
+- Live similarity is per route and uses pixel similarity, where `70` means approximately a 70% match. The gate passes only when every discovered route meets the threshold.
+- When enabled with retry, the live comparison is executed at most twice. Attempt reports are preserved as `clone-verify-attempt-1.json` and `clone-verify-attempt-2.json`; the final result is written to `clone-verify-report.json`.
+- A failed live gate does not automatically delete output or reclone. Destructive recloning requires explicit user authorization. Targeted repairs should be applied only to routes below threshold.
 
 ---
 
@@ -265,7 +276,9 @@ All tests use the built-in `node:test` runner, colocated with the module under t
 | `gate > selective re-crawl parses indices` | Selection input `2,5,7` and `2-5` parse to the correct route index sets; invalid indices are rejected. |
 | `progress > reports dynamic provider` | Given a model route `{ provider: 'z-ai', modelId: 'glm-5.3-flash' }`, the rendered progress line contains `via z-ai (glm-5.3-flash)`; the literal `via local model` appears nowhere in the output. |
 | `config > prompts are non-destructive` | `apograph config` with empty-input (defaults accepted) leaves unknown keys and existing values byte-identical; the GLM 5.3 Flash preset resolves to provider `z-ai`, model `glm-5.3-flash`. |
-| `repair > single-turn repair re-enters verification` | A failing route triggers exactly one repair turn whose prompt embeds the diff overlay and names the failing component; post-repair metrics are recorded. |
+| `repair > single-turn repair re-enters verification` | Compatibility fixture: a failing route can be repaired in one bounded turn; the prompt embeds the diff overlay and names the failing component; post-repair metrics are recorded. |
+| `repair > regression is reverted and accepted source is restored` | A worse candidate is rejected, the accepted source is restored, and the project is rebuilt. |
+| `repair > accepts an improvement and allows a bounded second turn` | An improving candidate is kept and a second route-local turn is allowed within the configured cap. |
 
 ### 8.6 Traceability Ledger
 
@@ -282,4 +295,6 @@ The Now horizon is complete when, re-running the dark-canvas SPA clone against t
 3. Gradient headline spans ("TECHNOLOGY & AI PARTNER", "BUSINESS") appear verbatim in the output, grounded in the DOM text corpus.
 4. The prompt payload carries a reduced palette (<= 24 colors), no `--color-apograph-N` enumeration.
 5. Terminal output reports `z-ai (glm-5.3-flash)` throughout.
-6. Failing routes receive exactly one localized pixelmatch-guided repair pass, with before/after metrics recorded.
+6. Failing routes receive bounded localized pixelmatch-guided repair turns, with keep/revert decisions and before/after metrics recorded.
+7. Optional live verification compares every discovered route against the current original URL, retries at most once when enabled, and never reclones destructively without explicit authorization.
+8. Fidelity remains an empirical outcome: a passing build or route smoke check does not imply a 70% visual match, and photographic assets, animations, dynamic content, and viewport differences may keep a route below threshold.
