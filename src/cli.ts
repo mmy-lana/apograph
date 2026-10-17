@@ -17,7 +17,7 @@
  */
 
 import { Command } from 'commander';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import * as p from '@clack/prompts';
@@ -245,6 +245,10 @@ interface ModularSynthesisOptions {
   interactive: boolean;
   verify: boolean;
   viewport: ViewportMode;
+  liveVerify?: boolean;
+  liveThreshold?: number;
+  liveRetry?: boolean;
+  targetUrl?: string;
   /** Exit 0 even when synthesis used fallback templates (`--allow-degraded`). */
   allowDegraded?: boolean;
   /** Route paths to skip because their page files already exist. */
@@ -363,6 +367,45 @@ async function runModularSynthesis(
     }
   }
 
+  if (options.liveVerify === true && options.targetUrl !== undefined) {
+    console.log('→ Running final live original-vs-clone comparison...');
+    const liveThreshold = options.liveThreshold ?? 70;
+    const firstLive = await runCloneVerify({
+      url: options.targetUrl,
+      outputDir: projectDir,
+      threshold: liveThreshold,
+      viewport: options.viewport,
+    });
+    await writeFile(
+      join(projectDir, 'clone-verify-attempt-1.json'),
+      JSON.stringify(firstLive, null, 2),
+      'utf8',
+    );
+    printCloneVerifyReport(firstLive);
+
+    let finalLive = firstLive;
+    if (options.liveRetry === true && firstLive.summary.passedRoutes !== firstLive.summary.totalRoutes) {
+      console.log('→ Live comparison below threshold; running one final retry...');
+      finalLive = await runCloneVerify({
+        url: options.targetUrl,
+        outputDir: projectDir,
+        threshold: liveThreshold,
+        viewport: options.viewport,
+      });
+      await writeFile(
+        join(projectDir, 'clone-verify-attempt-2.json'),
+        JSON.stringify(finalLive, null, 2),
+        'utf8',
+      );
+      printCloneVerifyReport(finalLive);
+    }
+    await writeCloneVerifyReport(projectDir, finalLive);
+    if (finalLive.summary.passedRoutes !== finalLive.summary.totalRoutes) {
+      console.warn('→ Live comparison remains below threshold on one or more routes.');
+      process.exitCode = 1;
+    }
+  }
+
   // Explicit run-status reporting (no silent fallback): recompute after the
   // backfill pass so template-only output is never presented as success.
   result.runStatus = computeRunStatus(result.stageOutcomes);
@@ -420,6 +463,12 @@ interface ClonePipelineOptions {
   interactive: boolean;
   /** Exit 0 even when synthesis used fallback templates (`--allow-degraded`). */
   allowDegraded?: boolean;
+  /** Run a final live original-vs-clone comparison. */
+  liveVerify?: boolean;
+  /** Minimum live pixel similarity per route. */
+  liveThreshold?: number;
+  /** Perform at most one evidence-based repair retry after live failure. */
+  liveRetry?: boolean;
   /** Checkpoint to resume from (skips crawl + approval gate). */
   resumeFrom?: CloneCheckpoint;
 }
@@ -571,6 +620,10 @@ async function runClonePipeline(options: ClonePipelineOptions): Promise<void> {
       interactive,
       verify,
       viewport,
+      liveVerify: options.liveVerify,
+      liveThreshold: options.liveThreshold,
+      liveRetry: options.liveRetry,
+      targetUrl: url,
       allowDegraded: allowDegraded === true,
       skipRoutePaths: (resumeFrom !== undefined ? false : force)
         ? []
@@ -614,6 +667,9 @@ interface CloneOptions {
   verify: boolean;
   model?: string;
   allowDegraded?: boolean;
+  liveVerify?: boolean;
+  liveThreshold: string;
+  liveRetry?: boolean;
 }
 
 /** Options for the `crawl` command. */
@@ -636,6 +692,8 @@ interface PlanCliOptions {
 interface VerifyCliOptions {
   threshold: string;
   viewport: string;
+  repair: boolean;
+  maxRepairTurns: string;
 }
 
 /** Options for the `clone-verify` command (commander passes numbers as strings). */
@@ -775,6 +833,9 @@ program
   .option('--no-verify', 'skip the 3-tier verification pass')
   .option('--model <id>', 'override the active model ID for this run')
   .option('--allow-degraded', 'exit 0 even when synthesis used fallback templates')
+   .option('--live-verify', 'run final live original-vs-clone comparison')
+   .option('--live-threshold <number>', 'minimum live pixel similarity per route', '70')
+   .option('--live-retry', 'retry live comparison once when routes fail')
   .action(async (url: string, options: CloneOptions) => {
     applyModelOverride(options.model);
     const viewport = parseViewportOption(options.viewport);
@@ -820,6 +881,9 @@ program
       verify: options.verify,
       interactive,
       allowDegraded: options.allowDegraded,
+      liveVerify: options.liveVerify,
+      liveThreshold: parseNumber(options.liveThreshold, 70),
+      liveRetry: options.liveRetry,
       resumeFrom,
     });
   });
@@ -901,6 +965,8 @@ program
   .argument('[evidenceDir]', 'evidence directory (defaults to .apograph/evidence)', DEFAULT_EVIDENCE_DIR)
   .option('--threshold <number>', 'visual mismatch threshold in percent', '15')
   .option('--viewport <mode>', 'viewports to compare: both, desktop, or mobile', 'both')
+  .option('--no-repair', 'disable visual repair mutations')
+  .option('--max-repair-turns <number>', 'maximum repair turns per route', '2')
   .action(async (outputDir: string, evidenceDir: string, options: VerifyCliOptions) => {
     const thresholdPercent = parseNumber(options.threshold, 15);
 
@@ -909,6 +975,8 @@ program
       evidenceDir,
       visualThreshold: thresholdPercent / 100,
       viewport: parseViewportOption(options.viewport),
+      repair: options.repair,
+      maxRepairTurnsPerRoute: parseNumber(options.maxRepairTurns, 2),
     });
 
     printVerificationSummary(report);

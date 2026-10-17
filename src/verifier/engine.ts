@@ -878,6 +878,8 @@ export interface VisualRepairPassOptions extends VisualRepairPassDeps {
   componentPathsByRoute: Map<string, string>;
   /** Generated project directory (components are read/written here). */
   outputDir: string;
+  /** Maximum accepted repair turns for each route (default: 2). */
+  maxRepairTurnsPerRoute?: number;
 }
 
 /** Encodes a PNG file into a base64 data URL, or null if unreadable. */
@@ -892,13 +894,12 @@ async function loadDataUrl(path: string): Promise<string | null> {
 }
 
 /**
- * Runs the single-turn closed-loop visual diff repair pass (spec s7):
- * for each route with failing visual comparisons, exactly one repair turn
- * is triggered — the worst failing viewport's diff overlay and reference
- * screenshot are embedded in a localized repair prompt for the route's
- * component — then the project is rebuilt and the route's visuals are
- * re-verified. Repairs record mismatchBefore/mismatchAfter/fixed per
- * failing viewport. A route never receives a second turn in the same pass.
+ * Runs a bounded closed-loop visual diff repair pass: each route with failing
+ * visual comparisons receives up to the configured number of turns. Each turn
+ * targets the worst current viewport, rebuilds and re-verifies the route, and
+ * keeps the candidate only when it improves at least one viewport without
+ * regressing any comparable viewport. Regressions and no-progress candidates
+ * are restored immediately.
  */
 export async function runVisualRepairPass(
   options: VisualRepairPassOptions,
@@ -906,9 +907,9 @@ export async function runVisualRepairPass(
   const { visuals, componentPathsByRoute, outputDir } = options;
   const repairComponent = options.repairComponent ?? repairComponentWithVisualDiff;
   const rebuild = options.rebuild ?? defaultRebuild;
+  const maxTurns = Math.max(0, options.maxRepairTurnsPerRoute ?? 2);
   const repairs: RepairRecord[] = [];
 
-  // Group failing comparisons by route; single repair turn per route.
   const failingByRoute = new Map<string, VisualCheck[]>();
   for (const visual of visuals) {
     if (visual.passed !== false) continue;
@@ -919,98 +920,87 @@ export async function runVisualRepairPass(
 
   const repairedVisuals = new Map(visuals.map((visual) => [visual, visual]));
 
-  for (const [routePath, failures] of failingByRoute) {
+  for (const [routePath, initialFailures] of failingByRoute) {
     const componentPath = componentPathsByRoute.get(routePath);
-    if (componentPath === undefined) continue;
-
-    // Worst failing viewport drives the repair prompt (single turn).
-    const worst = failures.reduce((a, b) =>
-      (b.mismatchPercent ?? 0) > (a.mismatchPercent ?? 0) ? b : a,
-    );
-
-    if (
-      worst.referenceScreenshot === null ||
-      worst.diffImage === null ||
-      worst.mismatchPercent === null
-    ) {
-      continue;
-    }
-
+    if (componentPath === undefined || maxTurns === 0 || options.reVerify === undefined) continue;
     const resolvedComponentPath = componentPath.startsWith('/')
       ? componentPath
       : join(outputDir, componentPath);
 
-    let currentCode: string;
+    let acceptedCode: string;
     try {
-      currentCode = await readFile(resolvedComponentPath, 'utf8');
+      acceptedCode = await readFile(resolvedComponentPath, 'utf8');
     } catch {
-      // Component file absent (page not synthesized) — nothing to repair.
       continue;
     }
 
-    const originalDataUrl = await loadDataUrl(worst.referenceScreenshot);
-    const diffDataUrl = await loadDataUrl(worst.diffImage);
-    if (originalDataUrl === null || diffDataUrl === null) continue;
-
-    let repairedCode: string;
-    try {
-      repairedCode = await repairComponent(
-        resolvedComponentPath,
-        currentCode,
-        originalDataUrl,
-        diffDataUrl,
-        worst.mismatchPercent,
+    let acceptedChecks = initialFailures;
+    for (let turn = 0; turn < maxTurns; turn += 1) {
+      const failures = acceptedChecks.filter((check) => check.passed === false);
+      if (failures.length === 0) break;
+      const worst = failures.reduce((a, b) =>
+        (b.mismatchPercent ?? 0) > (a.mismatchPercent ?? 0) ? b : a,
       );
-    } catch {
-      // Repair turn failed; the route keeps its pre-repair verdicts.
-      continue;
-    }
+      if (worst.referenceScreenshot === null || worst.diffImage === null || worst.mismatchPercent === null) break;
+      const originalDataUrl = await loadDataUrl(worst.referenceScreenshot);
+      const diffDataUrl = await loadDataUrl(worst.diffImage);
+      if (originalDataUrl === null || diffDataUrl === null) break;
 
-    // Write the repaired component to disk.
-    try {
-      await writeFile(resolvedComponentPath, repairedCode, 'utf8');
-    } catch {
-      continue;
-    }
+      let candidateCode: string;
+      try {
+        candidateCode = await repairComponent(
+          resolvedComponentPath,
+          acceptedCode,
+          originalDataUrl,
+          diffDataUrl,
+          worst.mismatchPercent,
+        );
+        await writeFile(resolvedComponentPath, candidateCode, 'utf8');
+      } catch {
+        break;
+      }
 
-    // Re-build and re-verify the repaired target.
-    const buildOk = await rebuild(outputDir);
-    if (!buildOk || options.reVerify === undefined) {
-      for (const failure of failures) {
+      const buildOk = await rebuild(outputDir);
+      const fresh = buildOk ? await options.reVerify(routePath) : [];
+      const comparable = failures.map((before) => ({
+        before,
+        after: fresh.find((check) => check.path === before.path && check.viewport === before.viewport),
+      }));
+      const regressed = !buildOk || comparable.some(({ before, after }) =>
+        after === undefined ||
+        after.passed === false && before.passed !== false ||
+        after.mismatchPercent === null ||
+        before.mismatchPercent === null ||
+        after.mismatchPercent > before.mismatchPercent,
+      );
+      const improved = !regressed && comparable.some(({ before, after }) =>
+        after?.passed === true ||
+        (after?.mismatchPercent !== null && after?.mismatchPercent !== undefined &&
+          before.mismatchPercent !== null && after.mismatchPercent < before.mismatchPercent),
+      );
+
+      for (const { before, after } of comparable) {
         repairs.push({
           path: routePath,
-          viewport: failure.viewport,
-          mismatchBefore: worst.mismatchPercent as number,
-          mismatchAfter: null,
-          fixed: false,
+          viewport: before.viewport,
+          mismatchBefore: before.mismatchPercent ?? worst.mismatchPercent,
+          mismatchAfter: after?.mismatchPercent ?? null,
+          fixed: after?.passed === true,
         });
       }
-      continue;
-    }
 
-    const fresh = await options.reVerify(routePath);
+      if (regressed || !improved) {
+        await writeFile(resolvedComponentPath, acceptedCode, 'utf8');
+        await rebuild(outputDir);
+        break;
+      }
 
-    for (const failure of failures) {
-      const after = fresh.find(
-        (check) => check.path === failure.path && check.viewport === failure.viewport,
-      );
-      const mismatchAfter = after?.mismatchPercent ?? null;
-      const fixed = after?.passed === true;
-      repairs.push({
-        path: routePath,
-        viewport: failure.viewport,
-        mismatchBefore: failure.mismatchPercent ?? worst.mismatchPercent,
-        mismatchAfter,
-        fixed,
-      });
-    }
-
-    // Fold fresh checks into the returned visual list.
-    for (const check of fresh) {
-      const existing = visuals.find(
-        (visual) => visual.path === check.path && visual.viewport === check.viewport,
-      );
-      if (existing !== undefined) repairedVisuals.set(existing, check);
+      acceptedCode = candidateCode;
+      acceptedChecks = fresh;
+      for (const check of fresh) {
+        const existing = visuals.find((visual) => visual.path === check.path && visual.viewport === check.viewport);
+        if (existing !== undefined) repairedVisuals.set(existing, check);
+      }
     }
   }
 
@@ -1040,8 +1030,10 @@ export interface VerificationOptions {
   visualThreshold?: number;
   /** Which viewports to compare visually. Defaults to `both`. */
   viewport?: ViewportMode;
-  /** Set false to disable the single-turn visual diff repair pass (spec s7). */
+  /** Set false to disable bounded visual diff repair. */
   repair?: boolean;
+  /** Maximum visual repair turns per route (default: 2). */
+  maxRepairTurnsPerRoute?: number;
 }
 
 /** True when a file is readable. */
@@ -1230,6 +1222,7 @@ export async function runVerification(
           visuals,
           componentPathsByRoute,
           outputDir,
+          maxRepairTurnsPerRoute: options.maxRepairTurnsPerRoute,
           reVerify: async (routePath: string): Promise<VisualCheck[]> => {
             const route = visualRoutes.find((entry) => entry.path === routePath);
             if (route === undefined) return [];
@@ -1255,7 +1248,7 @@ export async function runVerification(
           const fixed = pass.repairs.filter((repair) => repair.fixed).length;
           diagnostics.push(
             `Visual diff repair pass: ${pass.repairs.length} repair record(s), ` +
-              `${fixed} now below threshold (single turn per route).`,
+              `${fixed} now below threshold (bounded keep/revert turns).`,
           );
         }
       }

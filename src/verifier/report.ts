@@ -90,7 +90,7 @@ export interface VerificationVerdict {
   visualsPassed: boolean;
 }
 
-/** One single-turn visual diff repair outcome (spec s7). */
+/** One bounded visual diff repair attempt outcome (spec s7). */
 export interface RepairRecord {
   /** Route path whose component was repaired. */
   path: string;
@@ -217,7 +217,7 @@ export function printVerificationSummary(report: VerificationReport): void {
 
   // Repair pass outcomes (spec s7).
   if ((report.repairs ?? []).length > 0) {
-    lines.push('Visual diff repair pass (single turn per route):');
+    lines.push('Visual diff repair pass (bounded keep/revert turns):');
     for (const repair of report.repairs ?? []) {
       const after =
         repair.mismatchAfter !== null

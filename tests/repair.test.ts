@@ -104,6 +104,7 @@ test('repair > single-turn repair re-enters verification', async () => {
       visuals,
       componentPathsByRoute: new Map([['/en', 'src/pages/HomePage.tsx']]),
       outputDir,
+      maxRepairTurnsPerRoute: 1,
       repairComponent: async (componentPath, currentCode, original, diffOverlay, mismatch) => {
         calls.push({ componentPath, currentCode, original, diffOverlay, mismatch });
         return 'export function HomePage() {\n  return <div>repaired</div>;\n}\n';
@@ -184,6 +185,55 @@ test('repair > a failed rebuild records residual outcome with null after', async
     assert.equal(repairs[0]?.fixed, false);
     // Visuals keep the pre-repair verdict when re-verification never ran.
     assert.equal(visuals[0]?.mismatchPercent, 40);
+  } finally {
+    await cleanup(fixtures);
+  }
+});
+
+test('repair > regression is reverted and accepted source is restored', async () => {
+  const fixtures = await makeFixtures();
+  const { outputDir, reference, diff } = fixtures;
+  try {
+    let rebuildCount = 0;
+    const { visuals, repairs } = await runVisualRepairPass({
+      visuals: [visualCheck('/en', 'desktop', 30, false, reference, diff)],
+      componentPathsByRoute: new Map([['/en', 'src/pages/HomePage.tsx']]),
+      outputDir,
+      maxRepairTurnsPerRoute: 2,
+      repairComponent: async () => 'export function HomePage() { return <div>regression</div>; }',
+      rebuild: async () => { rebuildCount += 1; return true; },
+      reVerify: async () => [visualCheck('/en', 'desktop', 40, false, reference, diff)],
+    });
+    assert.equal(repairs.length, 1);
+    assert.equal(repairs[0]?.fixed, false);
+    assert.equal(visuals[0]?.mismatchPercent, 30);
+    assert.match(await readFile(join(outputDir, 'src', 'pages', 'HomePage.tsx'), 'utf8'), /before/);
+    assert.equal(rebuildCount, 2);
+  } finally {
+    await cleanup(fixtures);
+  }
+});
+
+test('repair > accepts an improvement and allows a bounded second turn', async () => {
+  const fixtures = await makeFixtures();
+  const { outputDir, reference, diff } = fixtures;
+  try {
+    let calls = 0;
+    const { visuals, repairs } = await runVisualRepairPass({
+      visuals: [visualCheck('/en', 'desktop', 40, false, reference, diff)],
+      componentPathsByRoute: new Map([['/en', 'src/pages/HomePage.tsx']]),
+      outputDir,
+      maxRepairTurnsPerRoute: 2,
+      repairComponent: async () => {
+        calls += 1;
+        return `export function HomePage() { return <div>step-${calls}</div>; }`;
+      },
+      rebuild: async () => true,
+      reVerify: async () => [visualCheck('/en', 'desktop', calls === 1 ? 25 : 10, calls >= 2, reference, diff)],
+    });
+    assert.equal(calls, 2);
+    assert.equal(repairs.length, 2);
+    assert.equal(visuals[0]?.mismatchPercent, 10);
   } finally {
     await cleanup(fixtures);
   }
