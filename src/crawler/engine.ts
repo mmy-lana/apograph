@@ -297,8 +297,9 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         await page.setViewportSize({ ...DESKTOP_VIEWPORT });
         await page.screenshot({ path: desktopScreenshot as string, type: 'png', fullPage: true });
         // Visual bounding-box asset extraction (screenshot-to-code pattern):
-        // crop background-image / canvas / hero-banner regions — which have no
-        // mirrored <img> source — out of the just-captured full-page PNG.
+        // crop background-image / canvas / svg / unmirrorable <img> surfaces —
+        // which have no mirrored <img> source — out of the just-captured
+        // full-page PNG. Generic wrapper divs are never cropped for size.
         visualAssets.push(
           ...(await extractVisualAssets(
             page,

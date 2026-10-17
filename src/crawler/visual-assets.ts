@@ -1,17 +1,24 @@
 /**
  * apograph — Visual bounding-box asset extraction (screenshot-to-code pattern).
  *
- * Hero backgrounds and interactive maps are frequently rendered via CSS
- * `background-image`, `<canvas>`, or full-bleed banner containers that never
- * appear as `<img>` sources — the DOM asset mirror misses them, and the vision
- * model falls back to flat CSS gradient placeholders. This pass identifies
- * those significant visually distinct containers (excluding regions already
- * covered by mirrored `<img>` sources), extracts their bounding boxes with
- * `page.evaluate`, and crops them out of the full-page screenshot with `pngjs`
- * (an existing dependency — no new packages) into the evidence asset
- * directory. The synthesizer's `copyMirroredAssets` then mirrors them into
- * `public/assets/`, and the manifest registration lists them as available
- * local assets (`hero-bg.png`, `map.png`, ...).
+ * Hero backgrounds, maps, and diagrams are frequently rendered via CSS
+ * `background-image`, `<canvas>`, or `<svg>` — surfaces the DOM asset mirror
+ * misses — so the vision model falls back to flat CSS gradient placeholders.
+ * This pass targets ONLY actual visual surfaces:
+ *
+ *   a) elements whose computed `background-image` carries a `url(...)`
+ *      layer (gradients — linear-gradient / radial-gradient — are excluded);
+ *   b) `<canvas>` elements (maps, WebGL);
+ *   c) `<svg>` elements at least 48x48 (complex diagrams / illustrations);
+ *   d) loaded `<img>` elements the DOM scraper cannot mirror (blob:/data:).
+ *
+ * Generic wrapper divs (`div.relative`, `div.container`, `div.mx-auto`,
+ * `section`) are NEVER cropped for size alone. Crops land in the evidence
+ * asset directory under semantic names (`map-canvas.png`,
+ * `network-diagram.png`, `hero-bg.png`); CSS layout utility classes never
+ * become asset names. The synthesizer's `copyMirroredAssets` mirrors them
+ * into `public/assets/`, and the manifest registration lists them as
+ * available local assets.
  */
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -27,38 +34,35 @@ import type { AssetEntry, VisualAssetKind, VisualAssetRegion } from '../types.js
 /** Smallest significant region (either dimension) in CSS pixels. */
 export const VISUAL_ASSET_MIN_SIZE = 80;
 
-/** Hero banner threshold: containers taller than this are significant. */
-export const HERO_BANNER_MIN_HEIGHT = 300;
+/** Minimum size for `<svg>` diagrams (icons below this are UI chrome). */
+export const SVG_MIN_SIZE = 48;
 
 /** Max visual assets extracted per screenshot (token / noise bound). */
 export const MAX_VISUAL_ASSETS = 12;
-
-/** Max DOM elements scanned per page (mirrors the asset scraper's bound). */
-const MAX_SCAN_ELEMENTS = 3_000;
 
 // ---------------------------------------------------------------------------
 // In-page region collection
 // ---------------------------------------------------------------------------
 
 /**
- * In-page collector: finds significant visually distinct containers lacking
- * mirrored `<img>` sources — elements with a CSS `background-image` url(),
- * `<canvas>` (and map-like `<iframe>`) surfaces, and hero banners taller than
- * 300px — and returns their page-space bounding boxes with a label hint.
+ * In-page collector: finds actual visual surfaces (a-d in the module docs)
+ * lacking mirrored `<img>` sources and returns their page-space bounding
+ * boxes with semantic name sources. Generic wrappers are never selected for
+ * size alone.
  *
  * Serialized into the page by `page.evaluate`: must stay self-contained
  * (no module-scope references).
  */
 export function collectVisualAssetRegionsInPage(): VisualAssetRegion[] {
   const MIN_SIZE = 80;
-  const HERO_MIN_HEIGHT = 300;
+  const SVG_MIN_SIZE = 48;
+  const HERO_TOP = 600;
   const MAX_ELEMENTS = 3_000;
   const MAX_REGIONS = 12;
 
   interface Candidate {
     rect: DOMRect;
-    kind: VisualAssetKind;
-    label: string;
+    region: VisualAssetRegion;
   }
 
   const body = document.body;
@@ -74,34 +78,24 @@ export function collectVisualAssetRegionsInPage(): VisualAssetRegion[] {
     return Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
   };
 
-  const labelFor = (el: Element, kind: VisualAssetKind): string => {
-    const id = el.getAttribute('id');
-    if (id !== null && id.length > 0) return id;
+  const classTokensOf = (el: Element): string[] => {
     const className = el.getAttribute('class');
-    if (className !== null) {
-      for (const token of className.split(/\s+/)) {
-        if (token.length >= 3) return token;
-      }
-    }
-    const aria = el.getAttribute('aria-label');
-    if (aria !== null && aria.length > 0) return aria;
-    const role = el.getAttribute('role');
-    if (role !== null && role.length > 0) return role;
-    return kind === 'canvas' ? 'canvas' : kind === 'background-image' ? 'bg' : 'hero';
+    return className !== null
+      ? className.split(/\s+/).filter((token) => token.length > 0)
+      : [];
   };
 
   const candidates: Candidate[] = [];
   const elements = Array.from(document.querySelectorAll('*')).slice(0, MAX_ELEMENTS);
 
   for (const el of elements) {
-    const tag = el.tagName.toUpperCase();
+    const tag = el.tagName.toLowerCase();
     if (
-      tag === 'IMG' ||
-      tag === 'PICTURE' ||
-      tag === 'VIDEO' ||
-      tag === 'SVG' ||
-      tag === 'SCRIPT' ||
-      tag === 'STYLE'
+      tag === 'script' ||
+      tag === 'style' ||
+      tag === 'picture' ||
+      tag === 'video' ||
+      tag === 'head'
     ) {
       continue;
     }
@@ -111,35 +105,66 @@ export function collectVisualAssetRegionsInPage(): VisualAssetRegion[] {
     if (Number.parseFloat(style.opacity || '1') < 0.1) continue;
 
     const rect = el.getBoundingClientRect();
-    if (rect.width < MIN_SIZE || rect.height < MIN_SIZE) continue;
 
+    // a) CSS background-image with a real url() layer. Gradients
+    // (linear-gradient / radial-gradient) carry no url() and never qualify;
+    // generic wrappers are not selected for size alone.
     const backgroundImage = style.backgroundImage;
-    const hasBackground =
-      typeof backgroundImage === 'string' && backgroundImage.includes('url(');
+    const hasBackgroundUrl =
+      typeof backgroundImage === 'string' && /url\(/i.test(backgroundImage);
 
     let kind: VisualAssetKind | null = null;
-    if (tag === 'CANVAS') {
-      kind = 'canvas';
-    } else if (hasBackground) {
-      kind = 'background-image';
-    } else if (rect.height > HERO_MIN_HEIGHT) {
-      kind = 'hero-banner';
+    if (tag === 'canvas') {
+      if (rect.width >= MIN_SIZE && rect.height >= MIN_SIZE) kind = 'canvas';
+    } else if (tag === 'svg') {
+      if (rect.width >= SVG_MIN_SIZE && rect.height >= SVG_MIN_SIZE) kind = 'svg';
+    } else if (tag === 'img') {
+      // d) Loaded images the DOM scraper cannot mirror (blob:/data: URLs).
+      const img = el as HTMLImageElement;
+      const src = img.getAttribute('src') ?? '';
+      if (
+        img.naturalWidth > 0 &&
+        (src.startsWith('blob:') || src.startsWith('data:'))
+      ) {
+        kind = 'image';
+      }
+    } else if (hasBackgroundUrl) {
+      if (rect.width >= MIN_SIZE && rect.height >= MIN_SIZE) kind = 'background-image';
     }
     if (kind === null) continue;
 
-    // Regions whose visual area is mostly covered by an <img> source are
-    // already mirrored by the DOM asset scraper — skip them.
-    let imgArea = 0;
-    for (const img of Array.from(el.querySelectorAll('img'))) {
-      const imgRect = img.getBoundingClientRect();
-      imgArea += imgRect.width * imgRect.height;
+    // Regions mostly covered by a mirrored <img> source are already captured
+    // by the DOM asset scraper — skip them (never applies to the images
+    // themselves).
+    if (kind !== 'image') {
+      let imgArea = 0;
+      for (const img of Array.from(el.querySelectorAll('img'))) {
+        const imgRect = img.getBoundingClientRect();
+        imgArea += imgRect.width * imgRect.height;
+      }
+      if (imgArea >= area(rect) * 0.5) continue;
     }
-    if (imgArea >= area(rect) * 0.5) continue;
 
-    candidates.push({ rect, kind, label: labelFor(el, kind) });
+    candidates.push({
+      rect,
+      region: {
+        kind,
+        x: rect.left + window.scrollX,
+        y: rect.top + window.scrollY,
+        width: rect.width,
+        height: rect.height,
+        tag,
+        id: el.getAttribute('id'),
+        ariaLabel: el.getAttribute('aria-label'),
+        alt: tag === 'img' ? el.getAttribute('alt') : null,
+        classTokens: classTokensOf(el),
+        inHero:
+          el.closest('#hero') !== null || rect.top + window.scrollY < HERO_TOP,
+      },
+    });
   }
 
-  // Prefer the innermost specific region: largest first, a candidate nested
+  // Prefer the innermost specific surface: largest first, a candidate nested
   // inside a kept region is dropped — unless it covers >=50% of that region,
   // in which case the kept entry was a mere wrapper and yields to it.
   candidates.sort((a, b) => area(b.rect) - area(a.rect));
@@ -166,21 +191,55 @@ export function collectVisualAssetRegionsInPage(): VisualAssetRegion[] {
     if (selected.length >= MAX_REGIONS) break;
   }
 
-  return selected.map((candidate) => ({
-    kind: candidate.kind,
-    x: candidate.rect.left + window.scrollX,
-    y: candidate.rect.top + window.scrollY,
-    width: candidate.rect.width,
-    height: candidate.rect.height,
-    label: candidate.label,
-  }));
+  return selected.map((candidate) => candidate.region);
 }
 
 // ---------------------------------------------------------------------------
 // Naming
 // ---------------------------------------------------------------------------
 
-/** Sanitizes an in-page label into a filesystem-safe asset base name. */
+/** Exact CSS layout utility tokens that must never become asset names. */
+const LAYOUT_UTILITY_TOKENS = new Set([
+  'relative',
+  'absolute',
+  'fixed',
+  'sticky',
+  'container',
+  'flex',
+  'grid',
+  'block',
+  'inline',
+  'hidden',
+  'contents',
+  'isolate',
+  'truncate',
+  'overflow-hidden',
+  'mx-auto',
+  'w-full',
+  'h-full',
+  'space-y',
+  'space-x',
+]);
+
+/** Tailwind-style layout utility prefixes that must never become asset names. */
+const LAYOUT_UTILITY_PREFIX =
+  /^(m[xytblr]?|p[xytblr]?|w|h|max-w|max-h|min-w|min-h|gap|space-[xy]|top|left|right|bottom|inset|z|order|flex|grid|items|justify|self|place|col|row|basis|grow|shrink|text|bg|border|rounded|font|leading|tracking|shadow|opacity|transition|duration|ease|ring|outline|fill|stroke|divide|sr|pointer|select|align|whitespace|break|overflow|aspect|object|cursor|resize|appearance)(-|$)/;
+
+/**
+ * True when a name is a generic CSS layout utility class (`relative`,
+ * `container`, `mx-auto`, `w-full`, `space-y-6`, ...). Such names confuse the
+ * vision model and must never become asset names.
+ */
+export function isLayoutUtilityName(name: string): boolean {
+  const normalized = name.trim().toLowerCase();
+  if (normalized.length === 0) return true;
+  if (LAYOUT_UTILITY_TOKENS.has(normalized)) return true;
+  if (LAYOUT_UTILITY_PREFIX.test(normalized)) return true;
+  const leading = normalized.split('-')[0] ?? normalized;
+  return LAYOUT_UTILITY_TOKENS.has(leading);
+}
+
+/** Sanitizes a name source into a filesystem-safe asset base name. */
 export function sanitizeAssetBaseName(label: string): string {
   const base = label
     .toLowerCase()
@@ -191,17 +250,51 @@ export function sanitizeAssetBaseName(label: string): string {
 }
 
 /**
- * Derives the suggested file base name for a region (e.g. `hero-bg`, `map`).
- * Background-image regions get a `-bg` suffix unless the label already
- * carries one.
+ * Suggests the file base name for a region (e.g. `map-canvas`,
+ * `network-diagram`, `hero-bg`, `section-graphic-3`):
+ *
+ * 1. semantic sources win — element id, aria-label, image alt, or a semantic
+ *    class token (`map` + canvas -> `map-canvas`, `network` + svg ->
+ *    `network-diagram`);
+ * 2. `background-image` regions inside `#hero` or in the top 600px are named
+ *    `hero-bg`;
+ * 3. CSS layout utility names are NEVER used — they fall back to
+ *    `section-graphic-${index}` (or the bare semantic tag for canvas/svg).
  */
-export function nameForRegion(region: Pick<VisualAssetRegion, 'kind' | 'label'>): string {
-  const base = sanitizeAssetBaseName(region.label);
-  const suffixed =
-    region.kind === 'background-image' && !base.endsWith('-bg') && !base.endsWith('-background')
-      ? `${base}-bg`
-      : base;
-  return suffixed.slice(0, 48);
+export function suggestRegionName(region: VisualAssetRegion, index: number): string {
+  const fallback = `section-graphic-${index}`;
+
+  const named = (value: string | null): string | null => {
+    if (value === null) return null;
+    const base = sanitizeAssetBaseName(value);
+    return isLayoutUtilityName(base) ? null : base;
+  };
+
+  const semanticClass = region.classTokens.find((token) => !isLayoutUtilityName(token));
+  const base =
+    named(region.id) ??
+    named(region.ariaLabel) ??
+    named(region.alt) ??
+    (semanticClass !== undefined ? sanitizeAssetBaseName(semanticClass) : null);
+
+  if (region.kind === 'background-image') {
+    if (region.inHero) return 'hero-bg';
+    if (base === null) return fallback;
+    return base.includes('bg') ? base : `${base}-bg`;
+  }
+
+  if (region.kind === 'canvas') {
+    if (base === null) return 'canvas';
+    return base.includes('canvas') ? base : `${base}-canvas`;
+  }
+
+  if (region.kind === 'svg') {
+    if (base === null) return 'diagram';
+    return base.includes('diagram') || base.includes('svg') ? base : `${base}-diagram`;
+  }
+
+  // kind === 'image'
+  return base !== null ? base : fallback;
 }
 
 /** Claims a collision-free name (`hero-bg`, `hero-bg-2`, ...) in `used`. */
@@ -264,11 +357,12 @@ export interface ExtractVisualAssetsOptions {
 }
 
 /**
- * Visual asset extraction pass: collects significant region bounding boxes
- * from the live page, crops them out of the given full-page screenshot, and
- * writes each crop into `assetsDir` under its suggested name (`hero-bg.png`,
- * `map.png`, ...). Names are collision-safe across routes via `usedNames`.
- * Returns manifest-ready asset entries for the evidence bundle.
+ * Visual asset extraction pass: collects visual-surface bounding boxes from
+ * the live page, crops them out of the given full-page screenshot, and writes
+ * each crop into `assetsDir` under its suggested semantic name
+ * (`hero-bg.png`, `map-canvas.png`, ...). Names are collision-safe across
+ * routes via `usedNames`. Returns manifest-ready asset entries for the
+ * evidence bundle.
  */
 export async function extractVisualAssets(
   page: Page,
@@ -292,11 +386,11 @@ export async function extractVisualAssets(
   await mkdir(assetsDir, { recursive: true });
 
   const entries: AssetEntry[] = [];
-  for (const region of regions.slice(0, maxAssets)) {
+  for (const [position, region] of regions.slice(0, maxAssets).entries()) {
     const cropped = cropPngToRegion(screenshot, region);
     if (cropped === null) continue;
 
-    const name = uniqueAssetName(nameForRegion(region), claimed);
+    const name = uniqueAssetName(suggestRegionName(region, position + 1), claimed);
     const localPath = join(assetsDir, `${name}.png`);
     await writeFile(localPath, cropped);
 

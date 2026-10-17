@@ -14,10 +14,12 @@ import { PNG } from 'pngjs';
 
 import {
   cropPngToRegion,
-  nameForRegion,
+  isLayoutUtilityName,
   sanitizeAssetBaseName,
+  suggestRegionName,
 } from '../dist/crawler/visual-assets.js';
 import { compareScreenshots, normalizeAlphaChannel } from '../dist/verifier/engine.js';
+import type { VisualAssetRegion } from '../dist/types.js';
 
 // ---------------------------------------------------------------------------
 // Synthetic image helpers
@@ -115,14 +117,82 @@ test('crop > returns null for regions with no overlap', () => {
 // Suggested naming
 // ---------------------------------------------------------------------------
 
-test('naming > sanitizes labels and applies the background-image suffix', () => {
+/** Builds a minimal region, overriding only the fields under test. */
+function region(overrides: Partial<VisualAssetRegion> = {}): VisualAssetRegion {
+  return {
+    kind: 'background-image',
+    x: 0,
+    y: 0,
+    width: 400,
+    height: 300,
+    tag: 'div',
+    id: null,
+    ariaLabel: null,
+    alt: null,
+    classTokens: [],
+    inHero: false,
+    ...overrides,
+  };
+}
+
+test('naming > assigns semantic names from id, aria-label, and semantic tags', () => {
   assert.equal(sanitizeAssetBaseName('Hero Header!'), 'hero-header');
   assert.equal(sanitizeAssetBaseName('***'), 'asset');
 
-  assert.equal(nameForRegion({ kind: 'background-image', label: 'hero' }), 'hero-bg');
-  assert.equal(nameForRegion({ kind: 'background-image', label: 'hero-bg' }), 'hero-bg');
-  assert.equal(nameForRegion({ kind: 'canvas', label: 'Map' }), 'map');
-  assert.equal(nameForRegion({ kind: 'hero-banner', label: 'main hero' }), 'main-hero');
+  assert.equal(
+    suggestRegionName(region({ kind: 'canvas', tag: 'canvas', id: 'map' }), 1),
+    'map-canvas',
+  );
+  assert.equal(
+    suggestRegionName(region({ kind: 'svg', tag: 'svg', ariaLabel: 'Network diagram' }), 1),
+    'network-diagram',
+  );
+  assert.equal(
+    suggestRegionName(region({ kind: 'svg', tag: 'svg', id: 'network' }), 1),
+    'network-diagram',
+  );
+  assert.equal(
+    suggestRegionName(region({ kind: 'image', tag: 'img', alt: 'Resort aerial view' }), 1),
+    'resort-aerial-view',
+  );
+  // Unnamed canvas keeps its semantic tag instead of a utility name.
+  assert.equal(
+    suggestRegionName(region({ kind: 'canvas', tag: 'canvas', classTokens: ['w-full'] }), 2),
+    'canvas',
+  );
+});
+
+test('naming > hero background-image regions are named hero-bg', () => {
+  assert.equal(
+    suggestRegionName(region({ kind: 'background-image', inHero: true }), 1),
+    'hero-bg',
+  );
+  assert.equal(
+    suggestRegionName(region({ kind: 'background-image', id: 'jungle' }), 1),
+    'jungle-bg',
+  );
+});
+
+test('naming > rejects generic utility class names', () => {
+  for (const utility of ['relative', 'absolute', 'container', 'mx-auto', 'w-full', 'space-y-6']) {
+    assert.equal(isLayoutUtilityName(utility), true, `${utility} must be rejected`);
+  }
+  assert.equal(isLayoutUtilityName('hero-bg'), false);
+  assert.equal(isLayoutUtilityName('map-canvas'), false);
+
+  // Utility-class-only wrappers fall back to the section-graphic name.
+  assert.equal(
+    suggestRegionName(
+      region({ kind: 'background-image', classTokens: ['relative', 'mx-auto', 'container'] }),
+      3,
+    ),
+    'section-graphic-3',
+  );
+  // Even an id that is a utility name is rejected.
+  assert.equal(
+    suggestRegionName(region({ kind: 'image', tag: 'img', id: 'container' }), 4),
+    'section-graphic-4',
+  );
 });
 
 // ---------------------------------------------------------------------------

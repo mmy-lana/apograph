@@ -146,12 +146,14 @@ export interface AssetEntry {
 }
 
 /** Why a visually distinct region was selected for extraction. */
-export type VisualAssetKind = 'background-image' | 'canvas' | 'hero-banner';
+export type VisualAssetKind = 'background-image' | 'canvas' | 'svg' | 'image';
 
 /**
- * A significant visually distinct region (CSS `background-image`, `<canvas>`,
- * or a >300px hero banner lacking a mirrored `<img>` source) cropped out of a
- * full-page screenshot as a visual asset.
+ * A significant visual surface cropped out of a full-page screenshot:
+ * a CSS `background-image` url() element (never gradients), a `<canvas>`, a
+ * >=48px `<svg>` diagram, or a loaded `<img>` the DOM scraper could not
+ * mirror (blob:/data: URLs). Generic wrapper divs are never cropped for size
+ * alone.
  */
 export interface VisualAssetRegion {
   kind: VisualAssetKind;
@@ -160,8 +162,18 @@ export interface VisualAssetRegion {
   y: number;
   width: number;
   height: number;
-  /** Raw in-page label (element id / class / aria-label / role). */
-  label: string;
+  /** Source element tag name (lowercase). */
+  tag: string;
+  /** Element id, when present. */
+  id: string | null;
+  /** aria-label, when present. */
+  ariaLabel: string | null;
+  /** Image alt text, when present. */
+  alt: string | null;
+  /** Raw class tokens (utility-class tokens are never used for naming). */
+  classTokens: string[];
+  /** True when inside `#hero` or the top edge is within 600px of the page top. */
+  inHero: boolean;
 }
 
 /** A URL the crawler chose not to visit, with the reason. */
