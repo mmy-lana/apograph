@@ -100,6 +100,12 @@ export function collectVisualAssetRegionsInPage(): VisualAssetRegion[] {
       continue;
     }
 
+    // Skip chrome, navigation, headers, footers — we never crop the site layout
+    // into content assets.
+    if (el.closest('header, footer, nav, [role="navigation"], [role="contentinfo"]') !== null) {
+      continue;
+    }
+
     const style = getComputedStyle(el);
     if (style.display === 'none' || style.visibility === 'hidden') continue;
     if (Number.parseFloat(style.opacity || '1') < 0.1) continue;

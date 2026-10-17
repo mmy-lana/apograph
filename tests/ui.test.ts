@@ -241,6 +241,14 @@ test('source > system guidelines forbid mixed icon name/component properties', a
     ),
     'lucide-react icon handling must be spelled out (TS2322 icon/ReactNode quirk)',
   );
+  assert.ok(
+    modularSource.includes('FOOTER CONTRACT'),
+    'Footer contract must ban fixed/sticky/absolute positioning',
+  );
+  assert.ok(
+    modularSource.includes('CARD IMAGES'),
+    'Card images rule must ban assigning background crops or logos to cards',
+  );
 });
 
 test('scaffold > vite config relaxes the port and binds all interfaces', () => {

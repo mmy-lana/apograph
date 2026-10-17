@@ -191,6 +191,8 @@ const SYSTEM_GUIDELINES = [
   '- Layout Architecture: Page sections must stack vertically in normal document flow inside <main className="flex min-h-screen w-full flex-col bg-background text-foreground">. Never position whole sections with `absolute` or `fixed` over other sections.',
   '- STRICT PROHIBITION ON WHOLE-SECTION ABSOLUTE POSITIONING: NEVER use `absolute inset-0`, `fixed inset-0`, or absolute positioning on top-level <section> or container wrappers. Every section must sit in natural vertical flow (e.g. `<section className="w-full py-16 sm:py-24">`). `position: absolute` is ONLY permitted for background/decorative elements inside a `relative` parent container.',
   '- SECTION INTEGRITY: Only render sections that visually belong to THIS page. Do not invent or pull cards, badges, or content from other pages.',
+  '- FOOTER CONTRACT: Footer.tsx must be a static block container at the bottom of the page (`<footer className="w-full border-t border-border bg-background py-12">`). NEVER use `fixed`, `sticky`, or `absolute` on Footer.tsx.',
+  '- CARD IMAGES: For card grids or list items, if a specific dedicated visual asset for that item does not exist, use a clean placeholder icon/gradient. Never assign background crops, full-page crops, or logo assets to card content.',
 ].join('\n');
 
 // ---------------------------------------------------------------------------
@@ -390,7 +392,7 @@ export function generateFooterTemplate(appName: string, routes: PlanRoute[]): st
     '',
     'export function Footer() {',
     '  return (',
-    '    <footer className="border-t border-border bg-transparent">',
+    '    <footer className="w-full border-t border-border bg-background">',
     '      <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-4 py-8 sm:flex-row sm:px-6">',
     `        <p className="text-sm text-muted-foreground">&copy; {new Date().getFullYear()} ${escapeString(appName)}</p>`,
     '        <nav className="flex flex-wrap gap-6">',
@@ -932,7 +934,10 @@ export async function synthesizeModularProject(
     '   infers `never[]` and the build fails. If there are no extra links,',
     '   render no list at all.',
     '2. src/components/Footer.tsx — exported function Footer; matches the',
-    '   screenshot footer content and links.',
+    '   screenshot footer content and links; must be a static block container',
+    '   at the bottom of the page (className must include "w-full border-t',
+    '   border-border bg-background py-12"); NEVER use fixed, sticky, or',
+    '   absolute positioning.',
   ].join('\n');
 
   const layoutFiles = await runVisionStage(

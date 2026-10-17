@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import { PNG } from 'pngjs';
 
 import {
+  collectVisualAssetRegionsInPage,
   cropPngToRegion,
   isLayoutUtilityName,
   sanitizeAssetBaseName,
@@ -227,4 +228,24 @@ test('compare > normalizeAlphaChannel forces every pixel opaque', () => {
     assert.equal(png.data[index], 255);
   }
   assert.equal(png.data[0], 10);
+});
+
+// ---------------------------------------------------------------------------
+// Chrome / Layout filter tests
+// ---------------------------------------------------------------------------
+
+test('collector > collectVisualAssetRegionsInPage skips header, footer, and navigation chrome', () => {
+  const source = collectVisualAssetRegionsInPage.toString();
+  assert.ok(
+    source.includes('header, footer, nav'),
+    'Collector must skip header, footer, and nav elements to prevent layout ghosting',
+  );
+  assert.ok(
+    source.includes('[role="navigation"]'),
+    'Collector must skip navigation landmarks',
+  );
+  assert.ok(
+    source.includes('[role="contentinfo"]'),
+    'Collector must skip contentinfo (footer) landmarks',
+  );
 });
