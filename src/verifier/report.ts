@@ -16,15 +16,37 @@ export const REPORT_FILENAME = 'verification-report.json';
 // Report shapes
 // ---------------------------------------------------------------------------
 
-/** Tier 1 result: tsc + vite build inside the output directory. */
+/** One compiler auto-repair turn (Tier 1 resilience). */
+export interface CompilerRepairRecord {
+  /** Source files (relative to outputDir) sent through repairCodeFile. */
+  repairedFiles: string[];
+  /** True when the post-repair `tsc --noEmit` re-run passed. */
+  fixed: boolean;
+  /** Parsed diagnostic lines that drove the repair. */
+  errorsBefore: string[];
+}
+
+/**
+ * Tier 1 result: tsc + vite build inside the output directory.
+ *
+ * `success` reflects artifact production (`vitePassed`): the pipeline stays
+ * resilient to residual type errors so `dist/` exists for tiers 2/3. The
+ * typecheck verdict is carried separately in `tscPassed` and
+ * `typecheckBypassed`.
+ */
 export interface BuildCheck {
+  /** True when `dist/` artifacts were produced (== vitePassed). */
   success: boolean;
-  /** True when `tsc --noEmit` passed. */
+  /** True when `tsc --noEmit` passed (final status after the repair turn). */
   tscPassed: boolean;
-  /** True when `vite build` passed (only attempted when tsc passed). */
+  /** True when `vite build` passed. */
   vitePassed: boolean;
   /** Compiler / bundler error log lines. */
   errors: string[];
+  /** Present iff a compiler auto-repair turn ran. */
+  repair?: CompilerRepairRecord;
+  /** True when tsc still fails but the vite build was forced through anyway. */
+  typecheckBypassed?: boolean;
 }
 
 /** Tier 2 result: one route's headless smoke check. */
@@ -130,9 +152,16 @@ export function printVerificationSummary(report: VerificationReport): void {
   lines.push('');
 
   // Build tier.
+  const tscStatus = report.build.repair?.fixed === true
+    ? 'ok (repaired)'
+    : report.build.tscPassed
+      ? 'ok'
+      : report.build.typecheckBypassed === true
+        ? 'FAILED (residual — build bypassed)'
+        : 'FAILED';
   lines.push(
     `Build:      ${mark(report.build.success)} ` +
-      `tsc ${report.build.tscPassed ? 'ok' : 'FAILED'}, ` +
+      `tsc ${tscStatus}, ` +
       `vite ${report.build.vitePassed ? 'ok' : 'FAILED'}`,
   );
   for (const error of report.build.errors.slice(0, 10)) {

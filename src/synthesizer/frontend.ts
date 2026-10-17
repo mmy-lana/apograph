@@ -189,6 +189,7 @@ const SYSTEM_GUIDELINES = [
   '   - src/components/*.tsx — semantic page, card, and list components.',
   '   - src/index.css — containing exactly: @tailwind base; @tailwind components; @tailwind utilities;',
   '7. Every file must be complete and compile-ready — no placeholders, no TODOs, no truncation.',
+  '- When rendering icons from lucide-react in maps, lists, or components, store the component reference and render as `<item.icon className="..." />`, or store JSX elements directly `icon: <Shield className="..." />`. Never assign string names and component references to the same property.',
 ].join('\n');
 
 /**

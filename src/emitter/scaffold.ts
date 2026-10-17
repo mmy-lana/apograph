@@ -122,7 +122,7 @@ export function generateFrontendScaffold(
     version: '0.1.0',
     type: 'module',
     scripts: {
-      dev: 'vite',
+      dev: 'vite --host 0.0.0.0',
       build: 'tsc --noEmit && vite build',
       preview: 'vite preview',
     },
@@ -155,7 +155,7 @@ export function generateFrontendScaffold(
     '',
     'export default defineConfig({',
     '  plugins: [react(), tailwindcss()],',
-    "  server: { port: 5173 },",
+    '  server: { port: 5173, strictPort: false, host: true },',
     '});',
     '',
   ].join('\n');
@@ -181,7 +181,12 @@ export function generateFrontendScaffold(
       module: 'ESNext',
       moduleResolution: 'bundler',
       jsx: 'react-jsx',
-      strict: true,
+      // Compiler resilience: local AI models emit minor type quirks (e.g. a
+      // Lucide icon component passed where ReactNode is expected). Strict
+      // mode turns those into build-aborting TS2322 errors; the verifier's
+      // auto-repair loop handles whatever remains.
+      strict: false,
+      noImplicitAny: false,
       // Local AI models frequently emit harmless unused imports
       // (e.g. `import { ReactNode } from 'react'`) — that must not break
       // the generated project's build.

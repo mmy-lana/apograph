@@ -20,13 +20,14 @@ import { promisify } from 'node:util';
 import { readFile, stat, mkdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { extname, join, resolve } from 'node:path';
+import { extname, join, resolve, sep } from 'node:path';
 import { chromium } from 'playwright';
 import type { Browser, ConsoleMessage, Page } from 'playwright';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
 import type {
   BuildCheck,
+  CompilerRepairRecord,
   RepairRecord,
   RouteCheck,
   VerificationReport,
@@ -35,6 +36,7 @@ import type {
 import type { EvidenceManifest, ViewportMode } from '../types.js';
 import type { ApographPlan, PlanRoute } from '../plan/schema.js';
 import { validatePlan } from '../plan/generator.js';
+import { repairCodeFile } from '../synthesizer/llm.js';
 import { repairComponentWithVisualDiff } from '../synthesizer/vision.js';
 
 /** Promisified execFile for async child-process execution. */
@@ -162,7 +164,7 @@ export async function startSiteServer(distDir: string): Promise<SiteHandle> {
 // ---------------------------------------------------------------------------
 
 /** Result of one build command run. */
-interface CommandResult {
+export interface CommandResult {
   ok: boolean;
   output: string;
 }
@@ -207,31 +209,155 @@ async function nodeModulesExists(cwd: string): Promise<boolean> {
   }
 }
 
-/**
- * Tier 1: runs `tsc --noEmit` and `vite build` inside the output directory.
- * Installs dependencies if `node_modules` is absent before typechecking.
- * `vite build` is only attempted when the typecheck passes (mirroring the
- * project's `pnpm build` script). Returns success flags and compiler logs.
- */
-export async function verifyBuild(outputDir: string): Promise<BuildCheck> {
-  const cwd = resolve(outputDir);
+// ---------------------------------------------------------------------------
+// Tier 1 — compiler diagnostics & auto-repair
+// ---------------------------------------------------------------------------
 
-  const hasModules = await nodeModulesExists(cwd);
+/** One parsed `tsc` error diagnostic. */
+export interface CompilerDiagnostic {
+  /** File path as printed by tsc (e.g. 'src/components/Hero.tsx'). */
+  file: string;
+  /** 1-based line of the error. */
+  line: number;
+  /** 1-based column of the error. */
+  column: number;
+  /** Diagnostic code, e.g. 'TS2322'. */
+  code: string;
+  /** Full diagnostic block text, including continuation lines. */
+  message: string;
+}
+
+/** Classic tsc format: `src/A.tsx(12,18): error TS2322: ...`. */
+const TSC_ERROR_CLASSIC = /^(.+?)\((\d+),(\d+)\):\s+error\s+(TS\d+):\s+(.*)$/;
+
+/** Pretty tsc format: `src/A.tsx:12:18 - error TS2322: ...`. */
+const TSC_ERROR_PRETTY = /^(.+?):(\d+):(\d+)\s+-\s+error\s+(TS\d+):\s+(.*)$/;
+
+/**
+ * Parses `tsc --noEmit` output into diagnostics, supporting both the classic
+ * `file(line,col): error TSxxxx:` format and the pretty
+ * `file:line:col - error TSxxxx:` format. Continuation lines (indented
+ * message detail / code frames) fold into the owning diagnostic until the
+ * next diagnostic or a blank line. File-less diagnostics (config-level
+ * TS5xxx / TS6053) produce no entries and are therefore never repair targets.
+ */
+export function parseTscDiagnostics(output: string): CompilerDiagnostic[] {
+  const diagnostics: CompilerDiagnostic[] = [];
+  let current: CompilerDiagnostic | null = null;
+
+  for (const rawLine of output.split('\n')) {
+    const line = rawLine.trimEnd();
+    const match = line.match(TSC_ERROR_CLASSIC) ?? line.match(TSC_ERROR_PRETTY);
+
+    if (match !== null) {
+      if (current !== null) diagnostics.push(current);
+      current = {
+        file: match[1] as string,
+        line: Number.parseInt(match[2] as string, 10),
+        column: Number.parseInt(match[3] as string, 10),
+        code: match[4] as string,
+        message: line,
+      };
+      continue;
+    }
+
+    if (current === null) continue;
+
+    if (line.trim().length === 0) {
+      diagnostics.push(current);
+      current = null;
+      continue;
+    }
+
+    current.message += `\n${line}`;
+  }
+
+  if (current !== null) diagnostics.push(current);
+  return diagnostics;
+}
+
+/** One file queued for a targeted compiler-repair turn. */
+interface RepairTarget {
+  file: string;
+  errors: string[];
+}
+
+/** Max files sent through one repair turn (token bound). */
+const MAX_REPAIR_FILES = 3;
+
+/** Max diagnostic lines forwarded per file. */
+const MAX_REPAIR_ERRORS = 20;
+
+/** True when a diagnostic file is a safe in-project repair candidate. */
+function isRepairTarget(cwd: string, file: string): boolean {
+  if (!file.startsWith('src/')) return false;
+  if (file.includes('node_modules')) return false;
+  const root = resolve(cwd);
+  return resolve(cwd, file).startsWith(root + sep);
+}
+
+/** Groups parseable diagnostics into per-file repair targets (bounded). */
+function selectRepairTargets(cwd: string, tscOutput: string): RepairTarget[] {
+  const byFile = new Map<string, string[]>();
+
+  for (const diagnostic of parseTscDiagnostics(tscOutput)) {
+    if (!isRepairTarget(cwd, diagnostic.file)) continue;
+    const errors = byFile.get(diagnostic.file) ?? [];
+    errors.push(diagnostic.message);
+    byFile.set(diagnostic.file, errors);
+  }
+
+  return [...byFile.entries()]
+    .slice(0, MAX_REPAIR_FILES)
+    .map(([file, errors]) => ({ file, errors: errors.slice(0, MAX_REPAIR_ERRORS) }));
+}
+
+/** Error lines from a failed command, falling back to raw output when unparseable. */
+function failureLines(output: string): string[] {
+  const lines = errorLines(output);
+  if (lines.length > 0) return lines;
+  return output
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(0, 10);
+}
+
+/** Injectable runtime seams for the tier-1 build (testable without tsc/LLM). */
+export interface Tier1Deps {
+  run(command: string, args: string[], cwd: string): Promise<CommandResult>;
+  repairFile(filePath: string, currentContent: string, errors: string[]): Promise<string>;
+}
+
+/**
+ * Tier 1 core: dependency install, `tsc --noEmit` with a bounded compiler
+ * auto-repair loop (default: one targeted turn over up to three files), then
+ * `vite build` — always attempted so `dist/` artifacts exist for tiers 2/3
+ * even when residual type errors remain.
+ */
+export async function runTier1Build(
+  cwd: string,
+  deps: Tier1Deps,
+  maxRepairTurns: number = 1,
+): Promise<BuildCheck> {
+  const root = resolve(cwd);
+
+  const hasModules = await nodeModulesExists(root);
 
   if (!hasModules) {
     // Install dependencies. A non-zero exit is tolerated when node_modules
     // was still materialized — pnpm may exit non-zero on unapproved build
     // scripts or lockfile conflicts while having installed everything the
     // build needs. Only escalate to npm when pnpm produced nothing.
-    const install = await runCommand('pnpm', ['install', '--prefer-offline'], cwd);
+    const install = await deps.run('pnpm', ['install', '--prefer-offline'], root);
 
-    let modulesReady = await nodeModulesExists(cwd);
+    let modulesReady = await nodeModulesExists(root);
 
     if (!modulesReady) {
       // pnpm may refuse on a conflicting lockfile (e.g. one written by npm);
       // fall back to npm before giving up.
-      const fallback = await runCommand('npm', ['install', '--prefer-offline'], cwd);
-      modulesReady = await nodeModulesExists(cwd);
+      const fallback = await deps.run('npm', ['install', '--prefer-offline'], root);
+      modulesReady = await nodeModulesExists(root);
 
       if (!modulesReady) {
         return {
@@ -248,27 +374,95 @@ export async function verifyBuild(outputDir: string): Promise<BuildCheck> {
     }
   }
 
-  const tsc = await runCommand('npx', ['--no-install', 'tsc', '--noEmit'], cwd);
-  const errors: string[] = [];
+  const tscArgs = ['--no-install', 'tsc', '--noEmit'];
+  let tsc = await deps.run('npx', tscArgs, root);
 
-  let vitePassed = false;
+  // Bounded compiler auto-repair loop (default: one targeted turn).
+  const repairedFiles: string[] = [];
+  const errorsBefore: string[] = [];
+  let repairRan = false;
+
   if (!tsc.ok) {
-    errors.push(...errorLines(tsc.output));
-  } else {
-    const vite = await runCommand('npx', ['--no-install', 'vite', 'build'], cwd);
-    if (!vite.ok) {
-      errors.push(...errorLines(vite.output));
-    } else {
-      vitePassed = true;
+    for (let turn = 0; turn < maxRepairTurns && !tsc.ok; turn += 1) {
+      const targets = selectRepairTargets(root, tsc.output);
+      if (targets.length === 0) break;
+
+      repairRan = true;
+      for (const target of targets) {
+        const filePath = join(root, target.file);
+        let content: string;
+        try {
+          content = await readFile(filePath, 'utf8');
+        } catch {
+          continue; // Diagnostic points at a missing file — skip it.
+        }
+
+        try {
+          const repaired = await deps.repairFile(target.file, content, target.errors);
+          await writeFile(filePath, repaired, 'utf8');
+          repairedFiles.push(target.file);
+          errorsBefore.push(...target.errors);
+        } catch {
+          // A failed repair turn leaves the file untouched.
+        }
+      }
+
+      tsc = await deps.run('npx', tscArgs, root);
     }
   }
 
+  // Always attempt `vite build`, even with residual type errors: esbuild
+  // transpiles without typechecking, so dist/index.html is produced and the
+  // route/visual tiers can execute. The typecheck verdict is reported
+  // separately (tscPassed / typecheckBypassed).
+  const vite = await deps.run('npx', ['--no-install', 'vite', 'build'], root);
+
+  const errors: string[] = [];
+  if (!tsc.ok) errors.push(...failureLines(tsc.output));
+  if (!vite.ok) errors.push(...failureLines(vite.output));
+
+  const repair: CompilerRepairRecord | undefined = repairRan
+    ? { repairedFiles, fixed: tsc.ok, errorsBefore }
+    : undefined;
+
   return {
-    success: tsc.ok && vitePassed,
+    success: vite.ok,
     tscPassed: tsc.ok,
-    vitePassed,
+    vitePassed: vite.ok,
     errors,
+    ...(repair !== undefined ? { repair } : {}),
+    ...(!tsc.ok ? { typecheckBypassed: true } : {}),
   };
+}
+
+/** Options for {@link verifyBuild}'s compiler auto-repair loop. */
+export interface BuildRepairOptions {
+  /** Max targeted repair turns after a failing typecheck (default 1; 0 disables). */
+  maxRepairTurns?: number;
+  /** Repair hook override (test seam). Defaults to `repairCodeFile`. */
+  repairFile?: Tier1Deps['repairFile'];
+}
+
+/**
+ * Tier 1: runs `tsc --noEmit` (with a bounded compiler auto-repair turn via
+ * `repairCodeFile`) and `vite build` inside the output directory. Installs
+ * dependencies if `node_modules` is absent before typechecking. `vite build`
+ * is attempted even when residual type errors remain so `dist/` artifacts are
+ * produced for the route/visual tiers. Returns success flags, compiler logs,
+ * and the auto-repair record.
+ */
+export async function verifyBuild(
+  outputDir: string,
+  options: BuildRepairOptions = {},
+): Promise<BuildCheck> {
+  return runTier1Build(
+    resolve(outputDir),
+    {
+      run: runCommand,
+      repairFile: options.repairFile ?? repairCodeFile,
+    },
+    options.maxRepairTurns ?? 1,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -962,6 +1156,12 @@ export async function runVerification(
   if (!build.success) {
     diagnostics.push(
       `Build failed (${build.errors.length} error line(s)); visual tiers may use a stale dist/.`,
+    );
+  }
+  if (build.typecheckBypassed === true) {
+    diagnostics.push(
+      `Residual type errors tolerated (${(build.repair?.repairedFiles ?? []).length} file(s) auto-repaired); ` +
+        'dist/ built for visual tiers.',
     );
   }
 
