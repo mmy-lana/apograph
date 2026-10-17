@@ -164,6 +164,8 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
 
   const routes: EvidenceManifest['routes'] = [];
   const assetUrls = new Set<string>();
+  /** Tracks which route paths each discovered asset URL was seen on. */
+  const assetRouteMap = new Map<string, string[]>();
   /** Screenshot-cropped visual assets (background-image / canvas / banners). */
   const visualAssets: AssetEntry[] = [];
   /** Filesystem names claimed by visual extracts (collision-safe across routes). */
@@ -300,14 +302,16 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         // crop background-image / canvas / svg / unmirrorable <img> surfaces —
         // which have no mirrored <img> source — out of the just-captured
         // full-page PNG. Generic wrapper divs are never cropped for size.
-        visualAssets.push(
-          ...(await extractVisualAssets(
-            page,
-            desktopScreenshot as string,
-            assetsDir,
-            usedVisualNames,
-          )),
+        const desktopVisuals = await extractVisualAssets(
+          page,
+          desktopScreenshot as string,
+          assetsDir,
+          usedVisualNames,
         );
+        for (const va of desktopVisuals) {
+          va.routes = [path];
+        }
+        visualAssets.push(...desktopVisuals);
       }
       if (captureMobile) {
         await page.setViewportSize({ ...MOBILE_VIEWPORT });
@@ -315,14 +319,16 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         if (!captureDesktop) {
           // Mobile-only crawl: extract against the mobile screenshot while the
           // mobile layout (and therefore its bounding boxes) is active.
-          visualAssets.push(
-            ...(await extractVisualAssets(
-              page,
-              mobileScreenshot as string,
-              assetsDir,
-              usedVisualNames,
-            )),
+          const mobileVisuals = await extractVisualAssets(
+            page,
+            mobileScreenshot as string,
+            assetsDir,
+            usedVisualNames,
           );
+          for (const va of mobileVisuals) {
+            va.routes = [path];
+          }
+          visualAssets.push(...mobileVisuals);
         }
       }
       if (captureDesktop) {
@@ -443,6 +449,12 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
       // Asset discovery.
       for (const assetUrl of await discoverImageAssets(page)) {
         assetUrls.add(assetUrl);
+        const existing = assetRouteMap.get(assetUrl);
+        if (existing !== undefined) {
+          if (!existing.includes(path)) existing.push(path);
+        } else {
+          assetRouteMap.set(assetUrl, [path]);
+        }
       }
     }
 
@@ -474,6 +486,14 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
     assetsDir,
   );
   diagnostics.uncapturedResources.push(...uncaptured);
+
+  // Merge per-route provenance into mirrored asset entries.
+  for (const asset of assets) {
+    const routes = assetRouteMap.get(asset.originalUrl);
+    if (routes !== undefined && routes.length > 0) {
+      asset.routes = routes;
+    }
+  }
 
   // Visual extracts join the mirrored assets in the manifest so the
   // synthesizer prompt lists them under available local assets (and

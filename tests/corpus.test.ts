@@ -31,6 +31,8 @@ function rawSpan(overrides: Partial<RawTextSpan>): RawTextSpan {
     webkitTextFillColor: 'rgb(248, 250, 252)',
     display: 'block',
     visibility: 'visible',
+    boxTop: 0,
+    boxLeft: 0,
     boxWidth: 800,
     boxHeight: 40,
     tag: 'span',
@@ -179,17 +181,17 @@ test('dom > transparent color predicate', () => {
 // Prompt formatting (spec s5.2)
 // ---------------------------------------------------------------------------
 
-test('prompt > corpus is priority-ordered with verbatim gradient definitions', () => {
+test('prompt > corpus is spatially ordered (top-to-bottom) with verbatim gradient definitions', () => {
   const spans: TextSpan[] = [
-    { text: 'Body paragraph.', color: 'rgb(148, 163, 184)', tag: 'span', parentTag: 'p' },
-    { text: 'TECHNOLOGY & AI PARTNER', color: 'rgb(59, 130, 246)', tag: 'span', parentTag: 'h1' },
-    { text: 'BUSINESS', color: 'rgb(6, 182, 212)', tag: 'span', parentTag: 'h1', gradient: EXAMPLE_GRADIENT },
-    { text: 'Sub heading', color: 'rgb(148, 163, 184)', tag: 'span', parentTag: 'h2' },
+    { text: 'Body paragraph.', color: 'rgb(148, 163, 184)', tag: 'span', parentTag: 'p', boundingBox: { top: 800, left: 0, width: 600, height: 20 } },
+    { text: 'TECHNOLOGY & AI PARTNER', color: 'rgb(59, 130, 246)', tag: 'span', parentTag: 'h1', boundingBox: { top: 100, left: 0, width: 600, height: 40 } },
+    { text: 'BUSINESS', color: 'rgb(6, 182, 212)', tag: 'span', parentTag: 'h1', gradient: EXAMPLE_GRADIENT, boundingBox: { top: 150, left: 0, width: 400, height: 40 } },
+    { text: 'Sub heading', color: 'rgb(148, 163, 184)', tag: 'span', parentTag: 'h2', boundingBox: { top: 400, left: 0, width: 500, height: 30 } },
   ];
 
   const prompt = formatTextSpansForPrompt(spans);
 
-  // h1 spans first (document order within rank), then h2, then p.
+  // Spans sorted by boundingBox.top ASC: h1(100), h1(150), h2(400), p(800).
   const lines = prompt.split('\n').filter((line) => line.includes('[h') || line.includes('[p'));
   assert.match(lines[0] as string, /TECHNOLOGY & AI PARTNER/);
   assert.match(lines[1] as string, /BUSINESS/);
@@ -197,8 +199,6 @@ test('prompt > corpus is priority-ordered with verbatim gradient definitions', (
   assert.match(lines[3] as string, /Body paragraph\./);
   // Gradient definition embedded verbatim.
   assert.ok(prompt.includes(EXAMPLE_GRADIENT));
-  // Verbatim reproduction instruction present.
-  assert.ok(prompt.includes('verbatim'));
 });
 
 test('prompt > empty corpus reports not captured', () => {

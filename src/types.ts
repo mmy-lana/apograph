@@ -143,6 +143,8 @@ export interface AssetEntry {
   kind?: 'mirrored' | 'visual-extract';
   /** Human-readable role hint for visual extracts (e.g. 'hero-bg'). */
   suggestedName?: string;
+  /** Route paths where this asset was encountered. */
+  routes?: string[];
 }
 
 /** Why a visually distinct region was selected for extraction. */
@@ -290,6 +292,8 @@ export interface TextSpan {
   tag: string;
   /** Nearest semantic ancestor tag (e.g. `h1`), else the parent tag. */
   parentTag: string;
+  /** Bounding box in CSS pixels at capture time. */
+  boundingBox?: { top: number; left: number; width: number; height: number };
 }
 
 /** One node of the accessibility tree (mirrors Playwright's AxNode shape). */

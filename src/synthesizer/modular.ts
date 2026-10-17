@@ -186,6 +186,11 @@ const SYSTEM_GUIDELINES = [
   '- When rendering icons from lucide-react in maps, lists, or components, store the component reference and render as `<item.icon className="..." />`, or store JSX elements directly `icon: <Shield className="..." />`. Never assign string names and component references to the same property.',
   '- Check the asset descriptions before linking images. Only use assets named `hero-bg` or `*-bg` for section backgrounds. Use card/thumbnail assets for card items.',
   '- Never render a <header> or <nav> inside route pages (e.g. HomePage.tsx). The shared Navbar and Footer are already rendered globally by the layout wrapper. Page components must start directly with their own unique hero or top section.',
+  '',
+  'CRITICAL LAYOUT ARCHITECTURE RULES (NON-NEGOTIABLE):',
+  '- Layout Architecture: Page sections must stack vertically in normal document flow inside <main className="flex min-h-screen w-full flex-col bg-background text-foreground">. Never position whole sections with `absolute` or `fixed` over other sections.',
+  '- STRICT PROHIBITION ON WHOLE-SECTION ABSOLUTE POSITIONING: NEVER use `absolute inset-0`, `fixed inset-0`, or absolute positioning on top-level <section> or container wrappers. Every section must sit in natural vertical flow (e.g. `<section className="w-full py-16 sm:py-24">`). `position: absolute` is ONLY permitted for background/decorative elements inside a `relative` parent container.',
+  '- SECTION INTEGRITY: Only render sections that visually belong to THIS page. Do not invent or pull cards, badges, or content from other pages.',
 ].join('\n');
 
 // ---------------------------------------------------------------------------
@@ -723,6 +728,26 @@ function manifestRouteFor(planRoute: PlanRoute, manifest: EvidenceManifest): Cra
   return manifest.routes.find((route) => route.path === planRoute.path);
 }
 
+/** True when an asset filename looks like a global logo or favicon. */
+function isGlobalAsset(asset: AssetEntry): boolean {
+  const name = (asset.localPath ?? asset.originalUrl).toLowerCase();
+  return /logo|favicon|icon|brand|og-image/.test(name);
+}
+
+/**
+ * Filters the manifest's asset list to only those relevant for a specific
+ * route: assets whose provenance includes this route, plus global logos/icons.
+ */
+function routeScopedAssets(assets: AssetEntry[], routePath: string): AssetEntry[] {
+  return assets.filter(
+    (asset) =>
+      isGlobalAsset(asset) ||
+      asset.routes === undefined ||
+      asset.routes.length === 0 ||
+      asset.routes.includes(routePath),
+  );
+}
+
 /** Matches a `.map(...)` call over an inline array with no object literals. */
 const INLINE_EMPTY_ARRAY_MAP_RE = /\[\s*(?:\/\/[^\n]*\n\s*)*\]\s*\.map\(/;
 
@@ -991,7 +1016,7 @@ export async function synthesizeModularProject(
       formatTokensForVisionPrompt(manifestRoute?.tokens ?? plan.designSystem),
       '',
       'Mirrored image assets (reference as /assets/<filename>):',
-      formatAssetMapForPrompt(manifest.assets),
+      formatAssetMapForPrompt(routeScopedAssets(manifest.assets, route.path)),
       '',
       'Accessibility tree of the reference page:',
       manifestRoute ? formatA11yTreeForVisionPrompt(manifestRoute.a11yTree) : '(not captured)',

@@ -105,12 +105,12 @@ test('isolation > pure pipeline exports remain available for Node tests', async 
   assert.equal(typeof normalizeColorToHex, 'function');
   // Signatures still behave per s8.4.
   assert.equal(normalizeColorToHex('rgb(8, 15, 28)'), '#080f1c');
-  assert.deepEqual(
+assert.deepEqual(
     buildTextSpans([
       {
         text: 'X', color: 'rgb(0, 0, 0)', backgroundImage: 'none', backgroundClip: 'border-box',
         webkitTextFillColor: 'rgb(0, 0, 0)', display: 'block', visibility: 'visible',
-        boxWidth: 10, boxHeight: 10, tag: 'span', parentTag: 'p',
+        boxTop: 0, boxLeft: 0, boxWidth: 10, boxHeight: 10, tag: 'span', parentTag: 'p',
       },
     ]).length,
     1,

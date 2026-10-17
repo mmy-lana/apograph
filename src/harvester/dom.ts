@@ -297,6 +297,8 @@ export interface RawTextSpan {
   webkitTextFillColor: string;
   display: string;
   visibility: string;
+  boxTop: number;
+  boxLeft: number;
   boxWidth: number;
   boxHeight: number;
   tag: string;
@@ -346,6 +348,12 @@ export function buildTextSpans(raw: RawTextSpan[]): TextSpan[] {
       color: entry.color,
       tag: entry.tag,
       parentTag: entry.parentTag,
+      boundingBox: {
+        top: entry.boxTop,
+        left: entry.boxLeft,
+        width: entry.boxWidth,
+        height: entry.boxHeight,
+      },
     };
     if (isGradientText(entry)) span.gradient = entry.backgroundImage;
     spans.push(span);
@@ -406,6 +414,8 @@ function collectRawTextSpans(): RawTextSpan[] {
       webkitTextFillColor: style.webkitTextFillColor,
       display: style.display,
       visibility: style.visibility,
+      boxTop: rect.top,
+      boxLeft: rect.left,
       boxWidth: rect.width,
       boxHeight: rect.height,
       tag,
