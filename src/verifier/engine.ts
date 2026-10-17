@@ -627,6 +627,21 @@ function cropToHeight<T extends DecodedPng>(source: T, height: number): T {
   return cropped as unknown as T;
 }
 
+/**
+ * Normalizes a decoded PNG's alpha channel to fully opaque so transparency
+ * carried only by the alpha channel (transparent overlays, unpainted regions)
+ * never registers as a layout mismatch: the RGB channels carry the comparison.
+ */
+export function normalizeAlphaChannel(png: {
+  width: number;
+  height: number;
+  data: Buffer;
+}): void {
+  for (let index = 3; index < png.data.length; index += 4) {
+    png.data[index] = 255;
+  }
+}
+
 /** Compares a current screenshot buffer against a reference buffer. */
 export function compareScreenshots(
   reference: Buffer,
@@ -650,6 +665,11 @@ export function compareScreenshots(
     referencePng.width,
     referencePng.height,
   );
+
+  // Normalize both alpha channels before diffing: transparent-overlay alpha
+  // discrepancies must not blow up the mismatch metric.
+  normalizeAlphaChannel(referencePng);
+  normalizeAlphaChannel(currentPng);
 
   const diff = new PNG({ width: referencePng.width, height: referencePng.height });
   const mismatched = pixelmatch(

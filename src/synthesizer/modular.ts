@@ -184,6 +184,7 @@ const SYSTEM_GUIDELINES = [
   '   no truncation, no markdown fences inside file contents.',
   '- Always use type-only imports for React types: `import type { FormEvent, ReactNode } from \'react\'`.',
   '- When rendering icons from lucide-react in maps, lists, or components, store the component reference and render as `<item.icon className="..." />`, or store JSX elements directly `icon: <Shield className="..." />`. Never assign string names and component references to the same property.',
+  '- When a section has an available local asset matching its role (e.g. hero-bg.png, map.png), prioritize using that asset via <img src="/assets/..." /> or inline CSS background-image over generating plain CSS gradients.',
 ].join('\n');
 
 // ---------------------------------------------------------------------------

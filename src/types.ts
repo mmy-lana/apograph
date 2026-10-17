@@ -139,6 +139,29 @@ export interface AssetEntry {
   status: AssetStatus;
   /** MIME type as reported by the download response, when known. */
   mimeType?: string;
+  /** Provenance: URL mirror vs screenshot-cropped visual extract. */
+  kind?: 'mirrored' | 'visual-extract';
+  /** Human-readable role hint for visual extracts (e.g. 'hero-bg'). */
+  suggestedName?: string;
+}
+
+/** Why a visually distinct region was selected for extraction. */
+export type VisualAssetKind = 'background-image' | 'canvas' | 'hero-banner';
+
+/**
+ * A significant visually distinct region (CSS `background-image`, `<canvas>`,
+ * or a >300px hero banner lacking a mirrored `<img>` source) cropped out of a
+ * full-page screenshot as a visual asset.
+ */
+export interface VisualAssetRegion {
+  kind: VisualAssetKind;
+  /** Page-space bounding box in CSS pixels at capture time. */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Raw in-page label (element id / class / aria-label / role). */
+  label: string;
 }
 
 /** A URL the crawler chose not to visit, with the reason. */

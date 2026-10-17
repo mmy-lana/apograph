@@ -20,6 +20,7 @@ import { join, resolve } from 'node:path';
 import { chromium } from 'playwright';
 import type { Browser, Frame, Page } from 'playwright';
 import type {
+  AssetEntry,
   CrawlRoute,
   CrawlScope,
   EvidenceManifest,
@@ -36,6 +37,7 @@ import {
 } from './health.js';
 import type { CaptureHealth } from './health.js';
 import { discoverInteractiveStates } from './interactions.js';
+import { extractVisualAssets } from './visual-assets.js';
 import {
   autoScrollWithReset,
   readinessDiagnostic,
@@ -162,6 +164,10 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
 
   const routes: EvidenceManifest['routes'] = [];
   const assetUrls = new Set<string>();
+  /** Screenshot-cropped visual assets (background-image / canvas / banners). */
+  const visualAssets: AssetEntry[] = [];
+  /** Filesystem names claimed by visual extracts (collision-safe across routes). */
+  const usedVisualNames = new Set<string>();
   const diagnostics: EvidenceManifest['diagnostics'] = {
     skippedUrls: [],
     failedNavigations: [],
@@ -290,10 +296,33 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
       if (captureDesktop) {
         await page.setViewportSize({ ...DESKTOP_VIEWPORT });
         await page.screenshot({ path: desktopScreenshot as string, type: 'png', fullPage: true });
+        // Visual bounding-box asset extraction (screenshot-to-code pattern):
+        // crop background-image / canvas / hero-banner regions — which have no
+        // mirrored <img> source — out of the just-captured full-page PNG.
+        visualAssets.push(
+          ...(await extractVisualAssets(
+            page,
+            desktopScreenshot as string,
+            assetsDir,
+            usedVisualNames,
+          )),
+        );
       }
       if (captureMobile) {
         await page.setViewportSize({ ...MOBILE_VIEWPORT });
         await page.screenshot({ path: mobileScreenshot as string, type: 'png', fullPage: true });
+        if (!captureDesktop) {
+          // Mobile-only crawl: extract against the mobile screenshot while the
+          // mobile layout (and therefore its bounding boxes) is active.
+          visualAssets.push(
+            ...(await extractVisualAssets(
+              page,
+              mobileScreenshot as string,
+              assetsDir,
+              usedVisualNames,
+            )),
+          );
+        }
       }
       if (captureDesktop) {
         await page.setViewportSize({ ...DESKTOP_VIEWPORT });
@@ -445,19 +474,24 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
   );
   diagnostics.uncapturedResources.push(...uncaptured);
 
+  // Visual extracts join the mirrored assets in the manifest so the
+  // synthesizer prompt lists them under available local assets (and
+  // copyMirroredAssets mirrors them into public/assets/).
+  const allAssets = [...assets, ...visualAssets];
+
   const manifest: EvidenceManifest = {
     targetUrl: canonicalRoot,
     crawledAt: new Date().toISOString(),
     stats: {
       pagesCrawled: routes.length,
       linksDiscovered: bookkeeping.linksDiscovered,
-      assetsDownloaded: assets.filter((asset) => asset.status === 'downloaded').length,
-      assetsFailed: assets.filter((asset) => asset.status === 'failed').length,
-      externalAssets: assets.filter((asset) => asset.status === 'external').length,
+      assetsDownloaded: allAssets.filter((asset) => asset.status === 'downloaded').length,
+      assetsFailed: allAssets.filter((asset) => asset.status === 'failed').length,
+      externalAssets: allAssets.filter((asset) => asset.status === 'external').length,
       durationMs: Date.now() - startedAt,
     },
     routes,
-    assets,
+    assets: allAssets,
     diagnostics,
   };
 
