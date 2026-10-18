@@ -5,6 +5,8 @@ node_modules/
 # Build artifacts
 dist/
 build/
+coverage/
+.nyc_output/
 *.tsbuildinfo
 
 # Repomix & context dumps
@@ -15,7 +17,8 @@ repomix-output.*
 # Environment & secrets
 .env
 .env.*
-*.local
+!.env.example
+!.env.test.example
 
 # Playwright & browser caches
 .cache/
@@ -24,9 +27,33 @@ test-results/
 # Apograph runtime evidence and generated projects
 .apograph/
 output/
+.apograph-cache/
+apograph-output/
+apograph-evidence/
 
 # OS metadata
 .DS_Store
 Thumbs.db
+.idea/
+.vscode/
 
 Modelfile.apograph
+
+#Logs and temporary files
+*.log
+logs/
+tmp/
+temp/
+
+#Browser and test artifacts
+
+playwright-report/
+test-results/
+blob-report/
+
+#Local certificates and private keys
+
+*.pem
+*.key
+*.p12
+*.pfx
