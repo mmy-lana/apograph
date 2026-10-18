@@ -11,6 +11,7 @@ import { versions } from 'node:process';
 import { generateText } from 'ai';
 import { chromium } from 'playwright';
 import { getModel, resolveProviderName } from '../config/models.js';
+import { redactSecrets } from '../config/validate.js';
 import {
   validateProviderConfig,
   probeModelCapabilities,
@@ -98,7 +99,7 @@ async function checkLlm(): Promise<CheckResult> {
       fix: null,
     };
   } catch (cause) {
-    const reason = cause instanceof Error ? cause.message : String(cause);
+    const reason = redactSecrets(cause instanceof Error ? cause.message : String(cause));
     return {
       label: `LLM connectivity (${provider})`,
       pass: false,
@@ -166,7 +167,7 @@ async function checkCapabilities(): Promise<CheckResult[]> {
   try {
     capabilities = await probeModelCapabilities(getModel());
   } catch (cause) {
-    const reason = cause instanceof Error ? cause.message : String(cause);
+    const reason = redactSecrets(cause instanceof Error ? cause.message : String(cause));
     return [
       {
         label: 'Model capability probes',

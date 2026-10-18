@@ -223,7 +223,7 @@ async function startDevServer(outputDir: string, port: number): Promise<DevServe
 
   const child = execFile(
     'npx',
-    ['vite', '--port', String(port), '--strictPort', '--host', '127.0.0.1'],
+    ['--no-install', 'vite', '--port', String(port), '--strictPort', '--host', '127.0.0.1'],
     { cwd: outputDir },
     () => {
       // Output is discarded; liveness is tracked via the port probe below.

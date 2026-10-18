@@ -91,9 +91,10 @@ function outDirFromUrl(url: string): string {
 }
 
 /** Parses a <number> commander option into a safe integer. */
-function parseNumber(value: string, fallback: number): number {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isNaN(parsed) ? fallback : parsed;
+function parseNumber(value: string, fallback: number, min = 0, max = Number.MAX_SAFE_INTEGER): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) return fallback;
+  return parsed;
 }
 
 /**

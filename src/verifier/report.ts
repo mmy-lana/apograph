@@ -29,10 +29,9 @@ export interface CompilerRepairRecord {
 /**
  * Tier 1 result: tsc + vite build inside the output directory.
  *
- * `success` reflects artifact production (`vitePassed`): the pipeline stays
- * resilient to residual type errors so `dist/` exists for tiers 2/3. The
- * typecheck verdict is carried separately in `tscPassed` and
- * `typecheckBypassed`.
+ * `success` requires both TypeScript and Vite to pass. Vite may still be
+ * attempted after a typecheck failure for diagnostics, but residual type
+ * errors are not a successful build.
  */
 export interface BuildCheck {
   /** True when `dist/` artifacts were produced (== vitePassed). */

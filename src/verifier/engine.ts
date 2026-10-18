@@ -20,7 +20,7 @@ import { promisify } from 'node:util';
 import { readFile, stat, mkdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { extname, join, resolve, sep } from 'node:path';
+import { extname, join, relative, resolve, sep } from 'node:path';
 import { chromium } from 'playwright';
 import type { Browser, ConsoleMessage, Page } from 'playwright';
 import pixelmatch from 'pixelmatch';
@@ -35,9 +35,10 @@ import type {
 } from './report.js';
 import type { EvidenceManifest, ViewportMode } from '../types.js';
 import type { ApographPlan, PlanRoute } from '../plan/schema.js';
-import { validatePlan } from '../plan/generator.js';
+import { loadEvidenceManifest, validatePlan } from '../plan/generator.js';
 import { repairCodeFile } from '../synthesizer/llm.js';
 import { repairComponentWithVisualDiff } from '../synthesizer/vision.js';
+import { assertNoSymlinkComponents, resolveContainedPath } from '../utils/fs-safe.js';
 
 /** Promisified execFile for async child-process execution. */
 const execFileAsync = promisify(execFile);
@@ -109,7 +110,8 @@ export async function startSiteServer(distDir: string): Promise<SiteHandle> {
       let filePath = join(root, urlPath);
 
       // Directory traversal guard: stay inside dist/.
-      if (!filePath.startsWith(root)) {
+      const relativePath = relative(root, filePath);
+       if (relativePath === '..' || relativePath.startsWith(`..${sep}`) || relativePath.includes(`..${sep}`)) {
         response.writeHead(403);
         response.end();
         return;
@@ -341,6 +343,9 @@ export async function runTier1Build(
   maxRepairTurns: number = 1,
 ): Promise<BuildCheck> {
   const root = resolve(cwd);
+  const repairTurns = Number.isSafeInteger(maxRepairTurns) && maxRepairTurns >= 0
+    ? Math.min(maxRepairTurns, 3)
+    : 0;
 
   const hasModules = await nodeModulesExists(root);
 
@@ -349,14 +354,14 @@ export async function runTier1Build(
     // was still materialized — pnpm may exit non-zero on unapproved build
     // scripts or lockfile conflicts while having installed everything the
     // build needs. Only escalate to npm when pnpm produced nothing.
-    const install = await deps.run('pnpm', ['install', '--prefer-offline'], root);
+    const install = await deps.run('pnpm', ['install', '--prefer-offline', '--ignore-scripts'], root);
 
     let modulesReady = await nodeModulesExists(root);
 
     if (!modulesReady) {
       // pnpm may refuse on a conflicting lockfile (e.g. one written by npm);
       // fall back to npm before giving up.
-      const fallback = await deps.run('npm', ['install', '--prefer-offline'], root);
+      const fallback = await deps.run('npm', ['install', '--prefer-offline', '--ignore-scripts'], root);
       modulesReady = await nodeModulesExists(root);
 
       if (!modulesReady) {
@@ -383,7 +388,7 @@ export async function runTier1Build(
   let repairRan = false;
 
   if (!tsc.ok) {
-    for (let turn = 0; turn < maxRepairTurns && !tsc.ok; turn += 1) {
+    for (let turn = 0; turn < repairTurns && !tsc.ok; turn += 1) {
       const targets = selectRepairTargets(root, tsc.output);
       if (targets.length === 0) break;
 
@@ -399,6 +404,7 @@ export async function runTier1Build(
 
         try {
           const repaired = await deps.repairFile(target.file, content, target.errors);
+          if (repaired.length === 0 || repaired.length > 1_000_000) throw new Error('repair output size invalid');
           await writeFile(filePath, repaired, 'utf8');
           repairedFiles.push(target.file);
           errorsBefore.push(...target.errors);
@@ -426,7 +432,7 @@ export async function runTier1Build(
     : undefined;
 
   return {
-    success: vite.ok,
+    success: tsc.ok && vite.ok,
     tscPassed: tsc.ok,
     vitePassed: vite.ok,
     errors,
@@ -455,6 +461,17 @@ export async function verifyBuild(
   outputDir: string,
   options: BuildRepairOptions = {},
 ): Promise<BuildCheck> {
+  if (process.env.APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION !== '1') {
+    return {
+      success: false,
+      tscPassed: false,
+      vitePassed: false,
+      errors: [
+        'Generated-project execution is disabled by default because no portable sandbox is available. ',
+        'Set APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION=1 only in a disposable, isolated environment.',
+      ],
+    };
+  }
   return runTier1Build(
     resolve(outputDir),
     {
@@ -907,7 +924,8 @@ export async function runVisualRepairPass(
   const { visuals, componentPathsByRoute, outputDir } = options;
   const repairComponent = options.repairComponent ?? repairComponentWithVisualDiff;
   const rebuild = options.rebuild ?? defaultRebuild;
-  const maxTurns = Math.max(0, options.maxRepairTurnsPerRoute ?? 2);
+  const configuredTurns = options.maxRepairTurnsPerRoute ?? 2;
+  const maxTurns = Number.isFinite(configuredTurns) ? Math.max(0, Math.floor(configuredTurns)) : 0;
   const repairs: RepairRecord[] = [];
 
   const failingByRoute = new Map<string, VisualCheck[]>();
@@ -923,9 +941,16 @@ export async function runVisualRepairPass(
   for (const [routePath, initialFailures] of failingByRoute) {
     const componentPath = componentPathsByRoute.get(routePath);
     if (componentPath === undefined || maxTurns === 0 || options.reVerify === undefined) continue;
-    const resolvedComponentPath = componentPath.startsWith('/')
-      ? componentPath
-      : join(outputDir, componentPath);
+    let resolvedComponentPath: string;
+    try {
+      const relativeComponent = componentPath.startsWith('/')
+        ? relative(outputDir, componentPath)
+        : componentPath;
+      resolvedComponentPath = resolveContainedPath(outputDir, relativeComponent);
+      await assertNoSymlinkComponents(outputDir, resolvedComponentPath);
+    } catch {
+      continue;
+    }
 
     let acceptedCode: string;
     try {
@@ -1056,15 +1081,10 @@ async function tryLoadPlan(evidenceDir: string): Promise<ApographPlan | null> {
   }
 }
 
-/** Loads the evidence manifest, or null. */
+/** Loads the strictly validated evidence manifest, or null. */
 async function tryLoadManifest(evidenceDir: string): Promise<EvidenceManifest | null> {
-  const manifestPath = join(resolve(evidenceDir), 'manifest.json');
   try {
-    const raw: unknown = JSON.parse(await readFile(manifestPath, 'utf8'));
-    if (typeof raw === 'object' && raw !== null && 'routes' in raw) {
-      return raw as EvidenceManifest;
-    }
-    return null;
+    return await loadEvidenceManifest(evidenceDir);
   } catch {
     return null;
   }
@@ -1079,12 +1099,16 @@ async function resolveEvidencePath(
   path: string,
   evidenceDir: string,
 ): Promise<string | null> {
-  const candidates = path.startsWith('/')
-    ? [path]
-    : [path, join(resolve(evidenceDir), path)];
+  const candidates: string[] = [];
+  try {
+    candidates.push(resolveContainedPath(evidenceDir, path));
+  } catch {
+    return null;
+  }
 
   for (const candidate of candidates) {
     try {
+      await assertNoSymlinkComponents(evidenceDir, candidate);
       await readFile(candidate);
       return resolve(candidate);
     } catch {
@@ -1161,7 +1185,13 @@ export async function runVerification(
     diagnostics.push('The plan in the evidence directory is not approved.');
   }
 
-  const { routePaths, visualRoutes } = await buildRouteInputs(plan, manifest, evidenceDir);
+  const authorizationValid = plan !== null && plan.approved && manifest !== null;
+  if (!authorizationValid) {
+    diagnostics.push('Verification requires a valid approved plan and evidence manifest; route and visual tiers are blocked.');
+  }
+  const { routePaths, visualRoutes } = authorizationValid
+    ? await buildRouteInputs(plan, manifest, evidenceDir)
+    : { routePaths: [], visualRoutes: [] };
 
   // --- Tier 1: build ---------------------------------------------------
   const build = await verifyBuild(outputDir);
@@ -1172,8 +1202,8 @@ export async function runVerification(
   }
   if (build.typecheckBypassed === true) {
     diagnostics.push(
-      `Residual type errors tolerated (${(build.repair?.repairedFiles ?? []).length} file(s) auto-repaired); ` +
-        'dist/ built for visual tiers.',
+      `Residual type errors remain after ${(build.repair?.repairedFiles ?? []).length} repair target(s); ` +
+        'the build is failed even if dist/ exists.',
     );
   }
 

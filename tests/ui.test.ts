@@ -220,14 +220,14 @@ test('scaffold > emitted tsconfig disables strict and noImplicitAny', () => {
   );
 });
 
-test('scaffold > dev script binds vite to 0.0.0.0', () => {
+test('scaffold > dev script uses Vite default host', () => {
   const files = generateFrontendScaffold('demo-app');
   const packageJson = files.find((file) => file.path === 'package.json');
   assert.ok(packageJson !== undefined);
   const parsed = JSON.parse(packageJson.content) as {
     scripts: { dev?: string };
   };
-  assert.equal(parsed.scripts.dev, 'vite --host 0.0.0.0');
+  assert.equal(parsed.scripts.dev, 'vite');
 });
 
 test('source > system guidelines forbid mixed icon name/component properties', async () => {
@@ -251,11 +251,11 @@ test('source > system guidelines forbid mixed icon name/component properties', a
   );
 });
 
-test('scaffold > vite config relaxes the port and binds all interfaces', () => {
+test('scaffold > vite config relaxes the port and binds loopback only', () => {
   const files = generateFrontendScaffold('demo-app');
   const viteConfig = files.find((file) => file.path === 'vite.config.ts');
   assert.ok(viteConfig !== undefined);
   assert.ok(viteConfig.content.includes('port: 5173'));
   assert.ok(viteConfig.content.includes('strictPort: false'));
-  assert.ok(viteConfig.content.includes('host: true'));
+  assert.ok(viteConfig.content.includes("host: '127.0.0.1'"));
 });

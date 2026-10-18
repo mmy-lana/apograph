@@ -8,7 +8,8 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import * as p from '@clack/prompts';
@@ -165,6 +166,9 @@ export function parseApographConfig(raw: unknown): ApographConfig | null {
   if (!isConfigProvider(candidate.provider)) {
     return null;
   }
+  for (const key of ['model', 'apiKey', 'baseUrl'] as const) {
+    if (candidate[key] !== undefined && typeof candidate[key] !== 'string') return null;
+  }
 
   return {
     provider: candidate.provider,
@@ -191,6 +195,20 @@ export function loadApographConfig(): ApographConfig | null {
   }
 }
 
+/** Writes a complete config atomically with restrictive permissions. */
+async function writeConfigAtomically(path: string, content: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const temp = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temp, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    await chmod(temp, 0o600);
+    await rename(temp, path);
+  } catch (cause) {
+    try { await unlink(temp); } catch { /* best effort cleanup */ }
+    throw cause;
+  }
+}
+
 /**
  * Persists the config to `~/.apograph/config.json`, merging over the raw
  * file so unknown keys survive the update (spec s6.2, non-destructive).
@@ -208,8 +226,7 @@ export async function saveApographConfig(config: ApographConfig): Promise<string
   }
 
   const merged = mergeConfigWithUnknownKeys(existingRaw, config);
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(merged, null, 2), 'utf8');
+  await writeConfigAtomically(path, JSON.stringify(merged, null, 2));
   return path;
 }
 
@@ -268,8 +285,7 @@ export async function setConfigModel(
   }
 
   const merged = mergeConfigWithUnknownKeys(existingRaw, { ...existing, model });
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(merged, null, 2), 'utf8');
+  await writeConfigAtomically(path, JSON.stringify(merged, null, 2));
 
   return { path, model };
 }

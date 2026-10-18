@@ -232,7 +232,7 @@ test('build repair > residual tsc errors still force vite build', async () => {
     );
     assert.equal(build.tscPassed, false);
     assert.equal(build.vitePassed, true);
-    assert.equal(build.success, true);
+    assert.equal(build.success, false);
     assert.equal(build.typecheckBypassed, true);
     assert.equal(build.repair?.fixed, false);
     assert.ok(
@@ -291,7 +291,7 @@ test('build repair > unparseable tsc output skips repair but still builds', asyn
     assert.equal(build.repair, undefined);
     assert.ok(calls.some((call) => call.args.includes('vite')));
     assert.equal(build.vitePassed, true);
-    assert.equal(build.success, true);
+    assert.equal(build.success, false);
     assert.equal(build.typecheckBypassed, true);
   } finally {
     await rm(project, { recursive: true, force: true });
@@ -313,6 +313,11 @@ test('build repair > install failure keeps the legacy early return', async () =>
     assert.equal(build.repair, undefined);
     assert.equal(repairs.length, 0);
     assert.ok(build.errors[0]?.includes('Failed to install dependencies'));
+    assert.ok(
+      calls.filter((call) => call.command === 'pnpm' || call.command === 'npm')
+        .every((call) => call.args.includes('--ignore-scripts')),
+      'dependency installation must disable lifecycle scripts',
+    );
     assert.equal(
       calls.filter((call) => call.args.includes('tsc') || call.args.includes('vite')).length,
       0,

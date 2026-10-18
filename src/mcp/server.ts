@@ -10,7 +10,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import type { Page } from 'playwright';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -27,6 +27,21 @@ import { createPlanFromEvidence } from '../plan/generator.js';
 import { synthesizeModularProject, copyMirroredAssets } from '../synthesizer/modular.js';
 import { emitProject } from '../emitter/scaffold.js';
 import { runVerification } from '../verifier/engine.js';
+import { validateNetworkUrl } from '../crawler/network-policy.js';
+import { resolveContainedPath } from '../utils/fs-safe.js';
+
+/** Resolves the fixed crawl evidence directory inside the current workspace. */
+export function resolveCrawlEvidenceDir(): string {
+  return resolveContainedPath(process.cwd(), '.apograph/evidence');
+}
+
+/** Resolves a clone output directory inside cwd or an approved workspace. */
+export function resolveCloneOutputDir(appName: string, workspaceDir?: string): string {
+  const workspaceRoot = workspaceDir === undefined
+    ? resolveContainedPath(process.cwd(), 'output')
+    : resolveContainedPath(process.cwd(), workspaceDir);
+  return resolveContainedPath(workspaceRoot, appName);
+}
 
 /** Derives an app name from a URL's hostname. */
 function appNameFromUrl(url: string): string {
@@ -59,14 +74,15 @@ server.tool(
   'Headless crawl of a site from a root URL: dual-viewport screenshots, a11y trees, design tokens, and mirrored image assets, persisted as an evidence bundle under .apograph/evidence/.',
   {
     targetUrl: z.string().url(),
-    evidenceDir: z.string().optional(),
-    maxDepth: z.number().int().min(0).optional(),
-    maxPages: z.number().int().min(1).optional(),
+    maxDepth: z.number().int().min(0).max(5).optional(),
+    maxPages: z.number().int().min(1).max(50).optional(),
   },
-  async ({ targetUrl, evidenceDir, maxDepth, maxPages }) => {
+  async ({ targetUrl, maxDepth, maxPages }) => {
+    await validateNetworkUrl(targetUrl);
+    const evidenceDir = resolveCrawlEvidenceDir();
     const manifest = await crawlEvidence({
       rootUrl: targetUrl,
-      evidenceDir: evidenceDir ?? '.apograph/evidence',
+      evidenceDir,
       maxDepth: maxDepth ?? 2,
       maxPages: maxPages ?? 10,
     });
@@ -99,24 +115,18 @@ server.tool(
   'Autonomously crawl a website, derive a plan, synthesize a standalone React 19 + Tailwind CSS frontend, and verify it.',
   {
     targetUrl: z.string().url(),
-    outDir: z.string().optional(),
-    maxPages: z.number().int().min(1).optional(),
+    maxPages: z.number().int().min(1).max(50).optional(),
     verify: z.boolean().optional().default(true),
+    workspaceDir: z.string().min(1).optional(),
   },
-  async ({ targetUrl, outDir, maxPages, verify }) => {
-    const outputDir = outDir ?? join('./output', appNameFromUrl(targetUrl));
-    const evidenceDir = '.apograph/evidence';
-
-    const manifest = await crawlEvidence({
-      rootUrl: targetUrl,
-      evidenceDir,
-      maxPages: maxPages ?? 10,
-    });
-
+  async ({ targetUrl, maxPages, verify, workspaceDir }) => {
+    await validateNetworkUrl(targetUrl);
+    const outputDir = resolveCloneOutputDir(appNameFromUrl(targetUrl), workspaceDir);
+    const evidenceDir = resolveCrawlEvidenceDir();
+    const manifest = await crawlEvidence({ rootUrl: targetUrl, evidenceDir, maxPages: maxPages ?? 10 });
     const plan = createPlanFromEvidence(manifest);
     plan.approved = true;
     plan.approvedAt = new Date().toISOString();
-
     const result = await synthesizeModularProject({ plan, manifest, evidenceDir });
 
     const { writtenFiles, projectDir } = await emitProject(result.files, outputDir, plan.appName, {

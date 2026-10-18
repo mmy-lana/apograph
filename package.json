@@ -39,7 +39,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "tsc && node --test tests/setup.test.ts tests/config.test.ts tests/health.test.ts tests/theme.test.ts tests/corpus.test.ts tests/ui.test.ts tests/gate.test.ts tests/repair.test.ts tests/scroll.test.ts tests/synthesis-guard.test.ts tests/llm.test.ts tests/compiler-repair.test.ts tests/crop-asset.test.ts",
+    "test": "tsc && node --test tests/setup.test.ts tests/config.test.ts tests/health.test.ts tests/theme.test.ts tests/corpus.test.ts tests/ui.test.ts tests/gate.test.ts tests/repair.test.ts tests/scroll.test.ts tests/synthesis-guard.test.ts tests/llm.test.ts tests/compiler-repair.test.ts tests/crop-asset.test.ts tests/security-regression.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc",
     "bump:patch": "pnpm typecheck && pnpm build && npm version patch",
