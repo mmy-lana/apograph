@@ -12,6 +12,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Page } from 'playwright';
 import type { AssetEntry, UncapturedResource } from '../types.js';
+import { validateNetworkUrl, type NetworkPolicyOptions } from './network-policy.js';
 
 /** Download timeout per asset. */
 const DOWNLOAD_TIMEOUT_MS = 20_000;
@@ -118,6 +119,13 @@ export interface MirrorResult {
   uncaptured: UncapturedResource[];
 }
 
+export interface MirrorOptions extends NetworkPolicyOptions {
+  fetchImpl?: typeof fetch;
+  maxAssets?: number;
+  maxBytes?: number;
+  maxTotalBytes?: number;
+}
+
 /**
  * Mirrors same-origin assets into `assetsDir` and records every discovered
  * asset. Cross-origin assets are recorded with status `external` and are not
@@ -127,14 +135,21 @@ export async function mirrorAssets(
   urls: string[],
   rootOrigin: string,
   assetsDir: string,
+  options: MirrorOptions = {},
 ): Promise<MirrorResult> {
   await mkdir(assetsDir, { recursive: true });
 
   const entries: AssetEntry[] = [];
   const uncaptured: UncapturedResource[] = [];
   const seen = new Set<string>();
+  const maxAssets = options.maxAssets ?? 500;
+  const maxBytes = options.maxBytes ?? 10 * 1024 * 1024;
+  const maxTotalBytes = options.maxTotalBytes ?? 50 * 1024 * 1024;
+  let totalBytes = 0;
+  const fetchImpl = options.fetchImpl ?? fetch;
 
   for (const raw of urls) {
+    if (seen.size >= maxAssets) break;
     let url: URL;
     try {
       url = new URL(raw);
@@ -144,6 +159,14 @@ export async function mirrorAssets(
 
     if (url.protocol !== 'http:' && url.protocol !== 'https:') continue;
     if (seen.has(url.href)) continue;
+    try {
+      await validateNetworkUrl(url.href, options);
+    } catch (cause) {
+      const reason = cause instanceof Error ? cause.message : String(cause);
+      entries.push({ originalUrl: url.href, localPath: null, status: 'failed' });
+      uncaptured.push({ url: url.href, reason: `blocked by network policy: ${reason}` });
+      continue;
+    }
     seen.add(url.href);
 
     if (url.origin !== rootOrigin) {
@@ -153,16 +176,35 @@ export async function mirrorAssets(
     }
 
     try {
-      const response = await fetch(url.href, {
+      let response = await fetchImpl(url.href, {
+        redirect: 'manual',
         signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
       });
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get('location');
+        if (location === null) throw new Error('redirect response missing Location');
+        const redirectUrl = await validateNetworkUrl(new URL(location, url).href, options);
+        if (redirectUrl.origin !== url.origin) throw new Error('cross-origin asset redirect blocked');
+        const redirected = await fetchImpl(redirectUrl.href, {
+          redirect: 'error',
+          signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+        });
+        response = redirected;
+        url = redirectUrl;
+      }
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
       }
 
       const mimeType = (response.headers.get('content-type') ?? '').split(';')[0]?.trim() ?? '';
+      if (!mimeType.startsWith('image/')) throw new Error(`unexpected content type: ${mimeType || 'missing'}`);
+      const declaredLength = Number(response.headers.get('content-length') ?? '0');
+      if (declaredLength > maxBytes) throw new Error(`asset exceeds ${maxBytes} byte limit`);
       const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.byteLength > maxBytes) throw new Error(`asset exceeds ${maxBytes} byte limit`);
+      if (totalBytes + buffer.byteLength > maxTotalBytes) throw new Error(`asset budget exceeds ${maxTotalBytes} byte limit`);
+      totalBytes += buffer.byteLength;
       const localPath = join(assetsDir, assetFilename(url, mimeType));
 
       await writeFile(localPath, buffer);

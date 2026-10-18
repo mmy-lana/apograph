@@ -13,10 +13,11 @@
  * project files are never deleted).
  */
 
-import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import * as p from '@clack/prompts';
 import type { ProjectFile, RouteMetadata } from '../types.js';
+import { assertNoSymlinkComponents, assertSafeRelativePath, resolveContainedPath } from '../utils/fs-safe.js';
 
 // ---------------------------------------------------------------------------
 // Fixed target stack versions
@@ -122,7 +123,7 @@ export function generateFrontendScaffold(
     version: '0.1.0',
     type: 'module',
     scripts: {
-      dev: 'vite --host 0.0.0.0',
+      dev: 'vite',
       build: 'tsc --noEmit && vite build',
       preview: 'vite preview',
     },
@@ -155,7 +156,7 @@ export function generateFrontendScaffold(
     '',
     'export default defineConfig({',
     '  plugins: [react(), tailwindcss()],',
-    '  server: { port: 5173, strictPort: false, host: true },',
+    "  server: { port: 5173, strictPort: false, host: '127.0.0.1' },",
     '});',
     '',
   ].join('\n');
@@ -320,6 +321,12 @@ export async function emitProject(
   options: EmitOptions = {},
 ): Promise<{ writtenFiles: string[]; projectDir: string }> {
   const projectDir = resolve(targetDir);
+  try {
+    const rootInfo = await lstat(projectDir);
+    if (rootInfo.isSymbolicLink()) throw new Error(`Output directory must not be a symlink: ${projectDir}`);
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause;
+  }
 
   // Overwrite guard for existing output directories.
   if (await isNonEmptyDir(projectDir)) {
@@ -350,10 +357,12 @@ export async function emitProject(
   const writtenFiles: string[] = [];
 
   for (const file of merged.values()) {
-    const filePath = join(projectDir, file.path);
+    const safePath = assertSafeRelativePath(file.path);
+    const filePath = resolveContainedPath(projectDir, safePath);
     await mkdir(dirname(filePath), { recursive: true });
+    await assertNoSymlinkComponents(projectDir, filePath);
     await writeFile(filePath, file.content, 'utf8');
-    writtenFiles.push(file.path);
+    writtenFiles.push(safePath);
   }
 
   return { writtenFiles, projectDir };

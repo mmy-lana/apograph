@@ -31,6 +31,7 @@ import {
 } from '../crawler/scroll.js';
 import { captureDOMSnapshot } from '../harvester/dom.js';
 import { launchHeadlessChromium } from '../crawler/engine.js';
+import { validateNetworkUrl } from '../crawler/network-policy.js';
 
 // ---------------------------------------------------------------------------
 // Index parsing (spec s8.5)
@@ -278,10 +279,11 @@ function renderSummaryTable(verdicts: GateRouteVerdict[]): void {
 
 /** Opens the platform file manager at the screenshots directory (s3.1 step 2). */
 export async function openScreenshotsDir(screenshotsDir: string): Promise<void> {
-  const { exec } = await import('node:child_process');
+  const { execFile } = await import('node:child_process');
   const opener =
-    platform() === 'darwin' ? 'open' : platform() === 'win32' ? 'start' : 'xdg-open';
-  exec(`${opener} "${screenshotsDir}"`);
+    platform() === 'darwin' ? 'open' : platform() === 'win32' ? 'cmd.exe' : 'xdg-open';
+  const args = platform() === 'win32' ? ['/c', 'start', '', screenshotsDir] : [screenshotsDir];
+  execFile(opener, args);
 }
 
 /** Re-evaluates one route's verdict after a re-crawl. */
@@ -496,6 +498,20 @@ export async function recrawlRoute(
   const browser = await launchHeadlessChromium();
   try {
     const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    await context.route('**/*', async (requestRoute) => {
+      const resourceUrl = requestRoute.request().url();
+      if (/^(data:|blob:|about:)/i.test(resourceUrl)) {
+        await requestRoute.continue();
+        return;
+      }
+      try {
+        await validateNetworkUrl(resourceUrl);
+        await requestRoute.continue();
+      } catch {
+        await requestRoute.abort('blockedbyclient');
+      }
+    });
+    await validateNetworkUrl(route.url);
     const page = await context.newPage();
     await page.goto(route.url, { waitUntil: 'networkidle', timeout: 30_000 });
     const title = await page.title();

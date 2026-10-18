@@ -22,10 +22,10 @@ import { redactSecrets } from '../config/validate.js';
 const GeneratedProjectSchema = z.object({
   files: z.array(
     z.object({
-      path: z.string().min(1),
-      content: z.string(),
+      path: z.string().min(1).max(240).regex(/^(?![\\/])(?!.*(?:^|[\\/])\.\.(?:[\\/]|$))[^\x00\r\n]+$/),
+      content: z.string().max(1000000),
     }),
-  ),
+  ).max(200),
 });
 
 /** The parsed payload of {@link GeneratedProjectSchema}. */

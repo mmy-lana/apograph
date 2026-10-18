@@ -23,11 +23,11 @@ export type InferredInteraction = z.infer<typeof InferredInteractionSchema>;
 /** One route of the plan. */
 export const PlanRouteSchema = z.object({
   /** URL path of the route (e.g. `/`, `/about`). */
-  path: z.string(),
+  path: z.string().regex(/^\/(?:[^\\0\\r\\n]*)$/),
   /** Document title captured at crawl time. */
   title: z.string(),
   /** PascalCase React component name (e.g. `HomePage`, `AboutPage`). */
-  componentName: z.string(),
+  componentName: z.string().regex(/^[A-Z][A-Za-z0-9]*Page$/),
   /** Whether this route is included in synthesis. */
   included: z.boolean(),
   /** Interactions inferred from the route's a11y tree. */
@@ -58,7 +58,16 @@ export const ApographPlanSchema = z.object({
   approved: z.boolean(),
   /** ISO-8601 timestamp set when the plan is approved. */
   approvedAt: z.string().optional(),
-  routes: z.array(PlanRouteSchema),
+  routes: z.array(PlanRouteSchema).superRefine((routes, ctx) => {
+    const paths = new Set<string>();
+    const components = new Set<string>();
+    routes.forEach((route, index) => {
+      if (paths.has(route.path)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [index, 'path'], message: 'duplicate route path' });
+      paths.add(route.path);
+      if (components.has(route.componentName)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [index, 'componentName'], message: 'duplicate component name' });
+      components.add(route.componentName);
+    });
+  }),
   designSystem: DesignSystemSchema,
   /** Assumptions the generator made (candidates for human review). */
   assumptions: z.array(z.string()),

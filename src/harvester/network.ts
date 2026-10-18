@@ -33,8 +33,13 @@ const TELEMETRY_DOMAIN_FRAGMENTS = [
   'datadog',
 ] as const;
 
+const MAX_CAPTURED_REQUESTS = 500;
+const MAX_CAPTURED_BODY_BYTES = 512 * 1024;
+const MAX_CAPTURED_TOTAL_BYTES = 10 * 1024 * 1024;
+
 export class NetworkCollector {
   private readonly requests: RecordedRequest[] = [];
+  private capturedBytes = 0;
   private listener: ((response: Response) => void) | null = null;
 
   /**
@@ -50,6 +55,7 @@ export class NetworkCollector {
       const url = response.url();
 
       if (isStaticAsset(url) || isTelemetry(url)) return;
+       if (this.requests.length >= MAX_CAPTURED_REQUESTS || this.capturedBytes >= MAX_CAPTURED_TOTAL_BYTES) return;
 
       const timestamp = Date.now();
       const method = request.method();
@@ -64,7 +70,13 @@ export class NetworkCollector {
       const responseHeaders = response.headers();
 
       void (async () => {
-        const responseBody = await response.text().catch(() => null);
+        const responseBody = await response.text().then((body) => {
+          if (body.length > MAX_CAPTURED_BODY_BYTES) return null;
+          const bytes = Buffer.byteLength(body, 'utf8');
+          if (this.capturedBytes + bytes > MAX_CAPTURED_TOTAL_BYTES) return null;
+          this.capturedBytes += bytes;
+          return body;
+        }).catch(() => null);
 
         this.requests.push({
           method,
@@ -91,6 +103,7 @@ export class NetworkCollector {
   /** Empties the in-memory capture buffer. */
   clear(): void {
     this.requests.length = 0;
+    this.capturedBytes = 0;
   }
 
   /**

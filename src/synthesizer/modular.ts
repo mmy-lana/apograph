@@ -20,6 +20,7 @@
 import { copyFile, mkdir, readdir } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import type { AssetEntry, CrawlRoute, DesignTokens, EvidenceManifest, ProjectFile } from '../types.js';
+import { assertNoSymlinkComponents, resolveContainedPath } from '../utils/fs-safe.js';
 import type { ApographPlan, PlanRoute } from '../plan/schema.js';
 import type { ProgressHandle } from '../utils/progress.js';
 import { NULL_PROGRESS } from '../utils/progress.js';
@@ -712,10 +713,15 @@ export async function copyMirroredAssets(
   }
 
   await mkdir(targetDir, { recursive: true });
+  await assertNoSymlinkComponents(resolve(projectDir), targetDir);
 
   let copied = 0;
   for (const entry of entries) {
-    await copyFile(join(sourceDir, entry), join(targetDir, entry));
+    const sourcePath = resolveContainedPath(sourceDir, entry);
+    const targetPath = resolveContainedPath(targetDir, entry);
+    await assertNoSymlinkComponents(sourceDir, sourcePath);
+    await assertNoSymlinkComponents(targetDir, targetPath);
+    await copyFile(sourcePath, targetPath);
     copied += 1;
   }
   return copied;
@@ -851,6 +857,9 @@ export async function synthesizeModularProject(
   input: ModularSynthesisInput,
 ): Promise<ModularSynthesisResult> {
   const { plan, manifest, evidenceDir } = input;
+  if (!plan.approved) {
+    throw new Error('Synthesis requires an explicitly approved plan.');
+  }
   const included = plan.routes.filter((route) => route.included);
   const callbacks = input.callbacks;
   const skipPaths = new Set(callbacks?.skipRoutePaths ?? []);

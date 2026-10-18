@@ -16,8 +16,9 @@
  */
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { chromium } from 'playwright';
+import { validateNetworkUrl, type NetworkPolicyOptions } from './network-policy.js';
 import type { Browser, Frame, Page } from 'playwright';
 import type {
   AssetEntry,
@@ -70,6 +71,7 @@ export interface CrawlOptions {
   viewport?: ViewportMode;
   /** Same-origin crawl scope. Defaults to `site`. */
   scope?: CrawlScope;
+  networkPolicy?: NetworkPolicyOptions;
 }
 
 /** Desktop capture viewport. */
@@ -139,13 +141,18 @@ function slugForPath(pathname: string): string {
  * Returns the persisted manifest.
  */
 export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceManifest> {
-  const requestedRoot = normalizeUrl(options.rootUrl);
+  const requestedRootUrl = await validateNetworkUrl(options.rootUrl, options.networkPolicy);
+  const requestedRoot = normalizeUrl(requestedRootUrl.href);
   if (requestedRoot === null) {
     throw new Error(`Invalid root URL: ${options.rootUrl}`);
   }
 
-  const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
-  const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
+  const maxDepth = Number.isSafeInteger(options.maxDepth) && (options.maxDepth as number) >= 0
+    ? Math.min(options.maxDepth as number, 5)
+    : DEFAULT_MAX_DEPTH;
+  const maxPages = Number.isSafeInteger(options.maxPages) && (options.maxPages as number) >= 1
+    ? Math.min(options.maxPages as number, 50)
+    : DEFAULT_MAX_PAGES;
   const viewportMode: ViewportMode = options.viewport ?? 'both';
   const scope: CrawlScope = options.scope ?? 'site';
 
@@ -153,6 +160,10 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
   const captureMobile = viewportMode !== 'desktop';
 
   const evidenceDir = resolve(options.evidenceDir ?? DEFAULT_EVIDENCE_DIR);
+  const evidenceRoot = resolve(process.cwd());
+  if (!evidenceDir.startsWith(`${evidenceRoot}${sep}`) && evidenceDir !== evidenceRoot) {
+    throw new Error(`Evidence directory must remain inside the current workspace: ${evidenceDir}`);
+  }
   const screenshotsDir = join(evidenceDir, 'screenshots');
   const assetsDir = join(evidenceDir, 'assets');
   await mkdir(screenshotsDir, { recursive: true });
@@ -209,6 +220,19 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
 
   try {
     const context = await browser.newContext({ viewport: { ...DESKTOP_VIEWPORT } });
+    await context.route('**/*', async (route) => {
+      const resourceUrl = route.request().url();
+      if (/^(data:|blob:|about:)/i.test(resourceUrl)) {
+        await route.continue();
+        return;
+      }
+      try {
+        await validateNetworkUrl(resourceUrl, options.networkPolicy);
+        await route.continue();
+      } catch {
+        await route.abort('blockedbyclient');
+      }
+    });
     const page = await context.newPage();
 
     while (frontier.length > 0 && visited.size < maxPages) {
@@ -239,6 +263,7 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
           waitUntil: 'networkidle',
           timeout: NAVIGATION_TIMEOUT_MS,
         });
+        await validateNetworkUrl(page.url(), options.networkPolicy);
         title = await page.title();
       } catch (cause) {
         const reason = cause instanceof Error ? cause.message : String(cause);
@@ -484,6 +509,7 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
     [...assetUrls],
     rootOrigin,
     assetsDir,
+    { ...options.networkPolicy, maxTotalBytes: 50 * 1024 * 1024 },
   );
   diagnostics.uncapturedResources.push(...uncaptured);
 

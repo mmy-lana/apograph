@@ -12,6 +12,7 @@
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { z } from 'zod';
 import type { A11yNode, EvidenceManifest } from '../types.js';
 import { ApographPlanSchema } from './schema.js';
 import type { ApographPlan, InferredInteraction, PlanRoute } from './schema.js';
@@ -38,12 +39,35 @@ export async function loadEvidenceManifest(
   return manifestFromUnknown(raw, manifestPath);
 }
 
-/** Validates a parsed manifest payload, with a helpful error on mismatch. */
+/** Strict structural validation for evidence consumed by synthesis/verification. */
+const EvidenceManifestSchema = z.object({
+  targetUrl: z.string().url(),
+  crawledAt: z.string().min(1),
+  stats: z.object({
+    pagesCrawled: z.number().int().nonnegative(),
+    linksDiscovered: z.number().int().nonnegative(),
+    assetsDownloaded: z.number().int().nonnegative(),
+    assetsFailed: z.number().int().nonnegative(),
+    externalAssets: z.number().int().nonnegative(),
+    durationMs: z.number().nonnegative(),
+  }),
+  routes: z.array(z.object({
+    url: z.string().url(),
+    path: z.string().regex(/^\/[^\r\n]*$/),
+    title: z.string(),
+    desktopScreenshot: z.string().nullable(),
+    mobileScreenshot: z.string().nullable(),
+    a11yTree: z.object({ role: z.string() }).passthrough(),
+    tokens: z.object({ colors: z.record(z.string()), fonts: z.array(z.string()), spacing: z.array(z.string()), radii: z.array(z.string()) }).passthrough(),
+  }).passthrough()).max(500),
+  assets: z.array(z.object({ originalUrl: z.string().url(), localPath: z.string().nullable(), status: z.enum(['downloaded', 'failed', 'external']) }).passthrough()).max(2000),
+  diagnostics: z.object({ skippedUrls: z.array(z.object({ url: z.string(), reason: z.string() })), failedNavigations: z.array(z.object({ url: z.string(), reason: z.string() })), uncapturedResources: z.array(z.object({ url: z.string(), reason: z.string() })), redirectAliases: z.array(z.object({ from: z.string().url(), to: z.string().url(), settleTimeMs: z.number().nonnegative() })) }),
+});
+
 function manifestFromUnknown(raw: unknown, source: string): EvidenceManifest {
-  if (typeof raw !== 'object' || raw === null || !('routes' in raw) || !('targetUrl' in raw)) {
-    throw new Error(`Not an apograph evidence manifest: ${source}`);
-  }
-  return raw as EvidenceManifest;
+  const parsed = EvidenceManifestSchema.safeParse(raw);
+  if (!parsed.success) throw new Error(`Invalid apograph evidence manifest: ${source}`);
+  return parsed.data as EvidenceManifest;
 }
 
 /** Writes a plan to disk as pretty-printed JSON. */
