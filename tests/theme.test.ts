@@ -135,8 +135,9 @@ test('templates > App shell emits no hardcoded light wrapper', () => {
   const appTsx = generateAppTsx(makePlan(tokensWith() as unknown as ApographPlan['designSystem']));
   assert.ok(!appTsx.includes('bg-white'), 'App.tsx must not hardcode bg-white');
   assert.ok(!appTsx.includes('text-neutral-900'), 'App.tsx must not hardcode text-neutral-900');
-  assert.ok(appTsx.includes('bg-background'), 'App shell must apply the canvas token');
-  assert.ok(appTsx.includes('text-foreground'), 'App shell must use the foreground token');
+  assert.ok(appTsx.includes('min-h-screen w-full'), 'App shell must be a clean full-width router wrapper');
+  assert.ok(!appTsx.includes('<Navbar />'), 'App shell must not force a global navbar');
+  assert.ok(!appTsx.includes('<Footer />'), 'App shell must not force a global footer');
 });
 
 test('templates > index.css background is dynamic', () => {

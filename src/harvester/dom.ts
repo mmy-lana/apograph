@@ -232,12 +232,11 @@ export async function extractDesignTokens(page: Page): Promise<DesignTokens> {
       case 'color':
       case 'background-color':
       case 'border-color': {
-        colors.set(`${property}:${value}`, value);
+        if (isCleanColorValue(value)) colors.set(`${property}:${value}`, value);
         break;
       }
-      case 'font-family':
-      case 'font-size': {
-        fonts.add(value);
+      case 'font-family': {
+        if (isFontFamilyValue(value)) fonts.add(value);
         break;
       }
       case 'margin':
@@ -277,6 +276,18 @@ export async function extractDesignTokens(page: Page): Promise<DesignTokens> {
 /** Collapses generated CSS whitespace into a single-line token value. */
 function normalizeValue(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
+}
+
+/** True when a token is a clean color value suitable for synthesis prompts. */
+function isCleanColorValue(value: string): boolean {
+  const normalized = value.toLowerCase();
+  if (['color-mix', 'inherit', 'currentcolor', 'rgb(from'].some((token) => normalized.includes(token))) return false;
+  return /^#[0-9a-f]{3,8}$/i.test(value) || /^(rgb|hsl)\(/i.test(value);
+}
+
+/** True when a token is a font family rather than a CSS length or variable. */
+function isFontFamilyValue(value: string): boolean {
+  return !/^\s*(?:\d+(?:\.\d+)?(?:px|pt|em|rem|%|vh|vw)|var\(--text-[^)]+\))\s*$/i.test(value);
 }
 
 /** True when a value looks like a length/percentage (not `auto`/`inherit`/etc). */

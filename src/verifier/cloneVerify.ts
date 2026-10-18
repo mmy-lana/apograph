@@ -26,6 +26,7 @@ import { chromium } from 'playwright';
 import type { Browser, Page } from 'playwright';
 import type { ViewportMode } from '../types.js';
 import { compareScreenshots } from './engine.js';
+import { isDarkCanvasColor } from '../synthesizer/modular.js';
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -281,6 +282,22 @@ async function killProcessTree(child: ChildProcess): Promise<void> {
 // ---------------------------------------------------------------------------
 // Route discovery
 // ---------------------------------------------------------------------------
+
+/** Extracts route paths from an evidence manifest's routes. */
+async function detectedColorScheme(): Promise<'dark' | 'light'> {
+  try {
+    const raw: unknown = JSON.parse(await readFile(resolve('.apograph', 'evidence', 'manifest.json'), 'utf8'));
+    if (typeof raw !== 'object' || raw === null || !('routes' in raw)) return 'light';
+    const routes = (raw as { routes?: Array<{ tokens?: { canvas?: { backgroundColor?: unknown } } }> }).routes;
+    if (!Array.isArray(routes)) return 'light';
+    return routes.some((route) => {
+      const background = route.tokens?.canvas?.backgroundColor;
+      return typeof background === 'string' && isDarkCanvasColor(background);
+    }) ? 'dark' : 'light';
+  } catch {
+    return 'light';
+  }
+}
 
 /** Extracts route paths from an evidence manifest's routes. */
 async function routesFromManifest(manifestPath: string): Promise<string[] | null> {
@@ -586,6 +603,7 @@ export async function runCloneVerify(options: CloneVerifyOptions): Promise<Clone
   }
 
   const routePaths = await discoverRoutePaths(outputDir);
+  const detectedScheme = await detectedColorScheme();
 
   const devServer = await startDevServer(outputDir, port);
 
@@ -599,9 +617,11 @@ export async function runCloneVerify(options: CloneVerifyOptions): Promise<Clone
 
     const originalContext = await originalBrowser.newContext({
       viewport: { ...comparisonViewport(viewport).size },
+      colorScheme: detectedScheme,
     });
     const clonedContext = await clonedBrowser.newContext({
       viewport: { ...comparisonViewport(viewport).size },
+      colorScheme: detectedScheme,
     });
     const originalPage = await originalContext.newPage();
     const clonedPage = await clonedContext.newPage();

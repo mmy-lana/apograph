@@ -189,6 +189,15 @@ test('scaffold > emitted tsconfig disables verbatimModuleSyntax and keeps isolat
   assert.equal(parsed.compilerOptions.isolatedModules, true);
 });
 
+test('source > route pages own complete page architecture', async () => {
+  const modularSource = await readFile(
+    join(fileURLToPath(new URL('../src/synthesizer/modular.ts', import.meta.url))),
+    'utf8',
+  );
+  assert.ok(modularSource.includes('Complete Page Architecture'));
+  assert.ok(!modularSource.includes('Never render a <header> or <nav> inside route pages'));
+});
+
 test('source > system guidelines mandate type-only React imports', async () => {
   const modularSource = await readFile(
     join(fileURLToPath(new URL('../src/synthesizer/modular.ts', import.meta.url))),

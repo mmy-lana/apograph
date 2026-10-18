@@ -174,10 +174,8 @@ const SYSTEM_GUIDELINES = [
   '   and content structure faithfully.',
   '5. Reference mirrored images with their local path (/assets/<filename>) —',
   '   never their original remote URLs.',
-  '6. The Navbar must use a sticky blurred header: className must include',
-  '   `sticky top-0 z-50 backdrop-blur bg-background/80 border-b` so content',
-  '   scrolls under a frosted header (bg-background comes from @theme and',
-  '   carries the source site\'s extracted canvas color).',
+  '6. Headers and navigation must match the reference screenshot and belong to',
+  '   the self-contained route page that renders them; do not assume a global shell.',
   '7. Forms must include realistic HTML validation (required, type="email"),',
   '   a success toast/banner after submit, and mock persistence via',
   "   localStorage.setItem('apograph_submissions', ...).",
@@ -186,7 +184,7 @@ const SYSTEM_GUIDELINES = [
   '- Always use type-only imports for React types: `import type { FormEvent, ReactNode } from \'react\'`.',
   '- When rendering icons from lucide-react in maps, lists, or components, store the component reference and render as `<item.icon className="..." />`, or store JSX elements directly `icon: <Shield className="..." />`. Never assign string names and component references to the same property.',
   '- Check the asset descriptions before linking images. Only use assets named `hero-bg` or `*-bg` for section backgrounds. Use card/thumbnail assets for card items.',
-  '- Never render a <header> or <nav> inside route pages (e.g. HomePage.tsx). The shared Navbar and Footer are already rendered globally by the layout wrapper. Page components must start directly with their own unique hero or top section.',
+  '- Complete Page Architecture: Each route page component (e.g. HomePage.tsx, MinimalistPage.tsx) must be a complete, self-contained page matching its screenshot, including its own header/navigation, main sections, and footer if present in the screenshot.',
   '',
   'CRITICAL LAYOUT ARCHITECTURE RULES (NON-NEGOTIABLE):',
   '- Layout Architecture: Page sections must stack vertically in normal document flow inside <main className="flex min-h-screen w-full flex-col bg-background text-foreground">. Never position whole sections with `absolute` or `fixed` over other sections.',
@@ -553,7 +551,7 @@ export function generatePageTemplate(route: PlanRoute): string {
   }
 
   const body = [
-    `    <section className="mx-auto max-w-6xl px-4 py-12 sm:px-6">`,
+    `    <section className="min-h-screen w-full bg-background px-4 py-12 sm:px-6">`,
     `      <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">${escapeString(title)}</h1>`,
     '      <p className="mt-4 max-w-2xl text-neutral-600">',
     `        ${escapeString(title)} — synthesized by apograph from captured evidence.`,
@@ -622,22 +620,16 @@ export function generateAppTsx(plan: ApographPlan): string {
 
   return [
     "import { BrowserRouter, Route, Routes } from 'react-router';",
-    "import { Navbar } from './components/Navbar';",
-    "import { Footer } from './components/Footer';",
     ...routes.map((route) => `import { ${route.componentName} } from './pages/${route.componentName}';`),
     '',
     'export default function App() {',
     '  return (',
     '    <BrowserRouter>',
-    '      <div className="flex min-h-screen flex-col bg-background text-foreground">',
-    '        <Navbar />',
-    '        <main className="flex-1">',
-    '          <Routes>',
+    '      <div className="min-h-screen w-full">',
+    '        <Routes>',
     ...routeElements,
     ...wildcard,
-    '          </Routes>',
-    '        </main>',
-    '        <Footer />',
+    '        </Routes>',
     '      </div>',
     '    </BrowserRouter>',
     '  );',
@@ -1014,15 +1006,32 @@ export async function synthesizeModularProject(
       ? await loadRouteScreenshots(manifestRoute, evidenceDir)
       : [];
 
+    const routeCanvas = manifestRoute?.tokens.canvas?.backgroundColor ?? canvasColor;
+    const siblingRoutes = included
+      .filter((r) => r.path !== route.path)
+      .map((r) => `- ${r.path} ("${r.title.length > 0 ? r.title : r.componentName}")`)
+      .join('\n');
+
     const pagePrompt = [
       `Synthesize the page component for route ${route.path} (${route.componentName}).`,
       '',
       `Page title: ${route.title.length > 0 ? route.title : route.componentName}`,
       `Interactions to implement as client-side state (useState): ${route.inferredInteractions.join(', ')}`,
       '',
-      `Canvas background (extracted from the source site): ${canvasColor}.`,
-      '   Keep the page canvas this color; match text and accent colors with',
-      '   arbitrary Tailwind hex utilities from the screenshots.',
+      'INTERNAL NAVIGATION & ROUTE LINKING:',
+      'Available sibling routes in this application:',
+      siblingRoutes.length > 0 ? siblingRoutes : '(none - single page)',
+      '',
+      'Rules:',
+      ' - Whenever rendering cards, navigation items, buttons, or links whose title, headline, badge, or text corresponds to one of the sibling routes above, you MUST link directly to that route using <Link to="..."> from \'react-router\'.',
+      ' - Never use placeholder href="#..." when a matching sibling route exists in the list above.',
+      '',
+      'THEME & MOUNT STATE:',
+      `- Captured canvas background: ${routeCanvas} (${isDarkCanvasColor(routeCanvas) ? 'dark theme' : 'light theme'}).`,
+      `- The initial state of this component on first mount MUST match this captured background. If the page contains a theme switch, dark mode toggle, or appearance state, its useState default MUST be initialized so the page mounts directly matching ${routeCanvas}, NOT the inverted theme.`,
+      '',
+      `Canvas background for this route: ${routeCanvas}.`,
+      `The root container of this page must use min-h-screen and apply this background (e.g. bg-[${routeCanvas}] or matching utility).`,
       '',
       'Reduced color palette (use these, or arbitrary Tailwind hex utilities',
       'like bg-[#080f1c] / text-cyan-400 / gradient utilities matching the',
@@ -1054,12 +1063,12 @@ export async function synthesizeModularProject(
       '- "form-submit": a form with realistic HTML validation (required,',
       '   type="email", minLength), a success toast/banner after submit, and',
       "   mock persistence via localStorage.setItem('apograph_submissions', ...)",
-      '- "mobile-menu": handled by Navbar; ignore here.',
+      '- "mobile-menu": implement in the route page when shown in the screenshot.',
       '- "none": static content only.',
       '',
       `Emit exactly one file: src/pages/${route.componentName}.tsx with`,
       `export function ${route.componentName}(). Import nothing from the project`,
-      'except lucide-react — Navbar/Footer are rendered by App.',
+      'except lucide-react; the route page owns all layout chrome shown in its screenshot.',
     ].join('\n');
 
     const files = await runVisionStage(

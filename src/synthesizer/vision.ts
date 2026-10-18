@@ -120,7 +120,11 @@ export const MAX_PROMPT_COLORS = 24;
  * the vision model and drove monochrome fallbacks), plus the canvas color.
  */
 export function formatTokensForVisionPrompt(tokens: DesignTokens): string {
-  const allValues = Object.values(tokens.colors);
+  const allValues = Object.values(tokens.colors).filter((value) => {
+    const normalized = value.toLowerCase();
+    if (['color-mix', 'inherit', 'currentcolor', 'rgb(from'].some((token) => normalized.includes(token))) return false;
+    return /^#[0-9a-f]{3,8}$/i.test(value) || /^(rgb|hsl)\(/i.test(value);
+  });
   const uniqueColors = [...new Set(allValues)].slice(0, MAX_PROMPT_COLORS);
   const totalUnique = new Set(allValues).size;
   const colors = uniqueColors.map((value) => `  ${value}`).join('\n');
@@ -130,11 +134,14 @@ export function formatTokensForVisionPrompt(tokens: DesignTokens): string {
       : '';
 
   const canvas = tokens.canvas?.backgroundColor;
+  const fonts = tokens.fonts.filter((font) =>
+    !/^\s*(?:\d+(?:\.\d+)?(?:px|pt|em|rem|%|vh|vw)|var\(--text-[^)]+\))\s*$/i.test(font),
+  );
 
   return [
     `Canvas background: ${canvas ?? 'not captured'}`,
     `Reduced palette (max ${MAX_PROMPT_COLORS} colors):\n${colors}${paletteNote}`,
-    `Fonts: ${tokens.fonts.length > 0 ? tokens.fonts.slice(0, MAX_PROMPT_COLORS).join(', ') : '(none)'}`,
+    `Fonts: ${fonts.length > 0 ? fonts.slice(0, MAX_PROMPT_COLORS).join(', ') : '(none)'}`,
     `Spacing: ${tokens.spacing.length > 0 ? tokens.spacing.slice(0, MAX_PROMPT_COLORS).join(', ') : '(none)'}`,
     `Radii: ${tokens.radii.length > 0 ? tokens.radii.slice(0, MAX_PROMPT_COLORS).join(', ') : '(none)'}`,
   ].join('\n');

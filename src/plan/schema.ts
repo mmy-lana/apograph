@@ -23,7 +23,7 @@ export type InferredInteraction = z.infer<typeof InferredInteractionSchema>;
 /** One route of the plan. */
 export const PlanRouteSchema = z.object({
   /** URL path of the route (e.g. `/`, `/about`). */
-  path: z.string().regex(/^\/(?:[^\\0\\r\\n]*)$/),
+  path: z.string().startsWith('/'),
   /** Document title captured at crawl time. */
   title: z.string(),
   /** PascalCase React component name (e.g. `HomePage`, `AboutPage`). */
