@@ -280,23 +280,28 @@ async function killProcessTree(child: ChildProcess): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Route discovery
+// Route discovery & Scheme mapping
 // ---------------------------------------------------------------------------
 
-/** Extracts route paths from an evidence manifest's routes. */
-async function detectedColorScheme(): Promise<'dark' | 'light'> {
+/** Maps each route path to its detected color scheme ('dark' | 'light') from crawl evidence. */
+async function routeColorSchemeMap(): Promise<Map<string, 'dark' | 'light'>> {
+  const schemeMap = new Map<string, 'dark' | 'light'>();
   try {
     const raw: unknown = JSON.parse(await readFile(resolve('.apograph', 'evidence', 'manifest.json'), 'utf8'));
-    if (typeof raw !== 'object' || raw === null || !('routes' in raw)) return 'light';
-    const routes = (raw as { routes?: Array<{ tokens?: { canvas?: { backgroundColor?: unknown } } }> }).routes;
-    if (!Array.isArray(routes)) return 'light';
-    return routes.some((route) => {
-      const background = route.tokens?.canvas?.backgroundColor;
-      return typeof background === 'string' && isDarkCanvasColor(background);
-    }) ? 'dark' : 'light';
+    if (typeof raw !== 'object' || raw === null || !('routes' in raw)) return schemeMap;
+    const routes = (raw as { routes?: Array<{ path?: string; tokens?: { canvas?: { backgroundColor?: unknown } } }> }).routes;
+    if (!Array.isArray(routes)) return schemeMap;
+    for (const route of routes) {
+      if (typeof route.path === 'string') {
+        const background = route.tokens?.canvas?.backgroundColor;
+        const scheme = typeof background === 'string' && isDarkCanvasColor(background) ? 'dark' : 'light';
+        schemeMap.set(route.path, scheme);
+      }
+    }
   } catch {
-    return 'light';
+    // Return empty map on failure; callers default to 'light'.
   }
+  return schemeMap;
 }
 
 /** Extracts route paths from an evidence manifest's routes. */
@@ -389,10 +394,9 @@ function animationNames(rules: string[]): string[] {
     for (const match of rule.matchAll(/animation(?:-name)?\s*:\s*([^;]+)/g)) {
       for (const token of (match[1] as string).split(/\s+/)) {
         if (token.length === 0) continue;
-        // Timing keywords and durations are not animation names.
         if (/^(ease|ease-in|ease-out|ease-in-out|linear|step-start|step-end|infinite|alternate|reverse|both|forwards|backwards|normal|none|running|paused)$/i.test(token)) continue;
-        if (/^(\d|\.)[a-z]*$/i.test(token)) continue; // 0.3s, 300ms, 2s
-        if (/^var\(|^[a-z-]+\(.*\)$/.test(token)) continue; // functions
+        if (/^(\d|\.)[a-z]*$/i.test(token)) continue;
+        if (/^var\(|^[a-z-]+\(.*\)$/.test(token)) continue;
         names.add(token);
       }
     }
@@ -471,7 +475,14 @@ async function navigateBoth(
   clonedPage: Page,
   originalUrl: string,
   clonedUrl: string,
+  routeScheme: 'dark' | 'light',
 ): Promise<void> {
+  // Sync the route-specific colorScheme preference on both browser pages.
+  await Promise.all([
+    originalPage.emulateMedia({ colorScheme: routeScheme }),
+    clonedPage.emulateMedia({ colorScheme: routeScheme }),
+  ]);
+
   await Promise.all([
     originalPage.goto(originalUrl, {
       waitUntil: 'networkidle',
@@ -490,11 +501,20 @@ async function navigateBoth(
     // Never mounted — the screenshot records whatever rendered.
   }
   await clonedPage.waitForTimeout(250);
+
+  // Freeze animation/transition jitter and hide cursor caret during capture.
+  await Promise.all([
+    originalPage.addStyleTag({ content: '* { animation: none !important; transition: none !important; caret-color: transparent !important; }' }),
+    clonedPage.addStyleTag({ content: '* { animation: none !important; transition: none !important; caret-color: transparent !important; }' }),
+  ]);
 }
 
-/** Captures a screenshot from a page at the comparison viewport. */
+/** Captures a screenshot from a page at the comparison viewport after fonts load. */
 async function captureScreenshot(page: Page, size: { width: number; height: number }, path: string): Promise<void> {
   await page.setViewportSize({ ...size });
+  await page.evaluate(async () => {
+    if (document.fonts?.ready) await document.fonts.ready;
+  });
   await page.waitForTimeout(150);
   await page.screenshot({ path, type: 'png' });
 }
@@ -509,6 +529,7 @@ async function compareRoute(
   screenshotsDir: string,
   viewport: ViewportMode,
   threshold: number,
+  routeScheme: 'dark' | 'light',
 ): Promise<CloneVerifyRoute> {
   const { size, label } = comparisonViewport(viewport);
   const slug = slugForPath(path);
@@ -522,6 +543,7 @@ async function compareRoute(
     clonedPage,
     originalOrigin + path,
     clonedOrigin + path,
+    routeScheme,
   );
 
   const [originalFonts, clonedFonts, originalColors, clonedColors, originalRules, clonedRules] =
@@ -603,7 +625,7 @@ export async function runCloneVerify(options: CloneVerifyOptions): Promise<Clone
   }
 
   const routePaths = await discoverRoutePaths(outputDir);
-  const detectedScheme = await detectedColorScheme();
+  const schemes = await routeColorSchemeMap();
 
   const devServer = await startDevServer(outputDir, port);
 
@@ -617,17 +639,13 @@ export async function runCloneVerify(options: CloneVerifyOptions): Promise<Clone
 
     const originalContext = await originalBrowser.newContext({
       viewport: { ...comparisonViewport(viewport).size },
-      colorScheme: detectedScheme,
     });
     const clonedContext = await clonedBrowser.newContext({
       viewport: { ...comparisonViewport(viewport).size },
-      colorScheme: detectedScheme,
     });
     const originalPage = await originalContext.newPage();
     const clonedPage = await clonedContext.newPage();
 
-    // Fail fast when the original site is unreachable: the comparison is
-    // meaningless without it, and every route would time out.
     try {
       await originalPage.goto(originalOrigin, {
         waitUntil: 'domcontentloaded',
@@ -642,6 +660,7 @@ export async function runCloneVerify(options: CloneVerifyOptions): Promise<Clone
     await mkdir(screenshotsDir, { recursive: true });
 
     for (const path of routePaths) {
+      const routeScheme = schemes.get(path) ?? 'light';
       routes.push(
         await compareRoute(
           path,
@@ -652,6 +671,7 @@ export async function runCloneVerify(options: CloneVerifyOptions): Promise<Clone
           screenshotsDir,
           viewport,
           threshold,
+          routeScheme,
         ),
       );
     }
@@ -659,7 +679,6 @@ export async function runCloneVerify(options: CloneVerifyOptions): Promise<Clone
     await originalContext.close();
     await clonedContext.close();
   } finally {
-    // Both browsers and the dev server are always torn down — no orphans.
     await originalBrowser?.close().catch(() => undefined);
     await clonedBrowser?.close().catch(() => undefined);
     await devServer.kill();
@@ -694,6 +713,4 @@ export async function runCloneVerify(options: CloneVerifyOptions): Promise<Clone
   return result;
 }
 
-// Re-exported for the CLI: the screenshots directory name is needed by the
-// report printer when resolving relative paths.
 export { SCREENSHOTS_DIRNAME };
