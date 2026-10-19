@@ -10,10 +10,11 @@
  * granted exclusively by the interactive gate in `src/plan/gate.ts`.
  */
 
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
-import type { A11yNode, EvidenceManifest } from '../types.js';
+import type { A11yNode, CrawlRoute, EvidenceManifest, ModularTextSpans } from '../types.js';
+import { slugForPath } from '../utils/fs-safe.js';
 import { ApographPlanSchema } from './schema.js';
 import type { ApographPlan, InferredInteraction, PlanRoute } from './schema.js';
 
@@ -27,17 +28,16 @@ export const DEFAULT_EVIDENCE_DIR = '.apograph/evidence';
 /** Default plan file name inside the evidence directory. */
 export const PLAN_FILENAME = 'apograph-plan.json';
 
-/**
- * Reads and validates `.apograph/evidence/manifest.json` (or a custom
- * evidence directory) against the evidence manifest shape.
- */
-export async function loadEvidenceManifest(
-  evidenceDir: string = DEFAULT_EVIDENCE_DIR,
-): Promise<EvidenceManifest> {
-  const manifestPath = join(evidenceDir, 'manifest.json');
-  const raw = JSON.parse(await readFile(manifestPath, 'utf8')) as unknown;
-  return manifestFromUnknown(raw, manifestPath);
-}
+/** Strict structural validation for one route record of an evidence bundle. */
+const EvidenceRouteSchema = z.object({
+  url: z.string().url(),
+  path: z.string().regex(/^\/[^\r\n]*$/),
+  title: z.string(),
+  desktopScreenshot: z.string().nullable(),
+  mobileScreenshot: z.string().nullable(),
+  a11yTree: z.object({ role: z.string() }).passthrough(),
+  tokens: z.object({ colors: z.record(z.string()), fonts: z.array(z.string()), spacing: z.array(z.string()), radii: z.array(z.string()) }).passthrough(),
+}).passthrough();
 
 /** Strict structural validation for evidence consumed by synthesis/verification. */
 const EvidenceManifestSchema = z.object({
@@ -51,15 +51,7 @@ const EvidenceManifestSchema = z.object({
     externalAssets: z.number().int().nonnegative(),
     durationMs: z.number().nonnegative(),
   }),
-  routes: z.array(z.object({
-    url: z.string().url(),
-    path: z.string().regex(/^\/[^\r\n]*$/),
-    title: z.string(),
-    desktopScreenshot: z.string().nullable(),
-    mobileScreenshot: z.string().nullable(),
-    a11yTree: z.object({ role: z.string() }).passthrough(),
-    tokens: z.object({ colors: z.record(z.string()), fonts: z.array(z.string()), spacing: z.array(z.string()), radii: z.array(z.string()) }).passthrough(),
-  }).passthrough()).max(500),
+  routes: z.array(EvidenceRouteSchema).max(500),
   assets: z.array(z.object({ originalUrl: z.string().url(), localPath: z.string().nullable(), status: z.enum(['downloaded', 'failed', 'external']) }).passthrough()).max(2000),
   diagnostics: z.object({ skippedUrls: z.array(z.object({ url: z.string(), reason: z.string() })), failedNavigations: z.array(z.object({ url: z.string(), reason: z.string() })), uncapturedResources: z.array(z.object({ url: z.string(), reason: z.string() })), redirectAliases: z.array(z.object({ from: z.string().url(), to: z.string().url(), settleTimeMs: z.number().nonnegative() })) }),
 });
@@ -68,6 +60,133 @@ function manifestFromUnknown(raw: unknown, source: string): EvidenceManifest {
   const parsed = EvidenceManifestSchema.safeParse(raw);
   if (!parsed.success) throw new Error(`Invalid apograph evidence manifest: ${source}`);
   return parsed.data as EvidenceManifest;
+}
+
+/**
+ * Reads one modular evidence JSON file, failing with an explicit, actionable
+ * error (which file, which route) instead of an opaque ENOENT or parse throw.
+ */
+async function readModularJsonFile(filePath: string, description: string): Promise<unknown> {
+  let text: string;
+  try {
+    text = await readFile(filePath, 'utf8');
+  } catch (cause) {
+    throw new Error(`Missing modular evidence file: ${filePath} (${description})`, { cause });
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch (cause) {
+    throw new Error(`Corrupt modular evidence file: ${filePath} (${description})`, { cause });
+  }
+}
+
+/** True when the evidence dir uses the modular `routes/<slug>/` layout. */
+async function hasModularRouteLayout(evidenceDir: string): Promise<boolean> {
+  try {
+    return (await readdir(join(evidenceDir, 'routes'))).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reassembles one full `CrawlRoute` from a `routes/<slug>/` directory
+ * (`route.json` + `a11y.json` + `text-spans.json`).
+ */
+async function readModularRoute(routeDir: string, routePath: string): Promise<CrawlRoute> {
+  const description = `route ${routePath}`;
+  const routeMeta = (await readModularJsonFile(join(routeDir, 'route.json'), description)) as Record<string, unknown>;
+  const a11yTree = await readModularJsonFile(join(routeDir, 'a11y.json'), `${description} a11y tree`);
+  const spans = (await readModularJsonFile(join(routeDir, 'text-spans.json'), `${description} text spans`)) as Partial<ModularTextSpans> | null;
+
+  const merged: Record<string, unknown> = {
+    ...routeMeta,
+    a11yTree,
+    textSpans: Array.isArray(spans?.desktop) ? spans.desktop : [],
+    ...(Array.isArray(spans?.mobile) ? { mobileTextSpans: spans.mobile } : {}),
+  };
+
+  const parsed = EvidenceRouteSchema.safeParse(merged);
+  if (!parsed.success) {
+    throw new Error(`Invalid modular evidence route: ${routeDir} (${description})`);
+  }
+  return parsed.data as CrawlRoute;
+}
+
+/**
+ * Reads and validates the evidence bundle under `.apograph/evidence/` (or a
+ * custom evidence directory) against the evidence manifest shape.
+ *
+ * Supports both storage layouts transparently:
+ * - modular (per-route evidence): `manifest.json` is a lightweight index and
+ *   the full `EvidenceManifest` is hydrated from `assets.json` plus each
+ *   `routes/<slug>/` sub-bundle;
+ * - legacy monolithic: a single `manifest.json` holds the entire crawl.
+ */
+export async function loadEvidenceManifest(
+  evidenceDir: string = DEFAULT_EVIDENCE_DIR,
+): Promise<EvidenceManifest> {
+  const manifestPath = join(evidenceDir, 'manifest.json');
+  const raw = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
+
+  if (!(await hasModularRouteLayout(evidenceDir))) {
+    // Legacy monolithic manifest: nothing to hydrate.
+    return manifestFromUnknown(raw, manifestPath);
+  }
+
+  // Canonical global asset registry; tolerate partial bundles missing it.
+  let assets: unknown = raw['assets'] ?? [];
+  try {
+    assets = JSON.parse(await readFile(join(evidenceDir, 'assets.json'), 'utf8')) as unknown;
+  } catch {
+    // Fall back to whatever the root index carries (legacy-compatible).
+  }
+
+  const routeStubs = Array.isArray(raw['routes']) ? raw['routes'] : [];
+  const hydratedRoutes: CrawlRoute[] = [];
+  for (const stub of routeStubs) {
+    const record = (stub ?? {}) as Record<string, unknown>;
+    const path = typeof record.path === 'string' ? record.path : '/';
+    const slug = typeof record.slug === 'string' ? record.slug : slugForPath(path);
+    hydratedRoutes.push(await readModularRoute(join(evidenceDir, 'routes', slug), path));
+  }
+
+  return manifestFromUnknown(
+    { ...raw, routes: hydratedRoutes, assets },
+    manifestPath,
+  );
+}
+
+/**
+ * Route-scoped evidence reader: reads only `routes/<slug>/route.json`,
+ * `routes/<slug>/a11y.json`, and `routes/<slug>/text-spans.json` for a single
+ * route, so per-page synthesis never has to hold every route's a11y tree and
+ * text spans in memory at once. Falls back to extracting the route from a
+ * legacy monolithic `manifest.json` when the bundle predates the modular
+ * layout.
+ */
+export async function loadRouteEvidence(
+  evidenceDir: string,
+  routePath: string,
+): Promise<CrawlRoute> {
+  if (await hasModularRouteLayout(evidenceDir)) {
+    return readModularRoute(join(evidenceDir, 'routes', slugForPath(routePath)), routePath);
+  }
+
+  const manifestPath = join(evidenceDir, 'manifest.json');
+  const raw = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
+  const routes = Array.isArray(raw['routes']) ? raw['routes'] : [];
+  const match = routes.find(
+    (entry) => ((entry ?? {}) as Record<string, unknown>).path === routePath,
+  );
+  if (match === undefined) {
+    throw new Error(`Route not found in evidence manifest: ${routePath} (${manifestPath})`);
+  }
+  const parsed = EvidenceRouteSchema.safeParse(match);
+  if (!parsed.success) {
+    throw new Error(`Invalid apograph evidence route: ${routePath} (${manifestPath})`);
+  }
+  return parsed.data as CrawlRoute;
 }
 
 /** Writes a plan to disk as pretty-printed JSON. */

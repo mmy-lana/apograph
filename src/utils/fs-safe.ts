@@ -58,6 +58,22 @@ export async function writeContainedFile(root: string, path: string, content: st
 }
 
 /**
+ * Derives a filesystem-safe subdirectory slug from a URL path for modular
+ * evidence storage (`/` -> `index`, `/about-us` -> `about-us`). Unsafe
+ * characters collapse to `-`; the result is bounded and never empty.
+ */
+export function slugForPath(pathname: string): string {
+  const slug = pathname
+    .split('/')
+    .filter(Boolean)
+    .join('-')
+    .replace(/[^a-zA-Z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  return slug.length > 0 ? slug : 'index';
+}
+
+/**
  * Records a file path as bundle-relative for evidence manifests. Evidence
  * bundles must stay relocatable, so manifest references are stored relative
  * to the evidence directory (POSIX separators) and resolved back against it

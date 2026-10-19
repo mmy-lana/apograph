@@ -22,6 +22,7 @@ import { basename, join, resolve } from 'node:path';
 import type { AssetEntry, CrawlRoute, DesignTokens, EvidenceManifest, FontFaceRule, ProjectFile } from '../types.js';
 import { assertNoSymlinkComponents, resolveContainedPath } from '../utils/fs-safe.js';
 import type { ApographPlan, PlanRoute } from '../plan/schema.js';
+import { loadRouteEvidence } from '../plan/generator.js';
 import type { ProgressHandle } from '../utils/progress.js';
 import { NULL_PROGRESS } from '../utils/progress.js';
 import { resolveModelId, resolveProviderName } from '../config/models.js';
@@ -793,6 +794,25 @@ function manifestRouteFor(planRoute: PlanRoute, manifest: EvidenceManifest): Cra
   return manifest.routes.find((route) => route.path === planRoute.path);
 }
 
+/**
+ * Resolves the evidence record backing one plan route for per-route (stage 3)
+ * synthesis. Modular evidence bundles are read route-scoped from disk
+ * (`routes/<slug>/`) so each page prompt draws strictly on that route's a11y
+ * tree, text spans, and captures without holding every route's trees in
+ * memory; legacy monolithic bundles fall back to the in-memory manifest.
+ */
+async function resolveRouteEvidence(
+  planRoute: PlanRoute,
+  manifest: EvidenceManifest,
+  evidenceDir: string,
+): Promise<CrawlRoute | undefined> {
+  try {
+    return await loadRouteEvidence(evidenceDir, planRoute.path);
+  } catch {
+    return manifestRouteFor(planRoute, manifest);
+  }
+}
+
 /** True when an asset filename looks like a global logo or favicon. */
 function isGlobalAsset(asset: AssetEntry): boolean {
   const name = (asset.localPath ?? asset.originalUrl).toLowerCase();
@@ -1079,7 +1099,7 @@ export async function synthesizeModularProject(
       continue;
     }
 
-    const manifestRoute = manifestRouteFor(route, manifest);
+    const manifestRoute = await resolveRouteEvidence(route, manifest, evidenceDir);
     const screenshots = manifestRoute
       ? await loadRouteScreenshots(manifestRoute, evidenceDir)
       : [];

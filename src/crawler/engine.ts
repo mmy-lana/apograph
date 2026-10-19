@@ -26,13 +26,15 @@ import type {
   CrawlScope,
   EvidenceManifest,
   HashCapture,
+  ModularTextSpans,
   RedirectAliasRecord,
+  RouteManifestIndex,
   RouteMetadata,
   TextSpan,
   ViewportMode,
 } from '../types.js';
 import { captureDOMSnapshot, extractTextSpans } from '../harvester/dom.js';
-import { toEvidenceRelativePath } from '../utils/fs-safe.js';
+import { slugForPath, toEvidenceRelativePath } from '../utils/fs-safe.js';
 import { discoverImageAssets, mirrorAssets } from './assets.js';
 import { gotoWithReadiness, reloadWithReadiness, type NavigationOutcome } from './navigation.js';
 import {
@@ -126,22 +128,141 @@ export async function launchHeadlessChromium(): Promise<Browser> {
 // Crawl engine
 // ---------------------------------------------------------------------------
 
-/** Derives a filesystem-safe slug from a URL path (`/` -> `index`). */
-function slugForPath(pathname: string): string {
-  const slug = pathname
-    .split('/')
-    .filter(Boolean)
-    .join('-')
-    .replace(/[^a-zA-Z0-9-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 60);
-  return slug.length > 0 ? slug : 'index';
+/**
+ * Compact-but-readable JSON for the lightweight root index: containers nest
+ * at two spaces, flat leaf records render on a single line. Keeps
+ * `manifest.json` a small index even when diagnostics lists grow with the
+ * discovered link frontier (Rule D: lightweight index, no heavy payloads).
+ */
+function stringifyIndexJson(value: unknown, level = 0): string {
+  const pad = '  '.repeat(level);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return '[]';
+    const items = value.map(
+      (item) =>
+        `${pad}  ${
+          isFlatRecord(item) ? JSON.stringify(item) : stringifyIndexJson(item, level + 1)
+        }`,
+    );
+    return `[\n${items.join(',\n')}\n${pad}]`;
+  }
+  if (typeof value === 'object' && value !== null) {
+    const entries = Object.entries(value);
+    if (entries.length === 0) return '{}';
+    const lines = entries.map(([key, entry]) => {
+      const rendered = isFlatRecord(entry)
+        ? JSON.stringify(entry)
+        : stringifyIndexJson(entry, level + 1);
+      return `${pad}  ${JSON.stringify(key)}: ${rendered}`;
+    });
+    return `{\n${lines.join(',\n')}\n${pad}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/** True when a value is a plain object whose leaves are all scalars. */
+function isFlatRecord(value: unknown): boolean {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.values(value).every(
+      (entry) =>
+        entry === null ||
+        typeof entry === 'string' ||
+        typeof entry === 'number' ||
+        typeof entry === 'boolean',
+    )
+  );
+}
+
+/**
+ * Persists one crawl using the modular per-route evidence layout:
+ *
+ * ```
+ * manifest.json                  — lightweight root index (stats, diagnostics,
+ *                                  route stubs; no trees or full text spans)
+ * assets.json                    — canonical global AssetEntry[] registry
+ * routes/<slug>/route.json       — url, path, title, screenshots, metadata,
+ *                                  tokens, hashCaptures, modalCaptures
+ * routes/<slug>/a11y.json        — accessibility tree only
+ * routes/<slug>/text-spans.json  — { desktop, mobile? } measured text spans
+ * ```
+ *
+ * Legacy consumers keep working through `loadEvidenceManifest()`, which
+ * hydrates this layout back into a full `EvidenceManifest`.
+ */
+export async function writeModularEvidence(
+  evidenceDir: string,
+  manifest: EvidenceManifest,
+): Promise<void> {
+  const routesDir = join(evidenceDir, 'routes');
+  await mkdir(routesDir, { recursive: true });
+
+  for (const route of manifest.routes) {
+    const routeDir = join(routesDir, slugForPath(route.path));
+    await mkdir(routeDir, { recursive: true });
+
+    const { a11yTree, textSpans, mobileTextSpans, ...routeMeta } = route;
+
+    await writeFile(
+      join(routeDir, 'route.json'),
+      JSON.stringify(routeMeta, null, 2),
+      'utf8',
+    );
+    await writeFile(
+      join(routeDir, 'a11y.json'),
+      JSON.stringify(a11yTree, null, 2),
+      'utf8',
+    );
+
+    const spans: ModularTextSpans = {
+      desktop: textSpans ?? [],
+      ...(mobileTextSpans !== undefined ? { mobile: mobileTextSpans } : {}),
+    };
+    await writeFile(
+      join(routeDir, 'text-spans.json'),
+      JSON.stringify(spans, null, 2),
+      'utf8',
+    );
+  }
+
+  await writeFile(
+    join(evidenceDir, 'assets.json'),
+    JSON.stringify(manifest.assets, null, 2),
+    'utf8',
+  );
+
+  const routeIndex: RouteManifestIndex[] = manifest.routes.map((route) => ({
+    path: route.path,
+    url: route.url,
+    title: route.title,
+    slug: slugForPath(route.path),
+    desktopScreenshot: route.desktopScreenshot,
+    mobileScreenshot: route.mobileScreenshot,
+  }));
+
+  // Root manifest stays a lightweight index: heavy per-route payloads live in
+  // routes/<slug>/ so deep crawls never inflate this file.
+  const lightweightManifest = {
+    targetUrl: manifest.targetUrl,
+    crawledAt: manifest.crawledAt,
+    stats: manifest.stats,
+    routes: routeIndex,
+    diagnostics: manifest.diagnostics,
+  };
+
+  await writeFile(
+    join(evidenceDir, 'manifest.json'),
+    `${stringifyIndexJson(lightweightManifest)}\n`,
+    'utf8',
+  );
 }
 
 /**
  * Runs the full evidence crawl for a root URL and writes the evidence bundle
- * (screenshots, mirrored assets, `manifest.json`) under the evidence dir.
- * Returns the persisted manifest.
+ * (screenshots, mirrored assets, modular evidence files) under the evidence
+ * dir. Returns the persisted manifest.
  */
 export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceManifest> {
   const requestedRootUrl = await validateNetworkUrl(options.rootUrl, options.networkPolicy);
@@ -642,11 +763,9 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
     diagnostics,
   };
 
-  await writeFile(
-    join(evidenceDir, 'manifest.json'),
-    JSON.stringify(manifest, null, 2),
-    'utf8',
-  );
+  // Modular per-route evidence layout: routes/<slug>/… plus a lightweight
+  // root manifest.json index (see writeModularEvidence).
+  await writeModularEvidence(evidenceDir, manifest);
 
   return manifest;
 }

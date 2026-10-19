@@ -266,6 +266,32 @@ export interface EvidenceManifest {
   diagnostics: CrawlDiagnostics;
 }
 
+/**
+ * Lightweight per-route descriptor stored in the root `manifest.json` index of
+ * a modular evidence bundle. Heavy payloads (a11y tree, text spans, tokens,
+ * captures) live in `routes/<slug>/` and are hydrated on demand.
+ */
+export interface RouteManifestIndex {
+  /** URL path of the page (e.g. `/about`) — canonical route key. */
+  path: string;
+  /** The normalized URL of the page. */
+  url: string;
+  /** Document title at capture time. */
+  title: string;
+  /** Filesystem-safe subdirectory slug under `routes/`. */
+  slug: string;
+  /** Local path of the desktop (1280x800) screenshot PNG (null when not captured). */
+  desktopScreenshot: string | null;
+  /** Local path of the mobile (390x844) screenshot PNG (null when not captured). */
+  mobileScreenshot: string | null;
+}
+
+/** Payload of `routes/<slug>/text-spans.json` in a modular evidence bundle. */
+export interface ModularTextSpans {
+  desktop: TextSpan[];
+  mobile?: TextSpan[];
+}
+
 // ---------------------------------------------------------------------------
 // Layer 2 — Reconstruction
 // ---------------------------------------------------------------------------
