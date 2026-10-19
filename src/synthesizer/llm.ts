@@ -331,6 +331,38 @@ function isStructuredOutputUnsupported(error: unknown): boolean {
   return hasStatus || mentionsParameter || message.includes('400');
 }
 
+/**
+ * True when the model responded but no structured object could be produced —
+ * typically the AI SDK's `NoObjectGeneratedError` ("the tool was not
+ * called"), raised when a model answers with prose instead of invoking the
+ * structured-output tool. This is a protocol capability failure, not a
+ * transient provider fault: the pipeline must fall back to raw-text JSON
+ * extraction instead of abandoning the stage.
+ */
+function isNoObjectGeneratedError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.name === 'AI_NoObjectGeneratedError' || /no object generated/i.test(error.message);
+}
+
+/**
+ * Attempts to salvage generated files from the raw text a failed structured
+ * generation already produced (the AI SDK attaches it to
+ * `NoObjectGeneratedError.text`). Returns null when there is no usable
+ * payload; callers then fall back to a fresh `generateText` extraction.
+ */
+function salvageGeneratedFiles(cause: unknown): ProjectFile[] | null {
+  const text = (cause as { text?: unknown }).text;
+  if (typeof text !== 'string' || text.trim().length === 0) return null;
+  try {
+    const parsed: GeneratedProject = GeneratedProjectSchema.parse(
+      JSON.parse(extractJsonBlock(text)),
+    );
+    return parsed.files.length > 0 ? parsed.files : null;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Markdown fence extraction
 // ---------------------------------------------------------------------------
@@ -375,8 +407,10 @@ function extractJsonBlock(text: string): string {
  *
  * Prefers `generateObject` with the `project_files` schema. When the model
  * rejects native `json_schema` structured output (400 / unsupported
- * parameter — typical of local SLMs and OpenAI-compatible proxies), falls
- * back to `generateText` and parses the JSON block out of the raw response.
+ * parameter — typical of local SLMs and OpenAI-compatible proxies) or
+ * answers without invoking the structured tool (`NoObjectGeneratedError`),
+ * falls back to salvaging the returned text, then to `generateText` with
+ * JSON block extraction out of the raw response.
  * The whole call runs inside the single bounded transient retry policy
  * (429/502/503/408 retried, 401/403 abort the run, everything else raises).
  */
@@ -403,14 +437,24 @@ export async function generateStructuredFilesFromParts(
 
         return result.object.files;
       } catch (cause) {
-        if (!isStructuredOutputUnsupported(cause)) throw cause;
+        // Salvage files the failed structured call already produced before
+        // paying for a second generation round-trip.
+        const salvaged = isNoObjectGeneratedError(cause) ? salvageGeneratedFiles(cause) : null;
+        if (salvaged !== null) return salvaged;
+
+        const unsupported = isStructuredOutputUnsupported(cause);
+        const noObject = isNoObjectGeneratedError(cause);
+        if (!unsupported && !noObject) throw cause;
 
         // Protocol capability fallback — not a transient failure; subsequent
         // retry attempts skip straight to the generateText path.
         structuredUnsupported = true;
         console.warn(
-          '[apograph] structured output unsupported by model; ' +
-            'falling back to generateText JSON extraction.',
+          unsupported
+            ? '[apograph] structured output unsupported by model; ' +
+                'falling back to generateText JSON extraction.'
+            : '[apograph] model produced no structured object; ' +
+                'falling back to generateText JSON extraction.',
         );
       }
     }

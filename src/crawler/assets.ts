@@ -17,6 +17,43 @@ import { validateNetworkUrl, type NetworkPolicyOptions } from './network-policy.
 /** Download timeout per asset. */
 const DOWNLOAD_TIMEOUT_MS = 20_000;
 
+/** Bounded download attempts per asset (1 initial + retries on transients). */
+const DOWNLOAD_ATTEMPTS = 3;
+
+/** Backoff schedule (base + jitter) between transient asset download retries. */
+const DOWNLOAD_BACKOFF: ReadonlyArray<{ baseMs: number; jitterMs: number }> = [
+  { baseMs: 1_000, jitterMs: 500 },
+  { baseMs: 3_000, jitterMs: 1_000 },
+];
+
+/** HTTP statuses worth retrying (bounded): throttling and server-side faults. */
+const RETRYABLE_ASSET_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+
+/** Markers of transient network dropouts (node/undici error codes and messages). */
+const TRANSIENT_NETWORK_RE =
+  /(fetch failed|socket hang up|econnreset|econnrefused|etimedout|epipe|eai_again|ehostunreach|enetunreach|und_err|timeout|abort)/i;
+
+/**
+ * True when a failed asset download is transient (network dropout, timeout,
+ * throttling, or server fault) and a bounded retry can plausibly succeed.
+ * Deterministic policy failures (404, blocked content type, size limits) are
+ * never retried.
+ */
+export function isTransientAssetError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const status = (error as { status?: unknown }).status;
+  if (typeof status === 'number') return RETRYABLE_ASSET_STATUS.has(status);
+  const cause = (error as { cause?: unknown }).cause;
+  for (const node of [error, cause]) {
+    if (!(node instanceof Error)) continue;
+    const code = (node as { code?: unknown }).code;
+    if (typeof code === 'string' && TRANSIENT_NETWORK_RE.test(code)) return true;
+    if (TRANSIENT_NETWORK_RE.test(node.name)) return true;
+    if (TRANSIENT_NETWORK_RE.test(node.message)) return true;
+  }
+  return false;
+}
+
 /** Fallback file extensions derived from MIME types. */
 const MIME_EXTENSIONS: Record<string, string> = {
   'image/png': 'png',
@@ -124,6 +161,88 @@ export interface MirrorOptions extends NetworkPolicyOptions {
   maxAssets?: number;
   maxBytes?: number;
   maxTotalBytes?: number;
+  /** Sleep primitive for retry backoff waits (tests inject fakes). */
+  sleepImpl?: (ms: number) => Promise<void>;
+}
+
+/** One successful asset download (post-redirect), ready to mirror to disk. */
+interface DownloadedAsset {
+  url: URL;
+  mimeType: string;
+  buffer: Buffer;
+}
+
+/** Builds an Error carrying an HTTP status so retries can classify it. */
+function httpStatusError(status: number, statusText: string): Error {
+  return Object.assign(new Error(`HTTP ${status} ${statusText}`.trim()), { status });
+}
+
+/**
+ * Runs one download attempt for a single asset: follows at most one
+ * policy-validated redirect, then enforces the image MIME and per-asset size
+ * budgets. Throws on any failure; transient classification happens in
+ * {@link downloadWithRetry}.
+ */
+async function downloadAssetOnce(
+  startUrl: URL,
+  fetchImpl: typeof fetch,
+  options: NetworkPolicyOptions,
+  maxBytes: number,
+): Promise<DownloadedAsset> {
+  let url = startUrl;
+  let response = await fetchImpl(url.href, {
+    redirect: 'manual',
+    signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+  });
+  if (response.status >= 300 && response.status < 400) {
+    const location = response.headers.get('location');
+    if (location === null) throw new Error('redirect response missing Location');
+    // Redirect targets (e.g. CDN -> object storage) are allowed for any
+    // origin as long as they pass the same SSRF/network policy.
+    const redirectUrl = await validateNetworkUrl(new URL(location, url).href, options);
+    response = await fetchImpl(redirectUrl.href, {
+      redirect: 'error',
+      signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+    });
+    url = redirectUrl;
+  }
+
+  if (!response.ok) {
+    throw httpStatusError(response.status, response.statusText);
+  }
+
+  const mimeType = (response.headers.get('content-type') ?? '').split(';')[0]?.trim() ?? '';
+  if (!mimeType.startsWith('image/')) throw new Error(`unexpected content type: ${mimeType || 'missing'}`);
+  const declaredLength = Number(response.headers.get('content-length') ?? '0');
+  if (declaredLength > maxBytes) throw new Error(`asset exceeds ${maxBytes} byte limit`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer.byteLength > maxBytes) throw new Error(`asset exceeds ${maxBytes} byte limit`);
+
+  return { url, mimeType, buffer };
+}
+
+/**
+ * Downloads one asset with a bounded transient retry policy: network
+ * dropouts, timeouts, throttling, and server faults are retried with
+ * exponential backoff + jitter; deterministic failures raise immediately.
+ */
+async function downloadWithRetry(
+  startUrl: URL,
+  fetchImpl: typeof fetch,
+  options: NetworkPolicyOptions,
+  maxBytes: number,
+  sleepImpl: (ms: number) => Promise<void>,
+): Promise<DownloadedAsset> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await downloadAssetOnce(startUrl, fetchImpl, options, maxBytes);
+    } catch (cause) {
+      if (attempt >= DOWNLOAD_ATTEMPTS || !isTransientAssetError(cause)) throw cause;
+      const schedule = DOWNLOAD_BACKOFF[Math.min(attempt - 1, DOWNLOAD_BACKOFF.length - 1)];
+      if (schedule === undefined) throw cause;
+      await sleepImpl(schedule.baseMs + Math.floor(Math.random() * schedule.jitterMs));
+    }
+  }
 }
 
 /**
@@ -175,40 +294,17 @@ export async function mirrorAssets(
     const provenance = url.origin === rootOrigin ? 'same-origin' : `cross-origin (${url.origin})`;
 
     try {
-      let response = await fetchImpl(url.href, {
-        redirect: 'manual',
-        signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
-      });
-      if (response.status >= 300 && response.status < 400) {
-        const location = response.headers.get('location');
-        if (location === null) throw new Error('redirect response missing Location');
-        // Redirect targets (e.g. CDN -> object storage) are allowed for any
-        // origin as long as they pass the same SSRF/network policy.
-        const redirectUrl = await validateNetworkUrl(new URL(location, url).href, options);
-        const redirected = await fetchImpl(redirectUrl.href, {
-          redirect: 'error',
-          signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
-        });
-        response = redirected;
-        url = redirectUrl;
+      const sleepImpl = options.sleepImpl ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+      const downloaded = await downloadWithRetry(url, fetchImpl, options, maxBytes, sleepImpl);
+      url = downloaded.url;
+      if (totalBytes + downloaded.buffer.byteLength > maxTotalBytes) {
+        throw new Error(`asset budget exceeds ${maxTotalBytes} byte limit`);
       }
+      totalBytes += downloaded.buffer.byteLength;
+      const localPath = join(assetsDir, assetFilename(url, downloaded.mimeType));
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
-      }
-
-      const mimeType = (response.headers.get('content-type') ?? '').split(';')[0]?.trim() ?? '';
-      if (!mimeType.startsWith('image/')) throw new Error(`unexpected content type: ${mimeType || 'missing'}`);
-      const declaredLength = Number(response.headers.get('content-length') ?? '0');
-      if (declaredLength > maxBytes) throw new Error(`asset exceeds ${maxBytes} byte limit`);
-      const buffer = Buffer.from(await response.arrayBuffer());
-      if (buffer.byteLength > maxBytes) throw new Error(`asset exceeds ${maxBytes} byte limit`);
-      if (totalBytes + buffer.byteLength > maxTotalBytes) throw new Error(`asset budget exceeds ${maxTotalBytes} byte limit`);
-      totalBytes += buffer.byteLength;
-      const localPath = join(assetsDir, assetFilename(url, mimeType));
-
-      await writeFile(localPath, buffer);
-      entries.push({ originalUrl: url.href, localPath, status: 'downloaded', mimeType });
+      await writeFile(localPath, downloaded.buffer);
+      entries.push({ originalUrl: url.href, localPath, status: 'downloaded', mimeType: downloaded.mimeType });
     } catch (cause) {
       const reason = cause instanceof Error ? cause.message : String(cause);
       entries.push({ originalUrl: url.href, localPath: null, status: 'failed' });

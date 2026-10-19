@@ -447,3 +447,94 @@ describe('network/socket dropouts (transient reconnects)', () => {
     assert.deepEqual(clock.sleeps, [3000, 7000]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// No-object-generated protocol fallback (remediation record: tool not called)
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds an AI SDK `NoObjectGeneratedError`-shaped failure: the model
+ * answered but never invoked the structured-output tool. Optionally carries
+ * the raw response text the SDK attaches for salvage.
+ */
+function noObjectGenerated(text?: string, message = 'No object generated: the tool was not called.'): Error {
+  return Object.assign(new Error(message), {
+    name: 'AI_NoObjectGeneratedError',
+    ...(text !== undefined ? { text } : {}),
+  });
+}
+
+describe('generateStructuredFilesFromParts (no-object-generated fallback)', () => {
+  test('salvages project JSON from the failed structured call without a second LLM round-trip', async () => {
+    const clock = fakeClock();
+    let calls = 0;
+    const files = await generateStructuredFilesFromParts(
+      [{ type: 'text', text: 'build the page' }],
+      undefined,
+      {
+        ...clock,
+        model: mockModel(async () => {
+          calls += 1;
+          throw noObjectGenerated('{"files":[{"path":"src/salvaged.ts","content":"s"}]}');
+        }) as never,
+      },
+    );
+    assert.equal(files[0]?.path, 'src/salvaged.ts');
+    assert.equal(calls, 1, 'salvage must avoid a second generation call');
+    assert.deepEqual(clock.sleeps, []);
+  });
+
+  test('falls back to generateText JSON extraction when the response text is not salvageable', async () => {
+    const clock = fakeClock();
+    let calls = 0;
+    const files = await generateStructuredFilesFromParts(
+      [{ type: 'text', text: 'x' }],
+      undefined,
+      {
+        ...clock,
+        model: mockModel(async () => {
+          calls += 1;
+          if (calls === 1) throw noObjectGenerated('I would rather describe it in prose.');
+          return {
+            finishReason: 'stop',
+            usage: { promptTokens: 1, completionTokens: 1 },
+            text: '{"files":[{"path":"src/fallback.ts","content":"y"}]}',
+            rawCall: { rawPrompt: null, rawSettings: {} },
+          };
+        }) as never,
+      },
+    );
+    assert.equal(files[0]?.path, 'src/fallback.ts');
+    assert.equal(calls, 2, 'one failed structured call + one generateText fallback');
+    assert.deepEqual(clock.sleeps, [], 'protocol fallback is not a transient retry');
+  });
+
+  test('detects the failure by error name even with an unrelated message', async () => {
+    const clock = fakeClock();
+    let calls = 0;
+    const files = await generateStructuredFilesFromParts(
+      [{ type: 'text', text: 'x' }],
+      undefined,
+      {
+        ...clock,
+        model: mockModel(async () => {
+          calls += 1;
+          if (calls === 1) {
+            throw Object.assign(new Error('tool invocation missing from response'), {
+              name: 'AI_NoObjectGeneratedError',
+            });
+          }
+          return {
+            finishReason: 'stop',
+            usage: { promptTokens: 1, completionTokens: 1 },
+            text: '{"files":[{"path":"src/named.ts","content":"n"}]}',
+            rawCall: { rawPrompt: null, rawSettings: {} },
+          };
+        }) as never,
+      },
+    );
+    assert.equal(files[0]?.path, 'src/named.ts');
+    assert.equal(calls, 2);
+    assert.deepEqual(clock.sleeps, []);
+  });
+});

@@ -18,7 +18,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { mirrorAssets } from '../dist/crawler/assets.js';
+import { mirrorAssets, isTransientAssetError } from '../dist/crawler/assets.js';
 import type { NetworkPolicyOptions } from '../dist/crawler/network-policy.js';
 
 const PUBLIC_RESOLVE: NetworkPolicyOptions['resolve'] = async () => [
@@ -156,5 +156,155 @@ test('asset-mirror > enforces per-asset byte limits', async () => {
     );
 
     assert.equal(entries[0]?.status, 'failed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Transient-failure resilience (bounded retry with backoff)
+// ---------------------------------------------------------------------------
+
+/** Builds a network-dropout fetch rejection with a node-style cause code. */
+function networkDropout(code = 'ECONNRESET'): TypeError {
+  return Object.assign(new TypeError('fetch failed'), {
+    cause: Object.assign(new Error('connect ECONNRESET'), { code }),
+  });
+}
+
+test('asset-mirror > isTransientAssetError separates transients from deterministic failures', () => {
+  assert.equal(isTransientAssetError(networkDropout()), true);
+  assert.equal(isTransientAssetError(new Error('socket hang up')), true);
+  assert.equal(isTransientAssetError(Object.assign(new Error('HTTP 503'), { status: 503 })), true);
+  assert.equal(isTransientAssetError(Object.assign(new Error('HTTP 429'), { status: 429 })), true);
+  assert.equal(isTransientAssetError(new DOMException('The operation timed out.', 'TimeoutError')), true);
+  assert.equal(isTransientAssetError(Object.assign(new Error('HTTP 404'), { status: 404 })), false);
+  assert.equal(isTransientAssetError(new Error('unexpected content type: text/html')), false);
+  assert.equal(isTransientAssetError('not an error'), false);
+});
+
+test('asset-mirror > retries transient network dropouts with bounded backoff and succeeds', async () => {
+  await withAssetsDir(async (dir) => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      if (calls <= 2) throw networkDropout();
+      return response(PNG_BYTES, 'image/png');
+    }) as unknown as typeof fetch;
+    const sleeps: number[] = [];
+
+    const { entries, uncaptured } = await mirrorAssets(
+      ['https://www.example.com/flaky.png'],
+      'https://www.example.com',
+      dir,
+      {
+        fetchImpl,
+        resolve: PUBLIC_RESOLVE,
+        sleepImpl: async (ms) => {
+          sleeps.push(ms);
+        },
+      },
+    );
+
+    assert.equal(entries[0]?.status, 'downloaded');
+    assert.equal(uncaptured.length, 0);
+    assert.equal(calls, 3, 'two transient failures then success');
+    assert.equal(sleeps.length, 2, 'one backoff wait per failed attempt');
+    assert.ok(sleeps[0] >= 1000 && sleeps[0] < 1500, `first backoff ${sleeps[0]}ms`);
+    assert.ok(sleeps[1] >= 3000 && sleeps[1] < 4000, `second backoff ${sleeps[1]}ms`);
+  });
+});
+
+test('asset-mirror > retries transient HTTP faults (503) and recovers', async () => {
+  await withAssetsDir(async (dir) => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      if (calls === 1) return response(PNG_BYTES, 'image/png', { status: 503, statusText: 'Service Unavailable' });
+      return response(PNG_BYTES, 'image/png');
+    }) as unknown as typeof fetch;
+    const sleeps: number[] = [];
+
+    const { entries } = await mirrorAssets(
+      ['https://www.example.com/throttled.png'],
+      'https://www.example.com',
+      dir,
+      {
+        fetchImpl,
+        resolve: PUBLIC_RESOLVE,
+        sleepImpl: async (ms) => {
+          sleeps.push(ms);
+        },
+      },
+    );
+
+    assert.equal(entries[0]?.status, 'downloaded');
+    assert.equal(calls, 2);
+    assert.equal(sleeps.length, 1);
+  });
+});
+
+test('asset-mirror > never retries deterministic failures (404, non-image content)', async () => {
+  await withAssetsDir(async (dir) => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      return response(PNG_BYTES, 'image/png', { status: 404, statusText: 'Not Found' });
+    }) as unknown as typeof fetch;
+
+    const { entries } = await mirrorAssets(
+      ['https://www.example.com/missing.png'],
+      'https://www.example.com',
+      dir,
+      { fetchImpl, resolve: PUBLIC_RESOLVE, sleepImpl: async () => undefined },
+    );
+
+    assert.equal(entries[0]?.status, 'failed');
+    assert.equal(calls, 1, 'a 404 must not be retried');
+  });
+
+  await withAssetsDir(async (dir) => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      return response(Buffer.from('html'), 'text/html');
+    }) as unknown as typeof fetch;
+
+    const { entries } = await mirrorAssets(
+      ['https://www.example.com/page.png'],
+      'https://www.example.com',
+      dir,
+      { fetchImpl, resolve: PUBLIC_RESOLVE, sleepImpl: async () => undefined },
+    );
+
+    assert.equal(entries[0]?.status, 'failed');
+    assert.equal(calls, 1, 'a content-type policy failure must not be retried');
+  });
+});
+
+test('asset-mirror > gives up after bounded attempts on persistent transients', async () => {
+  await withAssetsDir(async (dir) => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      throw networkDropout();
+    }) as unknown as typeof fetch;
+    const sleeps: number[] = [];
+
+    const { entries, uncaptured } = await mirrorAssets(
+      ['https://www.example.com/dead.png'],
+      'https://www.example.com',
+      dir,
+      {
+        fetchImpl,
+        resolve: PUBLIC_RESOLVE,
+        sleepImpl: async (ms) => {
+          sleeps.push(ms);
+        },
+      },
+    );
+
+    assert.equal(entries[0]?.status, 'failed');
+    assert.equal(calls, 3, 'bounded: one initial attempt plus two retries');
+    assert.equal(sleeps.length, 2);
+    assert.ok(uncaptured[0]?.reason.includes('fetch failed'));
   });
 });
