@@ -57,6 +57,33 @@ export async function writeContainedFile(root: string, path: string, content: st
   return candidate;
 }
 
+/**
+ * Records a file path as bundle-relative for evidence manifests. Evidence
+ * bundles must stay relocatable, so manifest references are stored relative
+ * to the evidence directory (POSIX separators) and resolved back against it
+ * by consumers. Paths that escape the bundle root are rejected loudly.
+ */
+export function toEvidenceRelativePath(root: string, path: string): string {
+  const rootPath = resolve(root);
+  const candidate = resolve(path);
+  const rel = relative(rootPath, candidate);
+  if (rel.length === 0 || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`Path escapes authorized root: ${path}`);
+  }
+  return assertSafeRelativePath(rel.split(sep).join('/'));
+}
+
+/**
+ * Resolves an evidence reference read from a manifest. Bundle-relative paths
+ * are containment-checked and resolved against the evidence directory;
+ * absolute paths written by older evidence bundles (or tooling predating
+ * bundle-relative references) are honored as-is for compatibility.
+ */
+export function resolveEvidenceReference(root: string, path: string): string {
+  if (isAbsolute(path)) return resolve(path);
+  return resolveContainedPath(root, path);
+}
+
 /** Canonicalizes an existing path and verifies it remains under root. */
 export async function realpathContained(root: string, candidate: string): Promise<string> {
   const rootReal = await realpath(root);

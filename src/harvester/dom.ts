@@ -12,7 +12,7 @@
 
 import type { Page } from 'playwright';
 import * as csstree from 'css-tree';
-import type { A11yNode, CanvasTheme, DesignTokens, DOMSnapshot, TextSpan } from '../types.js';
+import type { A11yNode, CanvasTheme, DesignTokens, DOMSnapshot, FontFaceRule, TextSpan, TextStyle } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // A11y tree extraction
@@ -264,13 +264,72 @@ export async function extractDesignTokens(page: Page): Promise<DesignTokens> {
     }
   });
 
+  const fontTokens = extractFontTokens(css);
   return {
     colors: Object.fromEntries(colors),
     fonts: [...fonts].sort(),
     spacing: [...spacing].sort(),
     radii: [...radii].sort(),
     ...(canvas !== undefined ? { canvas } : {}),
+    ...(fontTokens.fontFaces.length > 0 ? { fontFaces: fontTokens.fontFaces } : {}),
+    ...(Object.keys(fontTokens.fontVariables).length > 0
+      ? { fontVariables: fontTokens.fontVariables }
+      : {}),
   };
+}
+
+/**
+ * Pure extractor for webfont replay evidence: every readable `@font-face`
+ * rule (family/src/weight/style) plus font-related custom properties such
+ * as `--font-sans` / `--font-mono` / `--default-font-family`. Cross-origin
+ * stylesheets are unreadable by design (see `collectCssText`) and simply
+ * contribute nothing here.
+ */
+export function extractFontTokens(css: string): {
+  fontFaces: FontFaceRule[];
+  fontVariables: Record<string, string>;
+} {
+  const ast = csstree.parse(css, { parseValue: false, parseCustomProperty: true });
+  const faces = new Map<string, FontFaceRule>();
+  const variables: Record<string, string> = {};
+
+  csstree.walk(ast, {
+    visit: 'Atrule',
+    enter(node) {
+      if (node.name !== 'font-face' || node.block === null) return;
+      const descriptors: Record<string, string> = {};
+      node.block.children.forEach((child) => {
+        if (child.type !== 'Declaration') return;
+        descriptors[csstree.property(child.property).name] = normalizeValue(csstree.generate(child.value));
+      });
+      const family = (descriptors['font-family'] ?? '').replace(/^['"]|['"]$/g, '');
+      const src = descriptors['src'] ?? '';
+      if (family.length === 0) return;
+      const weight = descriptors['font-weight'];
+      const style = descriptors['font-style'];
+      const key = `${family}|${weight ?? ''}|${style ?? ''}|${src}`;
+      if (!faces.has(key)) {
+        faces.set(key, {
+          family,
+          src,
+          ...(weight !== undefined ? { weight } : {}),
+          ...(style !== undefined ? { style } : {}),
+        });
+      }
+    },
+  });
+
+  csstree.walk(ast, (node) => {
+    if (node.type !== 'Declaration') return;
+    const property = csstree.property(node.property).name;
+    if (!/^--(?:default-)?font/.test(property)) return;
+    const value = normalizeValue(csstree.generate(node.value));
+    if (value.length > 0 && value.length <= 500 && !(property in variables)) {
+      variables[property] = value;
+    }
+  });
+
+  return { fontFaces: [...faces.values()], fontVariables: variables };
 }
 
 /** Collapses generated CSS whitespace into a single-line token value. */
@@ -314,6 +373,20 @@ export interface RawTextSpan {
   boxHeight: number;
   tag: string;
   parentTag: string;
+  /** Computed `font-size` (e.g. `30px`); optional on legacy fixtures. */
+  fontSize?: string;
+  /** Computed `font-weight` (e.g. `900`). */
+  fontWeight?: string;
+  /** Computed `line-height`. */
+  lineHeight?: string;
+  /** Computed `letter-spacing`. */
+  letterSpacing?: string;
+  /** Computed `text-transform`. */
+  textTransform?: string;
+  /** Computed `font-family` stack. */
+  fontFamily?: string;
+  /** Computed `text-align`. */
+  textAlign?: string;
 }
 
 /** True when a computed color is fully transparent (alpha 0). */
@@ -336,6 +409,44 @@ export function isGradientText(raw: {
   const clipText = raw.backgroundClip.includes('text');
   const fillTransparent = isTransparentColor(raw.webkitTextFillColor);
   return hasGradient && (clipText || fillTransparent);
+}
+
+/**
+ * Pure mapping of raw computed typography values to the canonical
+ * `TextStyle` (spec s5.1): drops unresolvable/identity values (`normal`
+ * line-height/letter-spacing, `none` text-transform, empty strings) and
+ * reduces the font stack to its first family. Returns `undefined` when
+ * nothing measurable remains.
+ */
+export function buildTextStyle(raw: RawTextSpan): TextStyle | undefined {
+  const style: TextStyle = {};
+  if (raw.fontSize !== undefined && raw.fontSize.trim().length > 0) {
+    style.fontSize = raw.fontSize.trim();
+  }
+  if (raw.fontWeight !== undefined && raw.fontWeight.trim().length > 0) {
+    style.fontWeight = raw.fontWeight.trim();
+  }
+  const lineHeight = raw.lineHeight?.trim();
+  if (lineHeight !== undefined && lineHeight.length > 0 && lineHeight !== 'normal') {
+    style.lineHeight = lineHeight;
+  }
+  const letterSpacing = raw.letterSpacing?.trim();
+  if (letterSpacing !== undefined && letterSpacing.length > 0 && letterSpacing !== 'normal') {
+    style.letterSpacing = letterSpacing;
+  }
+  const textTransform = raw.textTransform?.trim();
+  if (textTransform !== undefined && textTransform.length > 0 && textTransform !== 'none') {
+    style.textTransform = textTransform;
+  }
+  const family = raw.fontFamily?.split(',')[0]?.trim().replace(/^["']|["']$/g, '');
+  if (family !== undefined && family.length > 0) {
+    style.fontFamily = family;
+  }
+  const textAlign = raw.textAlign?.trim();
+  if (textAlign !== undefined && textAlign.length > 0) {
+    style.textAlign = textAlign;
+  }
+  return Object.keys(style).length > 0 ? style : undefined;
 }
 
 /**
@@ -367,6 +478,8 @@ export function buildTextSpans(raw: RawTextSpan[]): TextSpan[] {
       },
     };
     if (isGradientText(entry)) span.gradient = entry.backgroundImage;
+    const style = buildTextStyle(entry);
+    if (style !== undefined) span.style = style;
     spans.push(span);
   }
   return spans;
@@ -431,6 +544,13 @@ function collectRawTextSpans(): RawTextSpan[] {
       boxHeight: rect.height,
       tag,
       parentTag,
+      fontSize: style.fontSize,
+      fontWeight: style.fontWeight,
+      lineHeight: style.lineHeight,
+      letterSpacing: style.letterSpacing,
+      textTransform: style.textTransform,
+      fontFamily: style.fontFamily,
+      textAlign: style.textAlign,
     });
   }
   return raw;

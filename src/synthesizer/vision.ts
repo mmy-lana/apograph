@@ -149,7 +149,12 @@ export function formatTokensForVisionPrompt(tokens: DesignTokens): string {
 
 /** Serializes the mirrored-asset map for prompt embedding. */
 export function formatAssetMapForPrompt(
-  assets: Array<{ originalUrl: string; localPath: string | null; status: string }>,
+  assets: Array<{
+    originalUrl: string;
+    localPath: string | null;
+    status: string;
+    canvasOverlay?: { opacity: number; position: string; coversViewport: boolean };
+  }>,
 ): string {
   const downloaded = assets.filter(
     (asset) => asset.status === 'downloaded' && asset.localPath !== null,
@@ -159,7 +164,12 @@ export function formatAssetMapForPrompt(
   return downloaded
     .map((asset) => {
       const filename = asset.localPath?.split('/').pop() ?? '';
-      return `  /assets/${filename}  <-  ${asset.originalUrl}`;
+      const overlay = asset.canvasOverlay;
+      const overlayNote =
+        overlay !== undefined && overlay.coversViewport
+          ? `  [viewport overlay — ${overlay.position} full-viewport layer at opacity ${overlay.opacity}]`
+          : '';
+      return `  /assets/${filename}  <-  ${asset.originalUrl}${overlayNote}`;
     })
     .join('\n');
 }
@@ -172,13 +182,50 @@ export function formatAssetMapForPrompt(
 export const MAX_PROMPT_TEXT_SPANS = 200;
 
 /**
+ * Formats one span's measured rendered geometry (computed typography plus
+ * bounding box) as a compact metric string, or an empty string when nothing
+ * was measured. Pure and exported for testing.
+ */
+export function formatMeasuredMetrics(span: TextSpan): string {
+  const parts: string[] = [];
+  const style = span.style;
+  if (style?.fontSize !== undefined) parts.push(`fs ${style.fontSize}`);
+  if (style?.fontWeight !== undefined) parts.push(`fw ${style.fontWeight}`);
+  if (style?.lineHeight !== undefined) parts.push(`lh ${style.lineHeight}`);
+  if (style?.letterSpacing !== undefined) parts.push(`ls ${style.letterSpacing}`);
+  if (style?.textTransform !== undefined) parts.push(`transform ${style.textTransform}`);
+  if (style?.textAlign !== undefined && style.textAlign !== 'left' && style.textAlign !== 'start') {
+    parts.push(`align ${style.textAlign}`);
+  }
+  const box = span.boundingBox;
+  if (box !== undefined) {
+    parts.push(
+      `box ${Math.round(box.width)}x${Math.round(box.height)} @${Math.round(box.left)},${Math.round(box.top)}`,
+    );
+  }
+  return parts.join(', ');
+}
+
+/**
  * Formats the harvested text corpus for prompt embedding (spec s5.2):
  * spans are sorted by vertical visual position (boundingBox.top ASC) so they
  * match the natural top-to-bottom reading order of the screenshot, falling
  * back to original document index when coordinates are absent or identical.
+ *
+ * Each span line carries its MEASURED rendered geometry (computed typography
+ * and bounding box) captured from the live site. When `mobileSpans` is
+ * provided (dual-viewport crawl, matched by exact span text), the mobile
+ * viewport's measurements appear alongside the desktop ones so the model can
+ * reproduce each viewport's type scale and wrapping widths instead of
+ * guessing them from pixels.
  */
-export function formatTextSpansForPrompt(spans: TextSpan[]): string {
+export function formatTextSpansForPrompt(spans: TextSpan[], mobileSpans?: TextSpan[]): string {
   if (spans.length === 0) return 'Text corpus: (not captured)';
+
+  const mobileByText = new Map<string, TextSpan>();
+  for (const span of mobileSpans ?? []) {
+    if (!mobileByText.has(span.text)) mobileByText.set(span.text, span);
+  }
 
   const ranked = spans
     .map((span, index) => ({ span, index }))
@@ -189,19 +236,44 @@ export function formatTextSpansForPrompt(spans: TextSpan[]): string {
     })
     .slice(0, MAX_PROMPT_TEXT_SPANS);
 
+  let anyMetrics = false;
   const lines = ranked.map(({ span }) => {
     const tag = span.parentTag !== span.tag ? `${span.parentTag}>${span.tag}` : span.tag;
     const gradient = span.gradient !== undefined ? ` [gradient: ${span.gradient}]` : '';
-    return `  [${tag}] ${span.text}${gradient}`;
+    const measured = formatMeasuredMetrics(span);
+    const mobile = mobileByText.get(span.text);
+    const mobileMeasured =
+      mobile !== undefined && mobile !== span ? formatMeasuredMetrics(mobile) : '';
+    const primaryLabel = mobileMeasured.length > 0 ? 'desktop' : 'measured';
+    const metrics =
+      measured.length > 0 ? ` [${primaryLabel}: ${measured}]` : '';
+    const mobileMetrics =
+      mobileMeasured.length > 0 && mobileMeasured !== measured
+        ? ` [mobile: ${mobileMeasured}]`
+        : '';
+    if (metrics.length > 0 || mobileMetrics.length > 0) anyMetrics = true;
+    return `  [${tag}] ${span.text}${gradient}${metrics}${mobileMetrics}`;
   });
 
   const truncated =
     ranked.length < spans.length ? `\n  ... (${spans.length - ranked.length} more spans omitted)` : '';
 
+  const measuredNote = anyMetrics
+    ? [
+        'Bracketed metrics are MEASURED computed values captured from the live',
+        'site (not estimates): fs = font-size, fw = font-weight, lh = line-height,',
+        'ls = letter-spacing, box WxH @x,y = element box (CSS px, left,top).',
+        'Reproduce the measured type sizes, weights, wrapping widths, and',
+        'vertical positions exactly (arbitrary Tailwind values such as',
+        'text-[30px] font-[900] leading-[36px] w-[314px] are expected).',
+      ]
+    : [];
+
   return [
     'Text corpus (visible DOM text ordered top-to-bottom). Use this text to',
     'populate headings and copy accurately matching each section\'s visual hierarchy.',
     'Gradient headline spans MUST keep their exact gradient definition:',
+    ...measuredNote,
     ...lines,
     truncated,
   ]
@@ -251,6 +323,45 @@ export function screenshotsDirOf(evidenceDir: string): string {
  * a targeted correction of the failing component — not a re-synthesis.
  * Pure and exported for testing.
  */
+/**
+ * Reduces a component path to its schema-safe project-relative form for the
+ * repair prompt and file matching. Callers may pass an absolute path (the
+ * visual repair loop resolves components on disk first), but the structured
+ * file contract only accepts safe relative paths — an absolute path echoed
+ * back by the model would fail schema validation and silently abort the
+ * repair turn. `src/…` paths are kept as-is; absolute paths are reduced to
+ * their project-relative tail.
+ */
+export function toPromptComponentPath(componentPath: string): string {
+  const normalized = componentPath.replaceAll('\\', '/').trim();
+  const absoluteLike = normalized.startsWith('/') || /^[A-Za-z]:\//.test(normalized);
+  const schemaSafe =
+    normalized.length > 0 && !absoluteLike && !/(?:^|\/)\.\.(?:\/|$)/.test(normalized);
+  if (schemaSafe) return normalized;
+  const srcIndex = normalized.lastIndexOf('/src/');
+  if (srcIndex !== -1) return normalized.slice(srcIndex + 1);
+  const segments = normalized.split('/').filter((part) => part.length > 0 && part !== '..');
+  return segments.slice(-2).join('/');
+}
+
+/**
+ * Selects the repaired file from a model response: exact project-relative
+ * path first, then the caller's original path, then a normalized match, then
+ * the first emitted file.
+ */
+export function selectRepairedFile<T extends { path: string; content: string }>(
+  files: T[],
+  componentPath: string,
+  promptPath: string,
+): T | undefined {
+  return (
+    files.find((file) => file.path === promptPath) ??
+    files.find((file) => file.path === componentPath) ??
+    files.find((file) => toPromptComponentPath(file.path) === promptPath) ??
+    files[0]
+  );
+}
+
 export function buildVisualRepairPrompt(
   componentPath: string,
   mismatchPercent: number,
@@ -265,9 +376,16 @@ export function buildVisualRepairPrompt(
     '',
     'Repair ONLY the localized styling discrepancies visible in the diff',
     'overlay: spacing, padding, margins, colors, gradients, font sizes and',
-    'weights, container alignment, and visibility. Do NOT rewrite unrelated',
+    'weights, text casing (text-transform), line wrapping, container',
+    'alignment, responsive stacking and breakpoint',
+    'behavior, and visibility. Do NOT rewrite unrelated',
     'code, do NOT restructure the component, do NOT change imports, props,',
     'state logic, or event handlers, and do NOT truncate the file.',
+    '',
+    'The diff overlay highlights every region that differs. A candidate that',
+    'leaves the rendering unchanged cannot pass verification: make substantive',
+    'corrections in the highlighted regions (casing, type scale, wrapping,',
+    'spacing, and element sizing all count), not cosmetic one-line tweaks.',
     '',
     `Emit exactly one file — ${componentPath} — with the complete,`,
     'compile-ready corrected content.',
@@ -297,10 +415,13 @@ export async function repairComponentWithVisualDiff(
   diffImageDataUrl: string,
   mismatchPercent: number,
 ): Promise<string> {
-  const { text, systemPrompt } = buildVisualRepairPrompt(componentPath, mismatchPercent);
+  // Prompt and match against the schema-safe project-relative form so the
+  // model can echo a path the structured file contract accepts.
+  const promptPath = toPromptComponentPath(componentPath);
+  const { text, systemPrompt } = buildVisualRepairPrompt(promptPath, mismatchPercent);
 
   const parts: PromptPart[] = buildPromptParts(
-    `${text}\n\nCurrent content of ${componentPath}:\n${currentCode}`,
+    `${text}\n\nCurrent content of ${promptPath}:\n${currentCode}`,
     [
       { dataUrl: originalScreenshotDataUrl },
       { dataUrl: diffImageDataUrl },
@@ -308,9 +429,9 @@ export async function repairComponentWithVisualDiff(
   );
 
   const files = await generateStructuredFilesFromParts(parts, systemPrompt);
-  const repaired = files.find((file) => file.path === componentPath) ?? files[0];
+  const repaired = selectRepairedFile(files, componentPath, promptPath);
   if (repaired === undefined || repaired.content.trim().length === 0) {
-    throw new Error(`Visual repair for ${componentPath} returned no file content.`);
+    throw new Error(`Visual repair for ${promptPath} returned no file content.`);
   }
   return repaired.content;
 }

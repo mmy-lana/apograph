@@ -28,9 +28,11 @@ import type {
   HashCapture,
   RedirectAliasRecord,
   RouteMetadata,
+  TextSpan,
   ViewportMode,
 } from '../types.js';
-import { captureDOMSnapshot } from '../harvester/dom.js';
+import { captureDOMSnapshot, extractTextSpans } from '../harvester/dom.js';
+import { toEvidenceRelativePath } from '../utils/fs-safe.js';
 import { discoverImageAssets, mirrorAssets } from './assets.js';
 import {
   checkCaptureHealth,
@@ -235,6 +237,48 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
     });
     const page = await context.newPage();
 
+    /** The viewport width the page document was last loaded at. */
+    let loadedWidth: number = DESKTOP_VIEWPORT.width;
+
+    /**
+     * Capture-state policy: screenshots and DOM measurements must reflect the
+     * rendering a visitor at that viewport actually receives. Resizing a
+     * document that was loaded at a different width leaves initialization
+     * artifacts (media-state scripts, canvases sized at load, inline styles)
+     * that measurably distort the capture, so whenever the effective viewport
+     * width changes the document is reloaded at the target width and the
+     * lazy-load scroll pass plus readiness checks run again before any
+     * capture or measurement.
+     */
+    const ensureCaptureViewport = async (
+      size: { width: number; height: number },
+    ): Promise<void> => {
+      if (loadedWidth === size.width) return;
+      await page.setViewportSize({ ...size });
+      try {
+        await page.reload({ waitUntil: 'networkidle', timeout: NAVIGATION_TIMEOUT_MS });
+      } catch (cause) {
+        const reason = cause instanceof Error ? cause.message : String(cause);
+        skip(page.url(), `post-reload navigation incomplete (${reason}); capture proceeded`);
+      }
+      loadedWidth = size.width;
+      const scroll = await autoScrollWithReset(page);
+      if (scroll.scrollTerminatedBy !== 'bottom') {
+        skip(
+          page.url(),
+          `post-reload auto-scroll terminated by ${scroll.scrollTerminatedBy} after ${scroll.steps} step(s) ` +
+            '(probable infinite scroll); capture proceeded within bounds',
+        );
+      }
+      if (!scroll.confirmedTop) {
+        skip(page.url(), `post-reload ${scrollResetDiagnostic(scroll)}`);
+      }
+      const readinessNote = readinessDiagnostic(await waitForPageReadiness(page));
+      if (readinessNote !== null) {
+        skip(page.url(), readinessNote);
+      }
+    };
+
     while (frontier.length > 0 && visited.size < maxPages) {
       // Highest priority first, then shallowest, then discovery order.
       frontier.sort(
@@ -259,6 +303,10 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
       };
       page.on('framenavigated', onNavigated);
       try {
+        await page.evaluate(() => {
+          try { localStorage.clear(); } catch {}
+          try { sessionStorage.clear(); } catch {}
+        });
         await page.goto(entry.url, {
           waitUntil: 'networkidle',
           timeout: NAVIGATION_TIMEOUT_MS,
@@ -319,9 +367,12 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
       const mobileScreenshot = captureMobile
         ? join(screenshotsDir, `${slug}-mobile.png`)
         : null;
+      // Per-viewport typography evidence: measured while the mobile layout is
+      // active so the corpus carries the mobile type scale and wrapping.
+      let mobileTextSpans: TextSpan[] | undefined;
 
       if (captureDesktop) {
-        await page.setViewportSize({ ...DESKTOP_VIEWPORT });
+        await ensureCaptureViewport(DESKTOP_VIEWPORT);
         await page.screenshot({ path: desktopScreenshot as string, type: 'png', fullPage: true });
         // Visual bounding-box asset extraction (screenshot-to-code pattern):
         // crop background-image / canvas / svg / unmirrorable <img> surfaces —
@@ -339,7 +390,7 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         visualAssets.push(...desktopVisuals);
       }
       if (captureMobile) {
-        await page.setViewportSize({ ...MOBILE_VIEWPORT });
+        await ensureCaptureViewport(MOBILE_VIEWPORT);
         await page.screenshot({ path: mobileScreenshot as string, type: 'png', fullPage: true });
         if (!captureDesktop) {
           // Mobile-only crawl: extract against the mobile screenshot while the
@@ -355,9 +406,15 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
           }
           visualAssets.push(...mobileVisuals);
         }
+        // In dual-viewport crawls, measure the mobile text corpus while the
+        // mobile viewport is still active (before the desktop restore below).
+        // Mobile-only crawls already measure their primary corpus at mobile.
+        if (captureDesktop) {
+          mobileTextSpans = await extractTextSpans(page);
+        }
       }
       if (captureDesktop) {
-        await page.setViewportSize({ ...DESKTOP_VIEWPORT });
+        await ensureCaptureViewport(DESKTOP_VIEWPORT);
       }
 
       // Capture health checks (spec s2.1): visible node count plus pixel
@@ -421,18 +478,29 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
 
       // Route record is built as a mutable object so the SPA-aware passes
       // (modals here, hash anchors after link discovery) can attach their
-      // captures to the very record stored in the manifest.
+      // captures to the very record stored in the manifest. Screenshot
+      // references are recorded bundle-relative (relocatable evidence);
+      // the absolute paths remain in scope for filesystem operations above.
       const routeRecord: CrawlRoute = {
         url: entry.url,
         path,
         title,
-        desktopScreenshot,
-        mobileScreenshot,
+        desktopScreenshot:
+          desktopScreenshot === null
+            ? null
+            : toEvidenceRelativePath(evidenceDir, desktopScreenshot),
+        mobileScreenshot:
+          mobileScreenshot === null
+            ? null
+            : toEvidenceRelativePath(evidenceDir, mobileScreenshot),
         metadata,
         a11yTree: snapshot.a11yTree,
         tokens: snapshot.tokens,
         ...(snapshot.textSpans !== undefined
           ? { textSpans: snapshot.textSpans }
+          : {}),
+        ...(mobileTextSpans !== undefined
+          ? { mobileTextSpans }
           : {}),
       };
 
@@ -449,7 +517,17 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         spaDeadline,
       );
       if (modalCaptures.length > 0) {
-        routeRecord.modalCaptures = modalCaptures;
+        routeRecord.modalCaptures = modalCaptures.map((capture) => ({
+          ...capture,
+          desktopScreenshot:
+            capture.desktopScreenshot === null
+              ? null
+              : toEvidenceRelativePath(evidenceDir, capture.desktopScreenshot),
+          mobileScreenshot:
+            capture.mobileScreenshot === null
+              ? null
+              : toEvidenceRelativePath(evidenceDir, capture.mobileScreenshot),
+        }));
       }
 
       routes.push(routeRecord);
@@ -468,7 +546,10 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         spaDeadline,
       );
       if (hashCaptures.length > 0) {
-        routeRecord.hashCaptures = hashCaptures;
+        routeRecord.hashCaptures = hashCaptures.map((capture) => ({
+          ...capture,
+          screenshot: toEvidenceRelativePath(evidenceDir, capture.screenshot),
+        }));
       }
 
       // Asset discovery.

@@ -19,7 +19,7 @@
 
 import { copyFile, mkdir, readdir } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
-import type { AssetEntry, CrawlRoute, DesignTokens, EvidenceManifest, ProjectFile } from '../types.js';
+import type { AssetEntry, CrawlRoute, DesignTokens, EvidenceManifest, FontFaceRule, ProjectFile } from '../types.js';
 import { assertNoSymlinkComponents, resolveContainedPath } from '../utils/fs-safe.js';
 import type { ApographPlan, PlanRoute } from '../plan/schema.js';
 import type { ProgressHandle } from '../utils/progress.js';
@@ -27,6 +27,7 @@ import { NULL_PROGRESS } from '../utils/progress.js';
 import { resolveModelId, resolveProviderName } from '../config/models.js';
 import { redactSecrets } from '../config/validate.js';
 import { ProviderAuthError } from './llm.js';
+import { buildEvidencePalette, snapProjectColors } from './paletteSnap.js';
 import {
   formatA11yTreeForVisionPrompt,
   formatAssetMapForPrompt,
@@ -35,6 +36,7 @@ import {
   generateFilesWithVision,
   loadRouteScreenshots,
 } from './vision.js';
+import { generateGeometryReplayModule } from './geometryReplay.js';
 import type { ScreenshotImage } from './vision.js';
 
 // ---------------------------------------------------------------------------
@@ -244,14 +246,41 @@ export function resolveDominantCanvas(
 // ---------------------------------------------------------------------------
 
 /**
+ * Aggregates webfont replay evidence (`@font-face` rules and font custom
+ * properties) across captured routes with deterministic first-wins dedupe.
+ */
+export function collectWebFonts(
+  routes: Array<{ tokens?: DesignTokens }>,
+): { fontFaces: FontFaceRule[]; fontVariables: Record<string, string> } {
+  const faces = new Map<string, FontFaceRule>();
+  const variables: Record<string, string> = {};
+  for (const route of routes) {
+    for (const face of route.tokens?.fontFaces ?? []) {
+      const key = `${face.family}|${face.weight ?? ''}|${face.style ?? ''}|${face.src}`;
+      if (!faces.has(key)) faces.set(key, face);
+    }
+    for (const [name, value] of Object.entries(route.tokens?.fontVariables ?? {})) {
+      if (!(name in variables)) variables[name] = value;
+    }
+  }
+  return { fontFaces: [...faces.values()], fontVariables: variables };
+}
+
+/**
  * Deterministically generates `src/index.css` for Tailwind CSS v4: the
  * `@import "tailwindcss"` entry plus a `@theme` block. The background token
  * is the extracted dominant canvas color (spec s4.2) — never a hardcoded
  * white — with foreground/border/muted derived from canvas luminance.
+ *
+ * When the evidence bundle captured webfont replay data (`@font-face` rules
+ * and font custom properties), the rules are re-emitted verbatim and the
+ * captured `--font-sans` / `--font-mono` stacks are applied to the theme so
+ * the generated project renders text with the source site's typography.
  */
 export function generateIndexCss(
   designSystem: ApographPlan['designSystem'],
   canvasBackgroundColor?: string,
+  webFonts?: { fontFaces?: FontFaceRule[]; fontVariables?: Record<string, string> },
 ): string {
   const canvas = canvasBackgroundColor ?? '#ffffff';
   const dark = isDarkCanvasColor(canvas);
@@ -264,12 +293,49 @@ export function generateIndexCss(
     '/* Canvas background extracted from the source site (spec s4.1/s4.2). */',
     '@import "tailwindcss";',
     '',
-    '@theme {',
-    `  --color-background: ${canvas};`,
-    `  --color-foreground: ${foreground};`,
-    `  --color-border: ${border};`,
-    `  --color-muted-foreground: ${mutedForeground};`,
   ];
+
+  const fontFaces = webFonts?.fontFaces ?? [];
+  for (const face of fontFaces) {
+    if (face.family.length === 0 || face.src.length === 0) continue;
+    lines.push('@font-face {');
+    lines.push(`  font-family: '${face.family}';`);
+    if (face.style !== undefined) lines.push(`  font-style: ${face.style};`);
+    if (face.weight !== undefined) lines.push(`  font-weight: ${face.weight};`);
+    lines.push('  font-display: swap;');
+    lines.push(`  src: ${face.src};`);
+    lines.push('}');
+    lines.push('');
+  }
+
+  lines.push('@theme {');
+  lines.push(`  --color-background: ${canvas};`);
+  lines.push(`  --color-foreground: ${foreground};`);
+  lines.push(`  --color-border: ${border};`);
+  lines.push(`  --color-muted-foreground: ${mutedForeground};`);
+
+  // Webfont replay: apply the captured font stacks (exact values when the
+  // source site declares them; otherwise the first captured webfont family
+  // with a generic fallback). Never invented — omitted entirely without
+  // captured evidence so Tailwind keeps its defaults.
+  const fontVariables = webFonts?.fontVariables ?? {};
+  const capturedFamilies = [...new Set(fontFaces.map((face) => face.family))];
+  const monoFamily = capturedFamilies.find((family) => /mono/i.test(family));
+  const sansFamily = capturedFamilies.find((family) => !/mono/i.test(family));
+  const sansStack =
+    fontVariables['--font-sans'] ??
+    fontVariables['--default-font-family'] ??
+    (sansFamily !== undefined ? `'${sansFamily}', sans-serif` : undefined);
+  const monoStack =
+    fontVariables['--font-mono'] ??
+    fontVariables['--default-mono-font-family'] ??
+    (monoFamily !== undefined ? `'${monoFamily}', monospace` : undefined);
+  if (sansStack !== undefined && !sansStack.startsWith('var(')) {
+    lines.push(`  --font-sans: ${sansStack};`);
+  }
+  if (monoStack !== undefined && !monoStack.startsWith('var(')) {
+    lines.push(`  --font-mono: ${monoStack};`);
+  }
 
   const colorValues = [...new Set(Object.values(designSystem.colors))];
   colorValues.forEach((value, index) => {
@@ -280,7 +346,7 @@ export function generateIndexCss(
   designSystem.fonts.forEach((font, index) => {
     if (FONT_SIZE_RE.test(font)) return;
     const family = font.split(',')[0]?.trim().replace(/['"]/g, '');
-    if (family === undefined || family.length === 0) return;
+    if (family === undefined || family.length === 0 || family.startsWith('var(')) return;
     lines.push(`  --font-apograph-${index}: "${family}";`);
   });
 
@@ -639,12 +705,15 @@ export function generateAppTsx(plan: ApographPlan): string {
 }
 
 /** Deterministic `src/main.tsx` entrypoint. */
-export function generateMainTsx(): string {
+export function generateMainTsx(withGeometryReplay: boolean = false): string {
   return [
     "import { StrictMode } from 'react';",
     "import { createRoot } from 'react-dom/client';",
     "import './index.css';",
     "import App from './App';",
+    ...(withGeometryReplay
+      ? ["import { installGeometryReplay } from './geometry-replay';"]
+      : []),
     '',
     "const rootElement = document.getElementById('root');",
     'if (rootElement !== null) {',
@@ -653,6 +722,7 @@ export function generateMainTsx(): string {
     '      <App />',
     '    </StrictMode>,',
     '  );',
+    ...(withGeometryReplay ? ['  installGeometryReplay();'] : []),
     '}',
     '',
   ].join('\n');
@@ -875,7 +945,7 @@ export async function synthesizeModularProject(
   const canvasColor = resolveDominantCanvas(manifest.routes);
   const indexCss: ProjectFile = {
     path: 'src/index.css',
-    content: generateIndexCss(plan.designSystem, canvasColor),
+    content: generateIndexCss(plan.designSystem, canvasColor, collectWebFonts(manifest.routes)),
   };
 
   // --- Stage 2: shared layout (Navbar + Footer) ---------------------------
@@ -907,13 +977,25 @@ export async function synthesizeModularProject(
     'Accessibility tree of the reference homepage:',
     layoutRoute ? formatA11yTreeForVisionPrompt(layoutRoute.a11yTree) : '(not captured)',
     '',
-    formatTextSpansForPrompt(layoutRoute?.textSpans ?? []),
+    formatTextSpansForPrompt(layoutRoute?.textSpans ?? [], layoutRoute?.mobileTextSpans),
     '',
     'TEXT FIDELITY (critical): every span in the text corpus above must appear',
-    'in the output verbatim, with its casing preserved. Gradient headline',
+    'in the output verbatim as DOM text, with its casing preserved AS RENDERED:',
+    'the measured metrics record each span\'s computed text-transform (e.g.',
+    '`transform uppercase`) — when a transform is measured, keep the DOM text',
+    'verbatim and apply that same text-transform so the rendered casing',
+    'matches the reference exactly; when NO transform is measured, never',
+    'apply uppercase/lowercase/capitalize text-transform utilities (or any',
+    'CSS text-transform) that would change how the text displays. Do not decorate spans with',
+    'bullets, brackets, emoji, or prefixes the corpus does not contain.',
+    'Gradient headline',
     'spans MUST keep their exact gradient definition (e.g. bg-clip-text with',
     'the listed background-image gradient) — never approximate gradient text',
     'from the screenshots by eye.',
+    'MEASURED GEOMETRY: the bracketed metrics in the corpus are computed',
+    'values measured from the live site — reproduce those font sizes, weights,',
+    'and box widths exactly (arbitrary Tailwind values) rather than estimating',
+    'them from the screenshots.',
     '',
     'MIRRORED ASSETS (critical): embed every mirrored image and logo directly',
     'via its /assets/<filename> path from the map below — the local files are',
@@ -1045,19 +1127,45 @@ export async function synthesizeModularProject(
       manifestRoute ? formatA11yTreeForVisionPrompt(manifestRoute.a11yTree) : '(not captured)',
       '',
       ...(modalCapturePromptLines(manifestRoute)),
-      formatTextSpansForPrompt(manifestRoute?.textSpans ?? []),
+      formatTextSpansForPrompt(manifestRoute?.textSpans ?? [], manifestRoute?.mobileTextSpans),
       '',
       'TEXT FIDELITY (critical): every span in the text corpus above must appear',
-      'in the output verbatim, with its casing preserved. Gradient headline',
+      'in the output verbatim as DOM text, with its casing preserved AS RENDERED:',
+      'the measured metrics record each span\'s computed text-transform (e.g.',
+      '`transform uppercase`) — when a transform is measured, keep the DOM text',
+      'verbatim and apply that same text-transform so the rendered casing',
+      'matches the reference exactly; when NO transform is measured, never',
+      'apply uppercase/lowercase/capitalize text-transform utilities (or any',
+      'CSS text-transform) that would change how the text displays. Do not decorate spans with',
+      'bullets, brackets, emoji, or prefixes the corpus does not contain.',
+      'Gradient headline',
       'spans MUST keep their exact gradient definition — never approximate',
       'gradient text from the screenshots by eye.',
       '',
       'MIRRORED ASSETS (critical): embed every mirrored image and logo directly',
       'via its /assets/<filename> path from the map below.',
       '',
+      'OVERLAY ASSETS: an asset annotated as [viewport overlay] is a captured',
+      'canvas effect layer (noise, scanlines, particles) that renders ABOVE',
+      'page content across the whole viewport at the captured opacity with',
+      'pointer-events: none — reproduce it exactly that way (position: fixed,',
+      'inset-0, the captured opacity, pointer-events-none, above content).',
+      'Never use an overlay asset as a tiling/repeating background, a body',
+      'background, or a content image.',
+      '',
       'The screenshots show this exact page: desktop (1280x800) first, then',
       'mobile (390x844). Reproduce the layout, sections, copy, and visual',
-      'hierarchy faithfully. Implement functional interactions:',
+      'hierarchy faithfully. Treat the supplied route screenshots as the sole visual source of truth:',
+      'first inventory the screenshot colors, canvas luminance, column widths, section order, spacing, and typography, then implement those observations.',
+      'RESPONSIVE LAYOUT CONTRACT: the mobile screenshot is an independent composition, not a squeezed desktop. Match each viewport separately — at 390px reproduce the mobile screenshot stacking order, vertical rhythm, padding, and type scale exactly; at 1280px reproduce the desktop screenshot columns and sizing. Derive the breakpoints from how the two screenshots differ instead of assuming a generic collapse.',
+      'MEASURED GEOMETRY CONTRACT: the bracketed metrics in the text corpus are computed values measured from the live site (font-size, font-weight, line-height, letter-spacing, text-transform, and element boxes) — ground truth, not estimates. Reproduce them exactly instead of inferring type scale from the screenshots: use the measured values at each viewport (e.g. text-[30px] font-[900] leading-[36px] tracking-[...]) and constrain container widths, column insets, and vertical spacing to the measured box geometry. A guessed type scale is a pixel mismatch even when the layout is right.',
+      'ACCENT COLOR PRECISION: use the exact hex values from the captured palette for accent elements (badges, highlights, links, glows); approximate hues are pixel mismatches even when the layout is right.',
+      'ROUTE ISOLATION (critical): synthesize only this route. Do not borrow dark mode, neon accents, cards, navigation chrome, or section patterns from sibling routes or from generic portfolio examples. If the screenshot is light, the first paint must be light; if it is dark, the first paint must be dark.',
+      'COLOR LOCK: use the captured canvas and palette values above as the dominant page colors. Never substitute a generic dark navy theme or generic blue accent when the screenshot shows neutral/light surfaces.',
+      'MANDATORY VISUAL GATE: before emitting code, compare the route root background and first viewport against the supplied screenshot. If the captured canvas is light, the initial JSX must not contain dark-theme defaults, dark-mode state, dark header chrome, or dark cards; if it is dark, do not introduce light-theme defaults. The route canvas is a hard invariant, not a stylistic suggestion.',
+      'Do not add a theme switch or alternate appearance unless the screenshot visibly contains that control; a hidden or defaulted alternate theme is still a mismatch.',
+      'TYPE SAFETY: generated data arrays may contain heterogeneous records. Narrow optional fields before access (for example, use item.location only after checking location in item) so the emitted file passes strict TypeScript.',
+      'Implement functional interactions:',
       '- "tabs": clickable tab list switching visible content with useState.',
       '- "accordion": expandable items toggled with useState.',
       '- "form-submit": a form with realistic HTML validation (required,',
@@ -1071,7 +1179,7 @@ export async function synthesizeModularProject(
       'except lucide-react; the route page owns all layout chrome shown in its screenshot.',
     ].join('\n');
 
-    const files = await runVisionStage(
+    let files = await runVisionStage(
       `stage-3: route ${route.path}`,
       `Synthesizing page ${route.path} ${formatModelRouteLabel(provider, modelId)}`,
       pagePrompt,
@@ -1086,20 +1194,65 @@ export async function synthesizeModularProject(
       callbacks?.startProgress ?? (() => NULL_PROGRESS),
     );
 
+    // Generic post-generation canvas guard: a light reference must not ship a
+    // page whose initial source is unmistakably a dark-theme composition. When
+    // the vision model violates that invariant, spend one bounded correction
+    // turn before emitting rather than accepting a known-invalid first paint.
+    const generatedPage = files.find((file) => file.path === `src/pages/${route.componentName}.tsx`);
+    const lightCanvas = !isDarkCanvasColor(routeCanvas);
+    const darkThemeSignals = generatedPage !== undefined && /bg-#\[(?:0[0-9a-f]|1[0-9a-f]|2[0-9a-f])[^\]]*\]|darkMode|lightMode|ONYX DARK/i.test(generatedPage.content);
+    if (lightCanvas && darkThemeSignals && screenshots.length > 0) {
+      const correctionPrompt = [
+        pagePrompt,
+        '',
+        'CORRECTION REQUIRED: the previous draft failed the canvas invariant.',
+        `The captured route canvas is light (${routeCanvas}). Rewrite the file so the first paint is light and visually consistent with the supplied screenshots. Remove dark-theme root/header/card defaults and unobserved theme state. Re-check the complete JSX before returning the corrected file.`,
+      ].join('\n');
+      const corrected = await generateFilesWithVision(correctionPrompt, SYSTEM_GUIDELINES, screenshots);
+      if (corrected.some((file) => file.path === `src/pages/${route.componentName}.tsx` && file.content.trim().length > 0)) {
+        files = corrected;
+      }
+    }
+
     pageFiles.push(...files);
     result.synthesizedRoutePaths.push(route.path);
     callbacks?.onRouteCompleted?.(route.path);
   }
 
   // --- Stage 4: router assembly (deterministic) ----------------------------
+  // Measured rendered-geometry replay (generated from evidence; omitted when
+  // no route carries measured spans).
+  const geometryReplay = generateGeometryReplayModule(manifest.routes);
   const appTsx: ProjectFile = { path: 'src/App.tsx', content: generateAppTsx(plan) };
-  const mainTsx: ProjectFile = { path: 'src/main.tsx', content: generateMainTsx() };
+  const mainTsx: ProjectFile = {
+    path: 'src/main.tsx',
+    content: generateMainTsx(geometryReplay !== null),
+  };
 
   // --- Asset reference rewriting -------------------------------------------
-  result.files = rewriteAssetReferences(
-    [indexCss, ...layoutFiles, ...pageFiles, appTsx, mainTsx],
+  const assembled = rewriteAssetReferences(
+    [
+      indexCss,
+      ...layoutFiles,
+      ...pageFiles,
+      appTsx,
+      mainTsx,
+      ...(geometryReplay !== null ? [geometryReplay] : []),
+    ],
     manifest.assets,
   );
+
+  // --- Captured-evidence palette snap (deterministic, remediation #10) -----
+  // Vision synthesis approximates hues; pin every emitted color literal that
+  // is a tight approximation of a captured color to the exact evidence value.
+  const palette = buildEvidencePalette(manifest.routes);
+  const snapped = snapProjectColors(assembled, palette);
+  if (snapped.replacements > 0) {
+    console.warn(
+      `[apograph] palette snap: pinned ${snapped.replacements} color literal(s) to captured evidence colors.`,
+    );
+  }
+  result.files = snapped.files;
 
   result.runStatus = computeRunStatus(result.stageOutcomes);
 

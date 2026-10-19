@@ -23,6 +23,7 @@ import * as p from '@clack/prompts';
 import type { A11yNode, CrawlRoute, EvidenceManifest } from '../types.js';
 import { checkCaptureHealth } from '../crawler/health.js';
 import type { CaptureHealth } from '../crawler/health.js';
+import { resolveEvidenceReference, toEvidenceRelativePath } from '../utils/fs-safe.js';
 import {
   autoScrollWithReset,
   readinessDiagnostic,
@@ -149,15 +150,33 @@ function countA11yNodes(node: A11yNode): number {
   return count;
 }
 
-/** Re-evaluates capture health for a route from its persisted screenshot. */
-async function routeHealth(route: CrawlRoute): Promise<CaptureHealth | null> {
-  const screenshot = route.desktopScreenshot;
-  if (screenshot === null || !existsSync(screenshot)) return null;
+/**
+ * Re-evaluates capture health for a route from its persisted screenshot.
+ * Manifest screenshot references may be bundle-relative (preferred) or
+ * absolute (older bundles); both resolve to the same evidence file.
+ */
+async function routeHealth(route: CrawlRoute, evidenceDir: string): Promise<CaptureHealth | null> {
+  const reference = route.desktopScreenshot;
+  if (reference === null) return null;
+  const screenshot = resolveEvidenceReference(evidenceDir, reference);
+  if (!existsSync(screenshot)) return null;
   try {
     const png = await readFile(screenshot);
     return checkCaptureHealth(png, countA11yNodes(route.a11yTree));
   } catch {
     return null;
+  }
+}
+
+/**
+ * Records a capture path into the manifest in the bundle-relative form when
+ * possible, keeping the absolute form only for legacy out-of-bundle paths.
+ */
+function captureReference(evidenceDir: string, absolutePath: string): string {
+  try {
+    return toEvidenceRelativePath(evidenceDir, absolutePath);
+  } catch {
+    return absolutePath;
   }
 }
 
@@ -183,7 +202,7 @@ export async function filterEvidenceNonInteractive(
 
   for (const [arrayIndex, route] of manifest.routes.entries()) {
     const index = arrayIndex + 1;
-    const health = await routeHealth(route);
+    const health = await routeHealth(route, evidenceDir);
 
     const crawlAlias = crawlAliases.find((alias) => alias.from === route.url);
     if (crawlAlias !== undefined) {
@@ -327,7 +346,7 @@ export async function runEvidenceReviewGate(
       url: route.url,
       path: route.path,
       status: 'ok',
-      health: await routeHealth(route),
+      health: await routeHealth(route, evidenceDir),
       screenshot: route.desktopScreenshot,
     });
   }
@@ -382,7 +401,7 @@ export async function runEvidenceReviewGate(
         const route = await options.reCrawlRoute(index);
         activeRoutes.set(index, route);
         reCrawled.push(route.path);
-        refreshVerdict(verdicts, index, route, await routeHealth(route));
+        refreshVerdict(verdicts, index, route, await routeHealth(route, evidenceDir));
       }
       renderSummaryTable(verdicts);
       continue;
@@ -492,8 +511,15 @@ export async function recrawlRoute(
     );
   }
   const route = manifest.routes[routeIndex - 1] as CrawlRoute;
-  const desktopPath = route.desktopScreenshot ?? join(evidenceDir, 'screenshots', 'recrawl-desktop.png');
-  const mobilePath = route.mobileScreenshot ?? join(evidenceDir, 'screenshots', 'recrawl-mobile.png');
+  // Stored references may be bundle-relative (preferred) or absolute (older
+  // bundles); resolve to concrete capture targets, and record the result back
+  // in the bundle-relative form so the manifest stays relocatable.
+  const desktopPath = route.desktopScreenshot === null
+    ? join(evidenceDir, 'screenshots', 'recrawl-desktop.png')
+    : resolveEvidenceReference(evidenceDir, route.desktopScreenshot);
+  const mobilePath = route.mobileScreenshot === null
+    ? join(evidenceDir, 'screenshots', 'recrawl-mobile.png')
+    : resolveEvidenceReference(evidenceDir, route.mobileScreenshot);
 
   const browser = await launchHeadlessChromium();
   try {
@@ -547,8 +573,8 @@ export async function recrawlRoute(
     const updated: CrawlRoute = {
       ...route,
       title: title.length > 0 ? title : route.title,
-      desktopScreenshot: desktopPath,
-      mobileScreenshot: mobilePath,
+      desktopScreenshot: captureReference(evidenceDir, desktopPath),
+      mobileScreenshot: captureReference(evidenceDir, mobilePath),
       a11yTree: snapshot.a11yTree,
       tokens: snapshot.tokens,
       textSpans: snapshot.textSpans,

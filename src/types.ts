@@ -116,6 +116,12 @@ export interface CrawlRoute {
   /** Visible text corpus harvested in document order (spec s5.1). */
   textSpans?: TextSpan[];
   /**
+   * The same visible text corpus measured at the mobile capture viewport.
+   * Optional: older evidence bundles predate per-viewport measurement and
+   * single-viewport crawls capture one corpus only.
+   */
+  mobileTextSpans?: TextSpan[];
+  /**
    * Hash-anchor sub-captures (`#section` targets) recorded on this route
    * without creating new route entries. Optional: older evidence bundles
    * predate SPA-aware capture.
@@ -145,6 +151,25 @@ export interface AssetEntry {
   suggestedName?: string;
   /** Route paths where this asset was encountered. */
   routes?: string[];
+  /** Rendered overlay semantics of a captured <canvas> surface, when known. */
+  canvasOverlay?: CanvasOverlayMeta;
+}
+
+/**
+ * How a captured <canvas> surface renders in the source page (measured from
+ * computed styles at capture time): effects layers replay as fixed
+ * full-viewport overlays at the captured opacity, while content canvases
+ * (charts, maps) render inline in the layout.
+ */
+export interface CanvasOverlayMeta {
+  /** Computed `opacity` of the canvas element at capture time. */
+  opacity: number;
+  /** Computed `position` of the canvas element (e.g. `fixed`). */
+  position: string;
+  /** True when the canvas box covers >=90% of the viewport in both axes. */
+  coversViewport: boolean;
+  /** Whether the asset holds the canvas's own drawing or a screenshot crop. */
+  source: 'element-buffer' | 'screenshot-crop';
 }
 
 /** Why a visually distinct region was selected for extraction. */
@@ -176,6 +201,10 @@ export interface VisualAssetRegion {
   classTokens: string[];
   /** True when inside `#hero` or the top edge is within 600px of the page top. */
   inHero: boolean;
+  /** For canvas regions: the element's own drawing as a PNG data URL, when readable. */
+  canvasDataUrl?: string;
+  /** For canvas regions: measured overlay semantics (opacity/position/coverage). */
+  canvasOverlay?: CanvasOverlayMeta;
 }
 
 /** A URL the crawler chose not to visit, with the reason. */
@@ -280,6 +309,29 @@ export interface InferredSchema {
 // Layer 4 — UI & Design System
 // ---------------------------------------------------------------------------
 
+/**
+ * Measured computed typography of a text span at capture time (rendered
+ * ground truth for synthesis replay). Optional fields mirror the CSS
+ * computed-style properties that were resolvable; older evidence bundles
+ * predate typography capture.
+ */
+export interface TextStyle {
+  /** Computed `font-size` in CSS pixels (e.g. `30px`). */
+  fontSize?: string;
+  /** Computed `font-weight` (e.g. `900`). */
+  fontWeight?: string;
+  /** Computed `line-height` in CSS pixels when resolvable. */
+  lineHeight?: string;
+  /** Computed `letter-spacing` when not `normal`. */
+  letterSpacing?: string;
+  /** Computed `text-transform` when not `none`. */
+  textTransform?: string;
+  /** Computed `font-family` (first family in the stack). */
+  fontFamily?: string;
+  /** Computed `text-align`. */
+  textAlign?: string;
+}
+
 /** One visible text span harvested from the DOM (spec s5.1). */
 export interface TextSpan {
   /** Trimmed visible text content. */
@@ -294,6 +346,8 @@ export interface TextSpan {
   parentTag: string;
   /** Bounding box in CSS pixels at capture time. */
   boundingBox?: { top: number; left: number; width: number; height: number };
+  /** Measured computed typography at capture time (rendered ground truth). */
+  style?: TextStyle;
 }
 
 /** One node of the accessibility tree (mirrors Playwright's AxNode shape). */
@@ -313,6 +367,18 @@ export interface CanvasTheme {
   color?: string;
 }
 
+/** One captured `@font-face` rule (webfont replay evidence). */
+export interface FontFaceRule {
+  /** Font family name without quotes. */
+  family: string;
+  /** `src` descriptor value (contains the remote/local font source URLs). */
+  src: string;
+  /** `font-weight` descriptor value (e.g. `400`, `100 900`). */
+  weight?: string;
+  /** `font-style` descriptor value (e.g. `normal`). */
+  style?: string;
+}
+
 /** Design tokens extracted from stylesheets. */
 export interface DesignTokens {
   colors: Record<string, string>;
@@ -321,6 +387,10 @@ export interface DesignTokens {
   radii: string[];
   /** Computed `document.body` canvas colors (spec s4.1). */
   canvas?: CanvasTheme;
+  /** Captured `@font-face` rules (webfont replay evidence). */
+  fontFaces?: FontFaceRule[];
+  /** Captured font-related custom properties (e.g. `--font-sans`). */
+  fontVariables?: Record<string, string>;
 }
 
 /** A UI snapshot for one route: a11y tree plus extracted design tokens. */

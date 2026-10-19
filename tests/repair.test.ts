@@ -9,12 +9,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PNG } from 'pngjs';
 
 import { runVisualRepairPass } from '../dist/verifier/engine.js';
-import { buildVisualRepairPrompt } from '../dist/synthesizer/vision.js';
+import { buildVisualRepairPrompt, selectRepairedFile, toPromptComponentPath } from '../dist/synthesizer/vision.js';
 import type { VisualCheck } from '../dist/verifier/report.js';
+
+const SRC_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -280,4 +283,67 @@ test('repair > prompt names the component and stays localized', () => {
   assert.ok(text.includes('Do NOT rewrite unrelated'));
   assert.ok(text.includes('do NOT truncate the file'));
   assert.ok(systemPrompt.includes('minimum targeted styling corrections'));
+});
+
+// ---------------------------------------------------------------------------
+// Repair component-path contract (schema-safe prompting + lenient matching)
+// ---------------------------------------------------------------------------
+
+test('repair > component path normalization is schema-safe for every caller form', () => {
+  // Already project-relative: preserved verbatim.
+  assert.equal(toPromptComponentPath('src/pages/HomePage.tsx'), 'src/pages/HomePage.tsx');
+  // Absolute paths (as the visual repair loop passes them) reduce to the
+  // project-relative tail so the model can echo a schema-acceptable path.
+  assert.equal(
+    toPromptComponentPath('/tmp/run/output/app/src/pages/HomePage.tsx'),
+    'src/pages/HomePage.tsx',
+  );
+  assert.equal(
+    toPromptComponentPath('C:\\run\\output\\src\\pages\\HomePage.tsx'),
+    'src/pages/HomePage.tsx',
+  );
+  // Absolute paths without a src/ root reduce to their trailing segments.
+  assert.equal(toPromptComponentPath('/opt/app/pages/HomePage.tsx'), 'pages/HomePage.tsx');
+  // Never starts with a separator and never carries traversal segments.
+  assert.ok(!toPromptComponentPath('/x/../y.tsx').startsWith('/'));
+  assert.ok(!toPromptComponentPath('..\\x\\y.tsx').includes('..'));
+});
+
+test('repair > repaired file selection prefers the schema-safe path', () => {
+  const files = [
+    { path: 'src/pages/HomePage.tsx', content: 'preferred' },
+    { path: 'other.tsx', content: 'fallback' },
+  ];
+  assert.equal(
+    selectRepairedFile(files, '/abs/src/pages/HomePage.tsx', 'src/pages/HomePage.tsx')?.content,
+    'preferred',
+  );
+  // No path match at all: the single emitted file is still accepted.
+  assert.equal(
+    selectRepairedFile([{ path: 'other.tsx', content: 'fallback' }], '/abs/src/pages/HomePage.tsx', 'src/pages/HomePage.tsx')?.content,
+    'fallback',
+  );
+  assert.equal(selectRepairedFile([], '/abs/x.tsx', 'x.tsx'), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Rendered-text fidelity contract (casing / no-op repair rejection)
+// ---------------------------------------------------------------------------
+
+test('repair > prompt covers text casing and rejects no-op candidates', () => {
+  const { text } = buildVisualRepairPrompt('src/pages/HomePage.tsx', 20.2);
+  // text-transform casing is a correctable styling discrepancy.
+  assert.ok(text.includes('text-transform'));
+  // No-op candidates are explicitly called out (observed: mismatchAfter was
+  // exactly equal to mismatchBefore across repair turns).
+  assert.ok(text.includes('cannot pass verification'));
+});
+
+test('source > synthesis prompts enforce rendered text casing', async () => {
+  const modularText = await readFile(join(SRC_ROOT, 'src', 'synthesizer', 'modular.ts'), 'utf8');
+  const marker = 'casing preserved AS RENDERED';
+  const occurrences = modularText.split(marker).length - 1;
+  // Both synthesis stages (shared layout + per-route page) carry the rule.
+  assert.ok(occurrences >= 2, `expected rendered-casing rule in both stage prompts, found ${occurrences}`);
+  assert.ok(modularText.includes('Do not decorate spans with'));
 });

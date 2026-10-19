@@ -153,20 +153,46 @@ export function collectVisualAssetRegionsInPage(): VisualAssetRegion[] {
 
     candidates.push({
       rect,
-      region: {
-        kind,
-        x: rect.left + window.scrollX,
-        y: rect.top + window.scrollY,
-        width: rect.width,
-        height: rect.height,
-        tag,
-        id: el.getAttribute('id'),
-        ariaLabel: el.getAttribute('aria-label'),
-        alt: tag === 'img' ? el.getAttribute('alt') : null,
-        classTokens: classTokensOf(el),
-        inHero:
-          el.closest('#hero') !== null || rect.top + window.scrollY < HERO_TOP,
-      },
+      region: (() => {
+        const region: VisualAssetRegion = {
+          kind,
+          x: rect.left + window.scrollX,
+          y: rect.top + window.scrollY,
+          width: rect.width,
+          height: rect.height,
+          tag,
+          id: el.getAttribute('id'),
+          ariaLabel: el.getAttribute('aria-label'),
+          alt: tag === 'img' ? el.getAttribute('alt') : null,
+          classTokens: classTokensOf(el),
+          inHero:
+            el.closest('#hero') !== null || rect.top + window.scrollY < HERO_TOP,
+        };
+        if (kind === 'canvas') {
+          // Capture the canvas's own drawing (element buffer) plus measured
+          // overlay semantics: a screenshot crop of a fixed overlay canvas is
+          // the composited viewport (underlying UI included), not the effect.
+          let dataUrl: string | undefined;
+          try {
+            const canvas = el as HTMLCanvasElement;
+            if (typeof canvas.toDataURL === 'function') {
+              dataUrl = canvas.toDataURL('image/png');
+            }
+          } catch {
+            dataUrl = undefined;
+          }
+          region.canvasDataUrl = dataUrl;
+          region.canvasOverlay = {
+            opacity: Number.parseFloat(style.opacity || '1') || 1,
+            position: style.position,
+            coversViewport:
+              rect.width >= window.innerWidth * 0.9 &&
+              rect.height >= window.innerHeight * 0.9,
+            source: dataUrl !== undefined ? 'element-buffer' : 'screenshot-crop',
+          };
+        }
+        return region;
+      })(),
     });
   }
 
@@ -363,12 +389,36 @@ export interface ExtractVisualAssetsOptions {
 }
 
 /**
+ * Decodes a `data:image/png;base64,…` canvas export into a PNG buffer.
+ * Returns `null` for any non-PNG or malformed data URL (in-page `toDataURL`
+ * failures on tainted canvases arrive as `undefined` and never reach here).
+ */
+export function decodeCanvasDataUrl(dataUrl: string): Buffer | null {
+  const prefix = 'data:image/png;base64,';
+  if (!dataUrl.startsWith(prefix)) return null;
+  const base64 = dataUrl.slice(prefix.length);
+  if (base64.length === 0) return null;
+  const buffer = Buffer.from(base64, 'base64');
+  // PNG magic bytes — reject empty or garbage decodes.
+  if (buffer.length < 8) return null;
+  if (buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4e || buffer[3] !== 0x47) {
+    return null;
+  }
+  return buffer;
+}
+
+/**
  * Visual asset extraction pass: collects visual-surface bounding boxes from
  * the live page, crops them out of the given full-page screenshot, and writes
  * each crop into `assetsDir` under its suggested semantic name
  * (`hero-bg.png`, `map-canvas.png`, ...). Names are collision-safe across
  * routes via `usedNames`. Returns manifest-ready asset entries for the
  * evidence bundle.
+ *
+ * Canvas regions prefer the element's own drawing (its pixel buffer) over the
+ * screenshot crop: overlay canvases (noise, scanlines, particles) composite
+ * over the page in a screenshot, so a crop would carry the underlying UI.
+ * Measured overlay semantics ride along on the entry as `canvasOverlay`.
  */
 export async function extractVisualAssets(
   page: Page,
@@ -393,12 +443,18 @@ export async function extractVisualAssets(
 
   const entries: AssetEntry[] = [];
   for (const [position, region] of regions.slice(0, maxAssets).entries()) {
-    const cropped = cropPngToRegion(screenshot, region);
-    if (cropped === null) continue;
+    let bytes: Buffer | null = null;
+    if (region.canvasDataUrl !== undefined) {
+      bytes = decodeCanvasDataUrl(region.canvasDataUrl);
+    }
+    if (bytes === null) {
+      bytes = cropPngToRegion(screenshot, region);
+    }
+    if (bytes === null) continue;
 
     const name = uniqueAssetName(suggestRegionName(region, position + 1), claimed);
     const localPath = join(assetsDir, `${name}.png`);
-    await writeFile(localPath, cropped);
+    await writeFile(localPath, bytes);
 
     entries.push({
       originalUrl: `visual-extract:${name}`,
@@ -407,6 +463,7 @@ export async function extractVisualAssets(
       mimeType: 'image/png',
       kind: 'visual-extract',
       suggestedName: name,
+      ...(region.canvasOverlay !== undefined ? { canvasOverlay: region.canvasOverlay } : {}),
     });
   }
 
