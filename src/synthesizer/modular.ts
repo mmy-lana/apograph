@@ -36,7 +36,6 @@ import {
   generateFilesWithVision,
   loadRouteScreenshots,
 } from './vision.js';
-import { generateGeometryReplayModule } from './geometryReplay.js';
 import type { ScreenshotImage } from './vision.js';
 
 // ---------------------------------------------------------------------------
@@ -186,7 +185,7 @@ const SYSTEM_GUIDELINES = [
   '- Always use type-only imports for React types: `import type { FormEvent, ReactNode } from \'react\'`.',
   '- When rendering icons from lucide-react in maps, lists, or components, store the component reference and render as `<item.icon className="..." />`, or store JSX elements directly `icon: <Shield className="..." />`. Never assign string names and component references to the same property.',
   '- Check the asset descriptions before linking images. Only use assets named `hero-bg` or `*-bg` for section backgrounds. Use card/thumbnail assets for card items.',
-  '- Complete Page Architecture: Each route page component (e.g. HomePage.tsx, MinimalistPage.tsx) must be a complete, self-contained page matching its screenshot, including its own header/navigation, main sections, and footer if present in the screenshot.',
+  '- Complete Page Architecture: Each route page component (e.g. HomePage.tsx, AboutPage.tsx) must be a complete, self-contained page matching its screenshot, including its own header/navigation, main sections, and footer if present in the screenshot.',
   '',
   'CRITICAL LAYOUT ARCHITECTURE RULES (NON-NEGOTIABLE):',
   '- Layout Architecture: Page sections must stack vertically in normal document flow inside <main className="flex min-h-screen w-full flex-col bg-background text-foreground">. Never position whole sections with `absolute` or `fixed` over other sections.',
@@ -705,15 +704,12 @@ export function generateAppTsx(plan: ApographPlan): string {
 }
 
 /** Deterministic `src/main.tsx` entrypoint. */
-export function generateMainTsx(withGeometryReplay: boolean = false): string {
+export function generateMainTsx(): string {
   return [
     "import { StrictMode } from 'react';",
     "import { createRoot } from 'react-dom/client';",
     "import './index.css';",
     "import App from './App';",
-    ...(withGeometryReplay
-      ? ["import { installGeometryReplay } from './geometry-replay';"]
-      : []),
     '',
     "const rootElement = document.getElementById('root');",
     'if (rootElement !== null) {',
@@ -722,7 +718,6 @@ export function generateMainTsx(withGeometryReplay: boolean = false): string {
     '      <App />',
     '    </StrictMode>,',
     '  );',
-    ...(withGeometryReplay ? ['  installGeometryReplay();'] : []),
     '}',
     '',
   ].join('\n');
@@ -1200,7 +1195,7 @@ export async function synthesizeModularProject(
     // turn before emitting rather than accepting a known-invalid first paint.
     const generatedPage = files.find((file) => file.path === `src/pages/${route.componentName}.tsx`);
     const lightCanvas = !isDarkCanvasColor(routeCanvas);
-    const darkThemeSignals = generatedPage !== undefined && /bg-#\[(?:0[0-9a-f]|1[0-9a-f]|2[0-9a-f])[^\]]*\]|darkMode|lightMode|ONYX DARK/i.test(generatedPage.content);
+    const darkThemeSignals = generatedPage !== undefined && /bg-#\[(?:0[0-9a-f]|1[0-9a-f]|2[0-9a-f])[^\]]*\]|darkMode|lightMode/i.test(generatedPage.content);
     if (lightCanvas && darkThemeSignals && screenshots.length > 0) {
       const correctionPrompt = [
         pagePrompt,
@@ -1220,13 +1215,10 @@ export async function synthesizeModularProject(
   }
 
   // --- Stage 4: router assembly (deterministic) ----------------------------
-  // Measured rendered-geometry replay (generated from evidence; omitted when
-  // no route carries measured spans).
-  const geometryReplay = generateGeometryReplayModule(manifest.routes);
   const appTsx: ProjectFile = { path: 'src/App.tsx', content: generateAppTsx(plan) };
   const mainTsx: ProjectFile = {
     path: 'src/main.tsx',
-    content: generateMainTsx(geometryReplay !== null),
+    content: generateMainTsx(),
   };
 
   // --- Asset reference rewriting -------------------------------------------
@@ -1237,7 +1229,6 @@ export async function synthesizeModularProject(
       ...pageFiles,
       appTsx,
       mainTsx,
-      ...(geometryReplay !== null ? [geometryReplay] : []),
     ],
     manifest.assets,
   );
