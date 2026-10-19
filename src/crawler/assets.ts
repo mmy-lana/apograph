@@ -127,9 +127,12 @@ export interface MirrorOptions extends NetworkPolicyOptions {
 }
 
 /**
- * Mirrors same-origin assets into `assetsDir` and records every discovered
- * asset. Cross-origin assets are recorded with status `external` and are not
- * downloaded; failed downloads are recorded with status `failed`.
+ * Mirrors discovered image assets into `assetsDir` and records every
+ * discovered asset. Same-origin and cross-origin images are both mirrored:
+ * content imagery is frequently served from a CDN origin, and a clone cannot
+ * reproduce what it never downloads. Every request — including redirect
+ * targets — passes the SSRF/network policy and the image MIME/size budgets.
+ * Assets that cannot be mirrored are recorded with status `failed`.
  */
 export async function mirrorAssets(
   urls: string[],
@@ -169,11 +172,7 @@ export async function mirrorAssets(
     }
     seen.add(url.href);
 
-    if (url.origin !== rootOrigin) {
-      entries.push({ originalUrl: url.href, localPath: null, status: 'external' });
-      uncaptured.push({ url: url.href, reason: 'external-origin (not mirrored)' });
-      continue;
-    }
+    const provenance = url.origin === rootOrigin ? 'same-origin' : `cross-origin (${url.origin})`;
 
     try {
       let response = await fetchImpl(url.href, {
@@ -183,8 +182,9 @@ export async function mirrorAssets(
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
         if (location === null) throw new Error('redirect response missing Location');
+        // Redirect targets (e.g. CDN -> object storage) are allowed for any
+        // origin as long as they pass the same SSRF/network policy.
         const redirectUrl = await validateNetworkUrl(new URL(location, url).href, options);
-        if (redirectUrl.origin !== url.origin) throw new Error('cross-origin asset redirect blocked');
         const redirected = await fetchImpl(redirectUrl.href, {
           redirect: 'error',
           signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
@@ -212,7 +212,7 @@ export async function mirrorAssets(
     } catch (cause) {
       const reason = cause instanceof Error ? cause.message : String(cause);
       entries.push({ originalUrl: url.href, localPath: null, status: 'failed' });
-      uncaptured.push({ url: url.href, reason });
+      uncaptured.push({ url: url.href, reason: `${provenance}: ${reason}` });
     }
   }
 

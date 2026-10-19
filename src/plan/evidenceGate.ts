@@ -23,6 +23,7 @@ import * as p from '@clack/prompts';
 import type { A11yNode, CrawlRoute, EvidenceManifest } from '../types.js';
 import { checkCaptureHealth } from '../crawler/health.js';
 import type { CaptureHealth } from '../crawler/health.js';
+import { gotoWithReadiness } from '../crawler/navigation.js';
 import { resolveEvidenceReference, toEvidenceRelativePath } from '../utils/fs-safe.js';
 import {
   autoScrollWithReset,
@@ -539,7 +540,7 @@ export async function recrawlRoute(
     });
     await validateNetworkUrl(route.url);
     const page = await context.newPage();
-    await page.goto(route.url, { waitUntil: 'networkidle', timeout: 30_000 });
+    await gotoWithReadiness(page, route.url, { timeoutMs: 30_000 });
     const title = await page.title();
 
     // Patch spec s3.1 + amendment A1: bounded auto-scroll, settle delay,

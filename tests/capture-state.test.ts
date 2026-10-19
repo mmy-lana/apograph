@@ -23,12 +23,15 @@ const SRC_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 test('capture-state > crawler reloads at the capture viewport before capturing', async () => {
   const engineText = await readFile(join(SRC_ROOT, 'src', 'crawler', 'engine.ts'), 'utf8');
 
-  // The helper reloads whenever the effective width changes and redoes the
-  // lazy-load scroll pass plus readiness before any capture.
+  // The helper reloads whenever the effective width changes (via the
+  // resilient navigation helper) and redoes the lazy-load scroll pass plus
+  // readiness before any capture.
   const helperIndex = engineText.indexOf('const ensureCaptureViewport = ');
   assert.ok(helperIndex !== -1, 'crawler must define the capture-state helper');
   const helperSource = engineText.slice(helperIndex, helperIndex + 1600);
-  assert.ok(helperSource.includes('page.reload('), 'helper must reload the document');
+  assert.ok(helperSource.includes('reloadWithReadiness(page'), 'helper must reload the document');
+  const navigationText = await readFile(join(SRC_ROOT, 'src', 'crawler', 'navigation.ts'), 'utf8');
+  assert.ok(navigationText.includes('page.reload('), 'navigation helper must perform the reload');
   assert.ok(helperSource.includes('autoScrollWithReset(page)'), 'helper must redo lazy-load scrolling');
   assert.ok(helperSource.includes('waitForPageReadiness(page)'), 'helper must redo readiness checks');
   assert.ok(

@@ -34,6 +34,7 @@ import type {
 import { captureDOMSnapshot, extractTextSpans } from '../harvester/dom.js';
 import { toEvidenceRelativePath } from '../utils/fs-safe.js';
 import { discoverImageAssets, mirrorAssets } from './assets.js';
+import { gotoWithReadiness, reloadWithReadiness, type NavigationOutcome } from './navigation.js';
 import {
   checkCaptureHealth,
   classifyRedirect,
@@ -256,7 +257,12 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
       if (loadedWidth === size.width) return;
       await page.setViewportSize({ ...size });
       try {
-        await page.reload({ waitUntil: 'networkidle', timeout: NAVIGATION_TIMEOUT_MS });
+        const reloadOutcome = await reloadWithReadiness(page, {
+          timeoutMs: NAVIGATION_TIMEOUT_MS,
+        });
+        if (!reloadOutcome.settled && reloadOutcome.note !== undefined) {
+          skip(page.url(), `post-reload ${reloadOutcome.note}`);
+        }
       } catch (cause) {
         const reason = cause instanceof Error ? cause.message : String(cause);
         skip(page.url(), `post-reload navigation incomplete (${reason}); capture proceeded`);
@@ -302,14 +308,14 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         if (frame === page.mainFrame()) lastNavTime = Date.now();
       };
       page.on('framenavigated', onNavigated);
+      let navOutcome: NavigationOutcome;
       try {
         await page.evaluate(() => {
           try { localStorage.clear(); } catch {}
           try { sessionStorage.clear(); } catch {}
         });
-        await page.goto(entry.url, {
-          waitUntil: 'networkidle',
-          timeout: NAVIGATION_TIMEOUT_MS,
+        navOutcome = await gotoWithReadiness(page, entry.url, {
+          timeoutMs: NAVIGATION_TIMEOUT_MS,
         });
         await validateNetworkUrl(page.url(), options.networkPolicy);
         title = await page.title();
@@ -319,6 +325,9 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         continue;
       } finally {
         page.off('framenavigated', onNavigated);
+      }
+      if (!navOutcome.settled && navOutcome.note !== undefined) {
+        skip(entry.url, navOutcome.note);
       }
       const settleTimeMs = lastNavTime - gotoStart;
 
@@ -504,33 +513,16 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
           : {}),
       };
 
-      // Shared SPA-probe budget: both passes must fit within 30s per page.
+      // Shared SPA-probe budget: the interactive and hash passes must fit
+      // within 30s per page.
       const spaDeadline = Date.now() + SPA_PROBE_BUDGET_MS;
 
-      // SPA-aware interactive state discovery (modals / overlays): probing
-      // happens before the route is stored so modalCaptures ride on the
-      // record; per-element failures are swallowed inside the discovery.
-      const modalCaptures = await discoverInteractiveStates(
-        page,
-        routeRecord,
-        screenshotsDir,
-        spaDeadline,
-      );
-      if (modalCaptures.length > 0) {
-        routeRecord.modalCaptures = modalCaptures.map((capture) => ({
-          ...capture,
-          desktopScreenshot:
-            capture.desktopScreenshot === null
-              ? null
-              : toEvidenceRelativePath(evidenceDir, capture.desktopScreenshot),
-          mobileScreenshot:
-            capture.mobileScreenshot === null
-              ? null
-              : toEvidenceRelativePath(evidenceDir, capture.mobileScreenshot),
-        }));
-      }
-
-      routes.push(routeRecord);
+      // Pristine-DOM evidence passes (read-only) run BEFORE the interactive
+      // probe. That probe clicks through interactive elements — opening
+      // modals and overlays and potentially triggering SPA navigations it
+      // cannot undo — so links, hash sub-captures, and asset references must
+      // be sampled while the route's own document is still intact
+      // (remediation record #17).
 
       // Link discovery (scoped against the canonical root).
       const scopeFilter = createScopeFilter(canonicalRoot, scope);
@@ -562,6 +554,33 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
           assetRouteMap.set(assetUrl, [path]);
         }
       }
+
+      // SPA-aware interactive state discovery (modals / overlays) is the one
+      // DOM-mutating pass, so it runs LAST: its clicks can never pollute the
+      // evidence passes above. Probing happens before the route is stored so
+      // modalCaptures ride on the record; per-element failures are swallowed
+      // inside the discovery.
+      const modalCaptures = await discoverInteractiveStates(
+        page,
+        routeRecord,
+        screenshotsDir,
+        spaDeadline,
+      );
+      if (modalCaptures.length > 0) {
+        routeRecord.modalCaptures = modalCaptures.map((capture) => ({
+          ...capture,
+          desktopScreenshot:
+            capture.desktopScreenshot === null
+              ? null
+              : toEvidenceRelativePath(evidenceDir, capture.desktopScreenshot),
+          mobileScreenshot:
+            capture.mobileScreenshot === null
+              ? null
+              : toEvidenceRelativePath(evidenceDir, capture.mobileScreenshot),
+        }));
+      }
+
+      routes.push(routeRecord);
     }
 
     // Whatever the frontier still holds was cut off by the page cap.
