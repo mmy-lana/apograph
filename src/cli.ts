@@ -388,6 +388,7 @@ async function runModularSynthesis(
         outputDir: projectDir,
         evidenceDir,
         viewport: options.viewport,
+        repair: false,
       });
     } finally {
       progress.stop('Verification finished');
