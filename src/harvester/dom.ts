@@ -12,6 +12,7 @@
 
 import type { Page } from 'playwright';
 import * as csstree from 'css-tree';
+import { validateNetworkUrl } from '../crawler/network-policy.js';
 import type { A11yNode, CanvasTheme, DesignTokens, DOMSnapshot, FontFaceRule, TextSpan, TextStyle } from '../types.js';
 
 // ---------------------------------------------------------------------------
@@ -204,13 +205,111 @@ function collectCssText(): string {
 }
 
 /**
- * Evaluates the page's active stylesheets and parses them with CSSTree to
- * extract normalized, deduplicated design tokens.
+ * In-page collector: the hrefs of stylesheets whose rules are unreadable
+ * from the page (cross-origin `cssRules` access throws). Those stylesheets
+ * typically carry `@font-face` rules for CDN-hosted webfonts (Google Fonts
+ * and friends), so the crawler fetches their text server-side and mines it
+ * for webfont replay evidence. Serialized by `page.evaluate`: must stay
+ * fully self-contained (patch spec s2.1).
  */
-export async function extractDesignTokens(page: Page): Promise<DesignTokens> {
-  const [css, canvas] = await Promise.all([
+function collectUnreadableStylesheetHrefs(): string[] {
+  const hrefs: string[] = [];
+  for (const sheet of Array.from(document.styleSheets)) {
+    try {
+      void sheet.cssRules;
+    } catch {
+      const href = sheet.href;
+      if (typeof href === 'string' && href.length > 0) hrefs.push(href);
+    }
+  }
+  return hrefs;
+}
+
+/**
+ * Merges webfont evidence extracted from additional stylesheet text into an
+ * accumulating token set (deterministic first-wins dedupe, mirroring
+ * `collectWebFonts`). Pure and exported for testing.
+ */
+export function mergeFontTokens(
+  base: { fontFaces: FontFaceRule[]; fontVariables: Record<string, string> },
+  extra: { fontFaces: FontFaceRule[]; fontVariables: Record<string, string> },
+): void {
+  const seen = new Set(
+    base.fontFaces.map((face) => `${face.family}|${face.weight ?? ''}|${face.style ?? ''}|${face.src}`),
+  );
+  for (const face of extra.fontFaces) {
+    const key = `${face.family}|${face.weight ?? ''}|${face.style ?? ''}|${face.src}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    base.fontFaces.push(face);
+  }
+  for (const [name, value] of Object.entries(extra.fontVariables)) {
+    if (!(name in base.fontVariables)) base.fontVariables[name] = value;
+  }
+}
+
+/** Optional injection points for {@link extractDesignTokens} (tests provide fakes). */
+export interface DesignTokenOptions {
+  /**
+   * Fetcher for the text of stylesheets that were unreadable in-page
+   * (cross-origin). Returns null on failure; callers bound count and size.
+   * Defaults to {@link fetchStylesheetText} (SSRF-policy-checked, bounded).
+   */
+  fetchStylesheetText?: (url: string) => Promise<string | null>;
+  /** Cap on remote stylesheets fetched per page (default 5). */
+  maxRemoteStylesheets?: number;
+}
+
+/** Per-stylesheet fetch timeout for cross-origin webfont CSS text. */
+const STYLESHEET_FETCH_TIMEOUT_MS = 10_000;
+
+/** Max bytes read from one cross-origin stylesheet (webfont CSS is small). */
+const MAX_STYLESHEET_BYTES = 512 * 1024;
+
+/**
+ * Bounded, SSRF-policy-checked fetcher for the text of cross-origin
+ * stylesheets (unreadable via `cssRules`). Every request passes the same
+ * public-web network policy as asset mirroring — evidence capture, never a
+ * policy bypass. Returns null on any failure so mining degrades silently.
+ */
+export async function fetchStylesheetText(url: string): Promise<string | null> {
+  let validated: URL;
+  try {
+    validated = await validateNetworkUrl(url);
+  } catch {
+    return null;
+  }
+  try {
+    const response = await fetch(validated.href, {
+      redirect: 'follow',
+      signal: AbortSignal.timeout(STYLESHEET_FETCH_TIMEOUT_MS),
+      headers: { accept: 'text/css,*/*;q=0.8' },
+    });
+    if (!response.ok) return null;
+    const declared = Number(response.headers.get('content-length') ?? '0');
+    if (declared > MAX_STYLESHEET_BYTES) return null;
+    const text = await response.text();
+    return text.length > MAX_STYLESHEET_BYTES ? text.slice(0, MAX_STYLESHEET_BYTES) : text;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Evaluates the page's active stylesheets and parses them with CSSTree to
+ * extract normalized, deduplicated design tokens. Cross-origin stylesheets
+ * (whose `cssRules` are unreadable in-page) are fetched as text through the
+ * injected fetcher and mined for `@font-face` / font custom properties so
+ * CDN-hosted webfonts (e.g. Google Fonts) join the replay evidence.
+ */
+export async function extractDesignTokens(
+  page: Page,
+  options: DesignTokenOptions = {},
+): Promise<DesignTokens> {
+  const [css, canvas, remoteHrefs] = await Promise.all([
     page.evaluate(collectCssText),
     extractCanvasTheme(page),
+    page.evaluate(collectUnreadableStylesheetHrefs),
   ]);
 
   const colors = new Map<string, string>();
@@ -264,7 +363,22 @@ export async function extractDesignTokens(page: Page): Promise<DesignTokens> {
     }
   });
 
+  // Mine cross-origin stylesheet text for @font-face rules and font custom
+  // properties: CDN-hosted webfonts are the common case and must join the
+  // replay evidence. Bounded and first-wins.
   const fontTokens = extractFontTokens(css);
+  const fetchRemote = options.fetchStylesheetText ?? fetchStylesheetText;
+  const limit = Math.max(0, options.maxRemoteStylesheets ?? 5);
+  for (const href of [...new Set(remoteHrefs)].slice(0, limit)) {
+    let text: string | null = null;
+    try {
+      text = await fetchRemote(href);
+    } catch {
+      text = null;
+    }
+    if (text === null || text.length === 0) continue;
+    mergeFontTokens(fontTokens, extractFontTokens(text));
+  }
   return {
     colors: Object.fromEntries(colors),
     fonts: [...fonts].sort(),
@@ -387,6 +501,8 @@ export interface RawTextSpan {
   fontFamily?: string;
   /** Computed `text-align`. */
   textAlign?: string;
+  /** `href` of the nearest ancestor anchor, as authored (optional). */
+  href?: string;
 }
 
 /** True when a computed color is fully transparent (alpha 0). */
@@ -480,6 +596,9 @@ export function buildTextSpans(raw: RawTextSpan[]): TextSpan[] {
     if (isGradientText(entry)) span.gradient = entry.backgroundImage;
     const style = buildTextStyle(entry);
     if (style !== undefined) span.style = style;
+    // Link target replay: only spans actually rendered inside an anchor carry
+    // an href — synthesizers must never invent one for plain text.
+    if (entry.href !== undefined && entry.href.length > 0) span.href = entry.href;
     spans.push(span);
   }
   return spans;
@@ -517,6 +636,21 @@ function collectRawTextSpans(): RawTextSpan[] {
     return null;
   };
 
+  // Nearest ancestor anchor's href, verbatim as authored (empty string when
+  // the text is not inside a link) — internal to this evaluated closure
+  // (patch spec s2.1 Rule 1).
+  const anchorHref = (el: Element | null): string => {
+    let current: Element | null = el;
+    while (current !== null) {
+      if (current.tagName.toLowerCase() === 'a') {
+        const href = current.getAttribute('href');
+        return href !== null ? href.trim() : '';
+      }
+      current = current.parentElement;
+    }
+    return '';
+  };
+
   while (walker.nextNode()) {
     const textNode = walker.currentNode as Text;
     const text = textNode.textContent ?? '';
@@ -551,6 +685,7 @@ function collectRawTextSpans(): RawTextSpan[] {
       textTransform: style.textTransform,
       fontFamily: style.fontFamily,
       textAlign: style.textAlign,
+      href: anchorHref(element),
     });
   }
   return raw;
@@ -571,10 +706,14 @@ export async function extractTextSpans(page: Page): Promise<TextSpan[]> {
  * extracted design tokens, and the visible text corpus (spec s5.1), all
  * gathered concurrently.
  */
-export async function captureDOMSnapshot(page: Page, route: string): Promise<DOMSnapshot> {
+export async function captureDOMSnapshot(
+  page: Page,
+  route: string,
+  tokenOptions: DesignTokenOptions = {},
+): Promise<DOMSnapshot> {
   const [a11yTree, tokens, textSpans] = await Promise.all([
     extractA11yTree(page),
-    extractDesignTokens(page),
+    extractDesignTokens(page, tokenOptions),
     extractTextSpans(page),
   ]);
 

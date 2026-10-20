@@ -303,8 +303,9 @@ test('asset-mirror > gives up after bounded attempts on persistent transients', 
     );
 
     assert.equal(entries[0]?.status, 'failed');
-    assert.equal(calls, 3, 'bounded: one initial attempt plus two retries');
-    assert.equal(sleeps.length, 2);
+    assert.equal(calls, 4, 'bounded: one initial attempt plus three retries');
+    assert.equal(sleeps.length, 3);
+    assert.ok(sleeps[2] >= 8000 && sleeps[2] < 10000, `third backoff ${sleeps[2]}ms`);
     assert.ok(uncaptured[0]?.reason.includes('fetch failed'));
   });
 });

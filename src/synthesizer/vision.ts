@@ -88,6 +88,36 @@ export async function loadRouteScreenshots(
   return images;
 }
 
+/**
+ * Loads the captured modal/overlay-state screenshots for a route (each
+ * `ModalCapture`'s desktop + mobile PNGs) so synthesis can reproduce the
+ * overlay's layout instead of guessing it. Missing files are silently
+ * skipped. Pure loading — ordering/prompting is the caller's concern.
+ */
+export async function loadModalCaptureScreenshots(
+  route: CrawlRoute,
+  evidenceDir: string,
+): Promise<ScreenshotImage[]> {
+  const images: ScreenshotImage[] = [];
+  for (const capture of route.modalCaptures ?? []) {
+    if (capture.desktopScreenshot !== null) {
+      const desktop = await loadScreenshotDataUrl(
+        resolveScreenshotPath(capture.desktopScreenshot, evidenceDir),
+        'desktop',
+      );
+      if (desktop) images.push(desktop);
+    }
+    if (capture.mobileScreenshot !== null) {
+      const mobile = await loadScreenshotDataUrl(
+        resolveScreenshotPath(capture.mobileScreenshot, evidenceDir),
+        'mobile',
+      );
+      if (mobile) images.push(mobile);
+    }
+  }
+  return images;
+}
+
 // ---------------------------------------------------------------------------
 // Prompt context serialization
 // ---------------------------------------------------------------------------
@@ -194,6 +224,7 @@ export function formatMeasuredMetrics(span: TextSpan): string {
   if (style?.lineHeight !== undefined) parts.push(`lh ${style.lineHeight}`);
   if (style?.letterSpacing !== undefined) parts.push(`ls ${style.letterSpacing}`);
   if (style?.textTransform !== undefined) parts.push(`transform ${style.textTransform}`);
+  if (style?.fontFamily !== undefined) parts.push(`family ${style.fontFamily}`);
   if (style?.textAlign !== undefined && style.textAlign !== 'left' && style.textAlign !== 'start') {
     parts.push(`align ${style.textAlign}`);
   }
@@ -240,6 +271,10 @@ export function formatTextSpansForPrompt(spans: TextSpan[], mobileSpans?: TextSp
   const lines = ranked.map(({ span }) => {
     const tag = span.parentTag !== span.tag ? `${span.parentTag}>${span.tag}` : span.tag;
     const gradient = span.gradient !== undefined ? ` [gradient: ${span.gradient}]` : '';
+    // Link-target replay: spans captured inside an anchor carry their exact
+    // href; spans without one are plain text and must never gain an invented
+    // <a href> in the output.
+    const link = span.href !== undefined && span.href.length > 0 ? ` [link: ${span.href}]` : '';
     const measured = formatMeasuredMetrics(span);
     const mobile = mobileByText.get(span.text);
     const mobileMeasured =
@@ -252,7 +287,7 @@ export function formatTextSpansForPrompt(spans: TextSpan[], mobileSpans?: TextSp
         ? ` [mobile: ${mobileMeasured}]`
         : '';
     if (metrics.length > 0 || mobileMetrics.length > 0) anyMetrics = true;
-    return `  [${tag}] ${span.text}${gradient}${metrics}${mobileMetrics}`;
+    return `  [${tag}] ${span.text}${link}${gradient}${metrics}${mobileMetrics}`;
   });
 
   const truncated =
@@ -262,16 +297,23 @@ export function formatTextSpansForPrompt(spans: TextSpan[], mobileSpans?: TextSp
     ? [
         'Bracketed metrics are MEASURED computed values captured from the live',
         'site (not estimates): fs = font-size, fw = font-weight, lh = line-height,',
-        'ls = letter-spacing, box WxH @x,y = element box (CSS px, left,top).',
+        'ls = letter-spacing, family = computed font-family (first family in the',
+        'stack), box WxH @x,y = element box (CSS px, left,top).',
         'Reproduce the measured type sizes, weights, wrapping widths, and',
         'vertical positions exactly (arbitrary Tailwind values such as',
-        'text-[30px] font-[900] leading-[36px] w-[314px] are expected).',
+        'text-[30px] font-[900] leading-[36px] w-[314px] are expected), and',
+        "apply each span's measured family with an arbitrary font-family",
+        "utility (e.g. font-[family-name:'Plus_Jakarta_Sans']) so text renders",
+        'in the captured family instead of a generic fallback.',
       ]
     : [];
 
   return [
     'Text corpus (visible DOM text ordered top-to-bottom). Use this text to',
     'populate headings and copy accurately matching each section\'s visual hierarchy.',
+    'Spans marked [link: <href>] were captured inside anchors — reuse that exact',
+    'href on the corresponding <a>; spans without a [link:] marker are plain',
+    'text (or buttons) and must NEVER be wrapped in an invented <a href>.',
     'Gradient headline spans MUST keep their exact gradient definition:',
     ...measuredNote,
     ...lines,

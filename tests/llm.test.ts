@@ -538,3 +538,127 @@ describe('generateStructuredFilesFromParts (no-object-generated fallback)', () =
     assert.deepEqual(clock.sleeps, []);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Provider body-parse failures ("Invalid JSON response")
+// ---------------------------------------------------------------------------
+
+/** APICallError-shaped provider body-parse failure (provider-utils style). */
+function invalidJsonResponse(extra: { statusCode?: number; responseBody?: string } = {}): Error {
+  return Object.assign(new Error('Invalid JSON response'), {
+    statusCode: extra.statusCode ?? 200,
+    ...(extra.responseBody !== undefined ? { responseBody: extra.responseBody } : {}),
+  });
+}
+
+describe('classifyProviderError (provider body-parse failures)', () => {
+  test('2xx Invalid JSON response is a bounded transient provider fault', () => {
+    assert.equal(classifyProviderError(invalidJsonResponse({ statusCode: 200 })), 'retry');
+    assert.equal(classifyProviderError(invalidJsonResponse({})), 'retry', 'absent status counts as provider fault');
+    assert.equal(classifyProviderError(invalidJsonResponse({ statusCode: 503 })), 'retry');
+  });
+
+  test('4xx Invalid JSON response still raises immediately (no retry)', () => {
+    assert.equal(classifyProviderError(invalidJsonResponse({ statusCode: 400 })), 'raise');
+    assert.equal(classifyProviderError(invalidJsonResponse({ statusCode: 404 })), 'raise');
+  });
+});
+
+describe('generateStructuredFilesFromParts (invalid-JSON-response fallback)', () => {
+  test('salvages project files from the raw responseBody without a second call', async () => {
+    const clock = fakeClock();
+    let calls = 0;
+    const files = await generateStructuredFilesFromParts(
+      [{ type: 'text', text: 'build the page' }],
+      undefined,
+      {
+        ...clock,
+        model: mockModel(async () => {
+          calls += 1;
+          throw invalidJsonResponse({
+            responseBody: '{"note":"gateway wrapper","files":[{"path":"src/body.ts","content":"b"}]}',
+          });
+        }) as never,
+      },
+    );
+    assert.equal(files[0]?.path, 'src/body.ts');
+    assert.equal(calls, 1, 'salvage must avoid a second generation call');
+    assert.deepEqual(clock.sleeps, []);
+  });
+
+  test('un-salvageable invalid-JSON falls back to generateText JSON extraction', async () => {
+    const clock = fakeClock();
+    let calls = 0;
+    const files = await generateStructuredFilesFromParts(
+      [{ type: 'text', text: 'x' }],
+      undefined,
+      {
+        ...clock,
+        model: mockModel(async () => {
+          calls += 1;
+          if (calls === 1) throw invalidJsonResponse({ responseBody: '{"error":"upstream unavailable"}' });
+          return {
+            finishReason: 'stop',
+            usage: { promptTokens: 1, completionTokens: 1 },
+            text: '{"files":[{"path":"src/recovered.ts","content":"r"}]}',
+            rawCall: { rawPrompt: null, rawSettings: {} },
+          };
+        }) as never,
+      },
+    );
+    assert.equal(files[0]?.path, 'src/recovered.ts');
+    assert.equal(calls, 2, 'one failed structured call + one generateText fallback');
+    assert.deepEqual(clock.sleeps, [], 'protocol fallback itself is not a retry');
+  });
+
+  test('model-output JSON parse failures also salvage and fall back', async () => {
+    const clock = fakeClock();
+    let calls = 0;
+    const files = await generateStructuredFilesFromParts(
+      [{ type: 'text', text: 'x' }],
+      undefined,
+      {
+        ...clock,
+        model: mockModel(async () => {
+          calls += 1;
+          if (calls === 1) {
+            return {
+              finishReason: 'stop',
+              usage: { promptTokens: 1, completionTokens: 1 },
+              text: 'not json but {"files":[{"path":"src/mid.ts","content":"m"}]} trailing',
+              rawCall: { rawPrompt: null, rawSettings: {} },
+            };
+          }
+          return {
+            finishReason: 'stop',
+            usage: { promptTokens: 1, completionTokens: 1 },
+            text: '{"files":[{"path":"src/second.ts","content":"s"}]}',
+            rawCall: { rawPrompt: null, rawSettings: {} },
+          };
+        }) as never,
+      },
+    );
+    // generateObject parses the first text and fails; salvage recovers the
+    // embedded project JSON without a second call.
+    assert.equal(files[0]?.path, 'src/mid.ts');
+    assert.equal(calls, 1);
+    assert.deepEqual(clock.sleeps, []);
+  });
+
+  test('persistent body corruption retries boundedly then raises', async () => {
+    const clock = fakeClock();
+    let calls = 0;
+    await assert.rejects(
+      generateStructuredFilesFromParts([{ type: 'text', text: 'x' }], undefined, {
+        ...clock,
+        model: mockModel(async () => {
+          calls += 1;
+          throw invalidJsonResponse({ responseBody: '{"error":"corrupt"}' });
+        }) as never,
+      }),
+      /Invalid JSON response/,
+    );
+    assert.equal(calls, 4, '1 structured + 1 text on attempt 1, then text-only attempts 2-3');
+    assert.deepEqual(clock.sleeps, [3000, 7000], 'bounded transient backoff between attempts');
+  });
+});

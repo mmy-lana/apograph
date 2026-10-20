@@ -33,6 +33,7 @@ import {
   exitCodeForRunStatus,
   upsertStageOutcome,
 } from './synthesizer/modular.js';
+import { healProjectCompilation } from './synthesizer/compileHeal.js';
 import { emitProject } from './emitter/scaffold.js';
 import { runVerification } from './verifier/engine.js';
 import { printVerificationSummary, writeVerificationReport } from './verifier/report.js';
@@ -346,6 +347,37 @@ async function runModularSynthesis(
   const assetsCopied = await copyMirroredAssets(join(evidenceDir, 'assets'), projectDir);
   if (assetsCopied > 0) {
     console.log(`→ Mirrored ${assetsCopied} asset(s) into public/assets/.`);
+  }
+
+  // Pre-verification compile convergence: repair generated sources until
+  // they typecheck so the emitted project never ships known-invalid code
+  // (residual type errors correlate with runtime crashes the pixel score
+  // cannot reveal). Runs before — and independently of — the verifier's
+  // own bounded build-tier repair.
+  const heal = await healProjectCompilation(projectDir, {
+    onStatus: (message) => console.log(`→ ${message}`),
+  });
+  if (!heal.skipped) {
+    if (heal.repairedFiles.length > 0) {
+      console.log(
+        `→ compile-heal: repaired ${heal.repairedFiles.length} file(s) in ${heal.turns} turn(s): ` +
+          heal.repairedFiles.join(', '),
+      );
+    }
+    if (heal.clean) {
+      console.log('→ compile-heal: emitted project typechecks cleanly.');
+    } else {
+      console.warn(
+        `→ compile-heal: residual type errors after ${heal.turns} repair turn(s) ` +
+          '(verification will report them):',
+      );
+      for (const error of heal.residualErrors.slice(0, 5)) console.warn(`    ${error}`);
+      upsertStageOutcome(result.stageOutcomes, {
+        stage: 'compile convergence',
+        status: 'degraded-fallback',
+        reason: `residual type errors after ${heal.turns} bounded repair turn(s)`,
+      });
+    }
   }
 
   if (options.verify) {

@@ -44,6 +44,7 @@ Modelfile.apograph
 logs/
 tmp/
 temp/
+.repomixignore
 
 #Browser and test artifacts
 

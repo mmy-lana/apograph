@@ -6,8 +6,8 @@
  * `[role="button"]`, `a` without href or with `href="#"`), and records a
  * `ModalCapture` whenever clicking an element reveals a NEW overlay
  * (`[role="dialog"]`, `.modal`, `[aria-modal="true"]`, or a visible
- * `position: fixed` element with `z-index > 100`) that was not present
- * before the click.
+ * `position: fixed` element that is elevated (z-index >= 30) or covers
+ * most of the viewport) that was not present before the click.
  *
  * All in-page evaluate functions are fully self-contained (no
  * module-scope references), per patch spec s2.1. Per-element failures are
@@ -48,8 +48,9 @@ const CLICKABLE_SELECTOR = 'button, [role="button"], a:not([href]), a[href="#"]'
 const OVERLAY_SELECTOR = '[role="dialog"], .modal, [aria-modal="true"]';
 
 /**
- * Cap on elements scanned for the `position: fixed; z-index > 100` overlay
- * heuristic, so huge DOMs cannot blow the per-page time budget.
+ * Cap on elements scanned for the fixed-layer overlay heuristic (elevated
+ * z-index or viewport-covering), so huge DOMs cannot blow the per-page time
+ * budget.
  */
 const MAX_FIXED_OVERLAY_SCAN = 2_000;
 
@@ -105,7 +106,14 @@ function markExistingOverlays(): { bodyChildCount: number; markedOverlays: numbe
         const style = window.getComputedStyle(el);
         if (style.position !== 'fixed') continue;
         const zIndex = Number.parseInt(style.zIndex, 10);
-        if (Number.isNaN(zIndex) || zIndex <= 100) continue;
+        const rect = el.getBoundingClientRect();
+        // Modal heuristic (generic): an elevated fixed layer (z-index >= 30 —
+        // the conventional Tailwind z-50 dialog band) or a fixed layer
+        // covering most of the viewport (full-screen drawers/sheets).
+        const coversViewport =
+          rect.width >= window.innerWidth * 0.6 && rect.height >= window.innerHeight * 0.6;
+        const elevated = !Number.isNaN(zIndex) && zIndex >= 30;
+        if (!elevated && !coversViewport) continue;
         if (isVisible(el)) found.push(el);
       }
     }
@@ -150,7 +158,14 @@ function collectNewOverlays(): Array<{ name: string | null }> {
         const style = window.getComputedStyle(el);
         if (style.position !== 'fixed') continue;
         const zIndex = Number.parseInt(style.zIndex, 10);
-        if (Number.isNaN(zIndex) || zIndex <= 100) continue;
+        const rect = el.getBoundingClientRect();
+        // Modal heuristic (generic): an elevated fixed layer (z-index >= 30 —
+        // the conventional Tailwind z-50 dialog band) or a fixed layer
+        // covering most of the viewport (full-screen drawers/sheets).
+        const coversViewport =
+          rect.width >= window.innerWidth * 0.6 && rect.height >= window.innerHeight * 0.6;
+        const elevated = !Number.isNaN(zIndex) && zIndex >= 30;
+        if (!elevated && !coversViewport) continue;
         if (isVisible(el)) found.push(el);
       }
     }

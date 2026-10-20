@@ -374,6 +374,12 @@ export interface TextSpan {
   boundingBox?: { top: number; left: number; width: number; height: number };
   /** Measured computed typography at capture time (rendered ground truth). */
   style?: TextStyle;
+  /**
+   * `href` of the nearest ancestor anchor, verbatim as authored (e.g.
+   * `https://example.com/x`, `mailto:a@b.c`, `/about`). Absent when the span
+   * does not render inside a link — synthesizers must never invent one.
+   */
+  href?: string;
 }
 
 /** One node of the accessibility tree (mirrors Playwright's AxNode shape). */

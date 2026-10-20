@@ -88,7 +88,7 @@ test('isolation > every in-page collector is lexically self-contained', async ()
   const domText = await readFile(join(SRC_ROOT, 'src', 'harvester', 'dom.ts'), 'utf8');
   const engineText = await readFile(join(SRC_ROOT, 'src', 'crawler', 'engine.ts'), 'utf8');
 
-  for (const name of ['collectRawTextSpans', 'collectCssText', 'collectBodyComputedStyle']) {
+  for (const name of ['collectRawTextSpans', 'collectCssText', 'collectBodyComputedStyle', 'collectUnreadableStylesheetHrefs']) {
     assertSelfContained(domText, name);
   }
   for (const name of ['countVisibleNodesInPage', 'collectHeadMetadata']) {

@@ -18,12 +18,18 @@ import { validateNetworkUrl, type NetworkPolicyOptions } from './network-policy.
 const DOWNLOAD_TIMEOUT_MS = 20_000;
 
 /** Bounded download attempts per asset (1 initial + retries on transients). */
-const DOWNLOAD_ATTEMPTS = 3;
+const DOWNLOAD_ATTEMPTS = 4;
 
-/** Backoff schedule (base + jitter) between transient asset download retries. */
+/**
+ * Backoff schedule (base + jitter) between transient asset download retries.
+ * The later slots wait long enough for short-lived upstream throttle windows
+ * to expire (observed on rate-sensitive hosts) while staying bounded — this
+ * is request politeness, never a bypass of access controls.
+ */
 const DOWNLOAD_BACKOFF: ReadonlyArray<{ baseMs: number; jitterMs: number }> = [
   { baseMs: 1_000, jitterMs: 500 },
   { baseMs: 3_000, jitterMs: 1_000 },
+  { baseMs: 8_000, jitterMs: 2_000 },
 ];
 
 /** HTTP statuses worth retrying (bounded): throttling and server-side faults. */

@@ -35,6 +35,7 @@ import {
   formatTextSpansForPrompt,
   formatTokensForVisionPrompt,
   generateFilesWithVision,
+  loadModalCaptureScreenshots,
   loadRouteScreenshots,
 } from './vision.js';
 import type { ScreenshotImage } from './vision.js';
@@ -158,42 +159,20 @@ export function formatModelRouteLabel(provider: string, modelId: string): string
 
 const SYSTEM_GUIDELINES = [
   'You are an expert frontend engineer synthesizing a standalone React application.',
-  'Target stack (fixed): React 19.3, Vite, React Router v7 (imports from "react-router"),',
-  'Tailwind CSS v4 (CSS-first config in src/index.css via @theme), lucide-react icons.',
-  'Rules:',
-  '1. React 19 functional components with hooks only — no class components.',
-  '2. Style strictly with Tailwind CSS utility classes. Match the screenshots',
-  '   exactly: arbitrary value utilities are encouraged and expected — use',
-  '   bg-[#080f1c], text-cyan-400, gradient utilities (bg-gradient-to-r',
-  '   from-cyan-400 to-blue-500), opacity and blur utilities whenever they',
-  '   reproduce the reference visuals. Semantic @theme tokens (bg-background,',
-  '   text-foreground, border-border, text-muted-foreground) are also',
-  '   available. Never reference --color-apograph-N variables; use the',
-  '   provided reduced palette or direct hex values from the screenshots.',
-  '3. Use lucide-react for every icon. Never invent SVG icon paths.',
-  '4. Match the provided screenshots: desktop shot = >=1024px layout,',
-  '   mobile shot = <768px layout. Reproduce the visual hierarchy, spacing rhythm,',
-  '   and content structure faithfully.',
-  '5. Reference mirrored images with their local path (/assets/<filename>) —',
-  '   never their original remote URLs.',
-  '6. Headers and navigation must match the reference screenshot and belong to',
-  '   the self-contained route page that renders them; do not assume a global shell.',
-  '7. Forms must include realistic HTML validation (required, type="email"),',
-  '   a success toast/banner after submit, and mock persistence via',
-  "   localStorage.setItem('apograph_submissions', ...).",
-  '8. Every file must be complete and compile-ready — no placeholders, no TODOs,',
-  '   no truncation, no markdown fences inside file contents.',
-  '- Always use type-only imports for React types: `import type { FormEvent, ReactNode } from \'react\'`.',
-  '- When rendering icons from lucide-react in maps, lists, or components, store the component reference and render as `<item.icon className="..." />`, or store JSX elements directly `icon: <Shield className="..." />`. Never assign string names and component references to the same property.',
-  '- Check the asset descriptions before linking images. Only use assets named `hero-bg` or `*-bg` for section backgrounds. Use card/thumbnail assets for card items.',
-  '- Complete Page Architecture: Each route page component (e.g. HomePage.tsx, AboutPage.tsx) must be a complete, self-contained page matching its screenshot, including its own header/navigation, main sections, and footer if present in the screenshot.',
+  'Target stack: React 19.3, Vite, React Router v7, Tailwind CSS v4 (@theme in src/index.css), lucide-react icons.',
   '',
-  'CRITICAL LAYOUT ARCHITECTURE RULES (NON-NEGOTIABLE):',
-  '- Layout Architecture: Page sections must stack vertically in normal document flow inside <main className="flex min-h-screen w-full flex-col bg-background text-foreground">. Never position whole sections with `absolute` or `fixed` over other sections.',
-  '- STRICT PROHIBITION ON WHOLE-SECTION ABSOLUTE POSITIONING: NEVER use `absolute inset-0`, `fixed inset-0`, or absolute positioning on top-level <section> or container wrappers. Every section must sit in natural vertical flow (e.g. `<section className="w-full py-16 sm:py-24">`). `position: absolute` is ONLY permitted for background/decorative elements inside a `relative` parent container.',
-  '- SECTION INTEGRITY: Only render sections that visually belong to THIS page. Do not invent or pull cards, badges, or content from other pages.',
-  '- FOOTER CONTRACT: Footer.tsx must be a static block container at the bottom of the page (`<footer className="w-full border-t border-border bg-background py-12">`). NEVER use `fixed`, `sticky`, or `absolute` on Footer.tsx.',
-  '- CARD IMAGES: For card grids or list items, if a specific dedicated visual asset for that item does not exist, use a clean placeholder icon/gradient. Never assign background crops, full-page crops, or logo assets to card content.',
+  'Component & Architecture Guidelines:',
+  '1. Functional components with hooks only. Complete Page Architecture: each route page is self-contained with its layout.',
+  '2. Layout Architecture: Stack sections in natural document flow (<main className="flex min-h-screen w-full flex-col bg-background text-foreground">). Use relative containers for positioning overlays; avoid absolute positioning on root section wrappers.',
+  '3. FOOTER CONTRACT: Footer.tsx must be a static block container at the bottom of the page (<footer className="w-full border-t border-border bg-background py-12">); never use fixed or absolute positioning.',
+  '4. Use lucide-react icons: render component references directly as `<item.icon className="..." />` or store JSX elements. Never assign string names and component references to the same property.',
+  '5. Always use type-only imports for React types: `import type { FormEvent, ReactNode } from \'react\'`.',
+  '6. DATA SHAPE CONTRACT: Declare structured collections as typed module-level constants. Ensure tuple destructuring matches declared array types.',
+  '7. LINK TARGETS (evidence-driven): Spans marked `[link: <href>]` represent anchors; use the exact href. Spans without links are plain text or buttons.',
+  '8. CARD IMAGES: Use dedicated visual assets when available; otherwise use semantic lucide-react icons or CSS gradients.',
+  '9. Assets: Reference local files as `/assets/<filename>`. Only use `hero-bg` or `*-bg` assets for section backgrounds.',
+  '10. Form Handling: Standard HTML validation with mock storage using localStorage.',
+  '11. Every emitted file must be complete, compile-ready, and free of markdown fences or placeholders.',
 ].join('\n');
 
 // ---------------------------------------------------------------------------
@@ -862,6 +841,10 @@ function modalCapturePromptLines(route: CrawlRoute | undefined): string[] {
       (modal) =>
         `- "${modal.modalName}" — triggered by ${modal.triggerSelector}`,
     ),
+    'Each captured modal state has desktop/mobile screenshots attached after',
+    "the page screenshots — reproduce the overlay's layout from them. The",
+    'trigger is a BUTTON that opens the overlay in-place (never convert it',
+    'into an <a href> navigation).',
     '',
   ];
 }
@@ -1100,9 +1083,16 @@ export async function synthesizeModularProject(
     }
 
     const manifestRoute = await resolveRouteEvidence(route, manifest, evidenceDir);
-    const screenshots = manifestRoute
+    const routeScreenshots = manifestRoute
       ? await loadRouteScreenshots(manifestRoute, evidenceDir)
       : [];
+    // Captured modal/overlay states ride with the route images so the model
+    // can reproduce their layout instead of inventing placeholders (they are
+    // listed textually by modalCapturePromptLines below).
+    const modalScreenshots = manifestRoute
+      ? await loadModalCaptureScreenshots(manifestRoute, evidenceDir)
+      : [];
+    const screenshots = [...routeScreenshots, ...modalScreenshots];
 
     const routeCanvas = manifestRoute?.tokens.canvas?.backgroundColor ?? canvasColor;
     const siblingRoutes = included
