@@ -21,7 +21,7 @@ import { platform } from 'node:os';
 import { join } from 'node:path';
 import * as p from '@clack/prompts';
 import type { A11yNode, CrawlRoute, EvidenceManifest } from '../types.js';
-import { checkCaptureHealth } from '../crawler/health.js';
+import { checkCaptureHealth, deriveRenderedCanvasTheme } from '../crawler/health.js';
 import type { CaptureHealth } from '../crawler/health.js';
 import { gotoWithReadiness } from '../crawler/navigation.js';
 import { resolveEvidenceReference, toEvidenceRelativePath } from '../utils/fs-safe.js';
@@ -179,6 +179,16 @@ function captureReference(evidenceDir: string, absolutePath: string): string {
   } catch {
     return absolutePath;
   }
+}
+
+/**
+ * Derives the full-page auxiliary capture path from a canonical viewport
+ * capture path (`<name>.png` -> `<name>-fullpage.png`).
+ */
+function fullPageSiblingPath(viewportPath: string): string {
+  return viewportPath.endsWith('.png')
+    ? `${viewportPath.slice(0, -'.png'.length)}-fullpage.png`
+    : `${viewportPath}-fullpage.png`;
 }
 
 // ---------------------------------------------------------------------------
@@ -561,14 +571,27 @@ export async function recrawlRoute(
       console.warn(`[apograph] re-crawl ${route.path}: ${readinessNote}`);
     }
 
-    // Full-page captures for both viewports (patch spec s3.2).
+    // Canonical viewport frames plus full-page auxiliary frames for both
+    // viewports (patch spec s3.2 capture contract: the canonical desktop
+    // frame is 1280x800 and the canonical mobile frame is 390x844; the
+    // full-page frames carry below-fold evidence).
+    const desktopFullPagePath = fullPageSiblingPath(desktopPath);
+    const mobileFullPagePath = fullPageSiblingPath(mobilePath);
     await page.setViewportSize({ width: 1280, height: 800 });
-    await page.screenshot({ path: desktopPath, type: 'png', fullPage: true });
+    await page.screenshot({ path: desktopPath, type: 'png' });
+    await page.screenshot({ path: desktopFullPagePath, type: 'png', fullPage: true });
     await page.setViewportSize({ width: 390, height: 844 });
-    await page.screenshot({ path: mobilePath, type: 'png', fullPage: true });
+    await page.screenshot({ path: mobilePath, type: 'png' });
+    await page.screenshot({ path: mobileFullPagePath, type: 'png', fullPage: true });
     await page.setViewportSize({ width: 1280, height: 800 });
 
     const snapshot = await captureDOMSnapshot(page, route.path);
+    // Canvas grounding (spec s4.1): transparent-canvas pages are grounded in
+    // the rendered pixels rather than defaulted to white.
+    if (snapshot.tokens.canvas === undefined) {
+      const rendered = deriveRenderedCanvasTheme(await readFile(desktopFullPagePath));
+      if (rendered !== undefined) snapshot.tokens.canvas = rendered;
+    }
     await context.close();
 
     const updated: CrawlRoute = {
@@ -576,6 +599,8 @@ export async function recrawlRoute(
       title: title.length > 0 ? title : route.title,
       desktopScreenshot: captureReference(evidenceDir, desktopPath),
       mobileScreenshot: captureReference(evidenceDir, mobilePath),
+      desktopFullPageScreenshot: captureReference(evidenceDir, desktopFullPagePath),
+      mobileFullPageScreenshot: captureReference(evidenceDir, mobileFullPagePath),
       a11yTree: snapshot.a11yTree,
       tokens: snapshot.tokens,
       textSpans: snapshot.textSpans,

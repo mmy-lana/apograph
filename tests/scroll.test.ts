@@ -284,22 +284,32 @@ test('scroll > executor reset happens before any capture-time call site ordering
   // the DOM snapshot.
   const engineText = await readFile(join(SRC_ROOT, 'src', 'crawler', 'engine.ts'), 'utf8');
   const scrollIdx = engineText.indexOf('await autoScrollWithReset(page)');
-  const screenshotIdx = engineText.indexOf("page.screenshot({ path: desktopScreenshot as string, type: 'png', fullPage: true })");
+  const screenshotIdx = engineText.indexOf("page.screenshot({ path: desktopScreenshot as string, type: 'png' })");
   const nodeCountIdx = engineText.indexOf('await countVisibleNodes(page)');
   const snapshotIdx = engineText.indexOf('await captureDOMSnapshot(page, path)');
   assert.ok(scrollIdx > -1 && screenshotIdx > -1 && nodeCountIdx > -1 && snapshotIdx > -1);
   assert.ok(scrollIdx < screenshotIdx, 'auto-scroll must precede screenshots');
   assert.ok(scrollIdx < nodeCountIdx, 'auto-scroll must precede the visible-node count');
   assert.ok(scrollIdx < snapshotIdx, 'auto-scroll must precede the DOM snapshot');
-  // Full-page capture contract (patch spec s3.2): both viewports.
+  // Capture contract (patch spec s3.2): canonical viewport-exact frames
+  // (desktop 1280x800 / mobile 390x844) plus full-page auxiliary frames for
+  // below-fold evidence, at both viewports.
+  assert.ok(
+    engineText.includes("page.screenshot({ path: desktopFullPageScreenshot as string, type: 'png', fullPage: true })"),
+    'desktop full-page auxiliary frame must be captured',
+  );
+  assert.ok(
+    engineText.includes("page.screenshot({ path: mobileFullPageScreenshot as string, type: 'png', fullPage: true })"),
+    'mobile full-page auxiliary frame must be captured',
+  );
   assert.equal((engineText.match(/fullPage: true/g) ?? []).length, 2);
 });
 
-test('scroll > recrawlRoute adopts full-page captures and the same ordering', async () => {
+test('scroll > recrawlRoute adopts the same capture contract and the same ordering', async () => {
   const gateText = await readFile(join(SRC_ROOT, 'src', 'plan', 'evidenceGate.ts'), 'utf8');
   assert.equal((gateText.match(/fullPage: true/g) ?? []).length, 2);
   const scrollIdx = gateText.indexOf('await autoScrollWithReset(page)');
-  const screenshotIdx = gateText.indexOf("page.screenshot({ path: desktopPath, type: 'png', fullPage: true })");
+  const screenshotIdx = gateText.indexOf("page.screenshot({ path: desktopPath, type: 'png' })");
   assert.ok(scrollIdx > -1 && screenshotIdx > -1);
   assert.ok(scrollIdx < screenshotIdx, 'auto-scroll must precede re-capture screenshots');
 });
@@ -492,7 +502,7 @@ test('readiness > engine and recrawlRoute gate readiness before captures', async
   const scrollIdx = engineText.indexOf('await autoScrollWithReset(page)');
   const readinessIdx = engineText.indexOf('await waitForPageReadiness(page)');
   const screenshotIdx = engineText.indexOf(
-    "page.screenshot({ path: desktopScreenshot as string, type: 'png', fullPage: true })",
+    "page.screenshot({ path: desktopScreenshot as string, type: 'png' })",
   );
   assert.ok(scrollIdx > -1 && readinessIdx > -1 && screenshotIdx > -1);
   assert.ok(readinessIdx > scrollIdx, 'readiness must follow the scroll reset');
@@ -502,7 +512,7 @@ test('readiness > engine and recrawlRoute gate readiness before captures', async
   const gateScrollIdx = gateText.indexOf('await autoScrollWithReset(page)');
   const gateReadinessIdx = gateText.indexOf('await waitForPageReadiness(page)');
   const gateShotIdx = gateText.indexOf(
-    "page.screenshot({ path: desktopPath, type: 'png', fullPage: true })",
+    "page.screenshot({ path: desktopPath, type: 'png' })",
   );
   assert.ok(gateScrollIdx > -1 && gateReadinessIdx > -1 && gateShotIdx > -1);
   assert.ok(gateReadinessIdx > gateScrollIdx, 're-crawl readiness must follow the scroll reset');

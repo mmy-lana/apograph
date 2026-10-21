@@ -130,6 +130,17 @@ export interface CrawlRoute {
   desktopScreenshot: string | null;
   /** Local path of the mobile (390x844) screenshot PNG (null when not captured). */
   mobileScreenshot: string | null;
+  /**
+   * Local path of the full-page desktop screenshot PNG (below-fold auxiliary
+   * evidence; the cropping source for visual-asset extraction). Optional:
+   * older bundles only carry the viewport frame.
+   */
+  desktopFullPageScreenshot?: string | null;
+  /**
+   * Local path of the full-page mobile screenshot PNG (below-fold auxiliary
+   * evidence). Optional: older bundles only carry the viewport frame.
+   */
+  mobileFullPageScreenshot?: string | null;
   /** SEO / OpenGraph metadata extracted from the page head. */
   metadata?: RouteMetadata;
   /**
@@ -398,6 +409,14 @@ export interface TextSpan {
   tag: string;
   /** Nearest semantic ancestor tag (e.g. `h1`), else the parent tag. */
   parentTag: string;
+  /**
+   * True when the span renders inside preformatted/code content (`pre`,
+   * `code`, `kbd`, `samp`, `var`, `tt`). Value tokens that read as
+   * string-coercion artifacts (`undefined`, `${…}` interpolation) are
+   * legitimate documented copy there. Optional: older bundles predate
+   * preformatted provenance.
+   */
+  preformatted?: boolean;
   /** Bounding box in CSS pixels at capture time. */
   boundingBox?: { top: number; left: number; width: number; height: number };
   /** Measured computed typography at capture time (rendered ground truth). */
@@ -419,12 +438,25 @@ export interface A11yNode {
   children?: A11yNode[];
 }
 
+/**
+ * Where the recorded canvas background was resolved from. Pages that paint
+ * no computed background on `<body>`/`<html>` (transparent canvas) are
+ * grounded in the rendered pixels instead of being defaulted to white.
+ */
+export type CanvasBackgroundSource =
+  | 'body'
+  | 'root'
+  | 'painted-element'
+  | 'rendered-pixels';
+
 /** Computed canvas colors of `document.body` at capture time (spec s4.1). */
 export interface CanvasTheme {
   /** Computed body background color, normalized to `#rrggbb`. */
   backgroundColor: string;
   /** Computed body foreground color, normalized to `#rrggbb`. */
   color?: string;
+  /** Which surface the background color was resolved from, when known. */
+  source?: CanvasBackgroundSource;
 }
 
 /** One captured `@font-face` rule (webfont replay evidence). */

@@ -20,7 +20,7 @@
  */
 
 import { PNG } from 'pngjs';
-import type { BotBlockSignature, RouteBotCheck } from '../types.js';
+import type { BotBlockSignature, CanvasTheme, RouteBotCheck } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -130,6 +130,19 @@ export function analyzeUniformity(screenshotBuffer: Buffer): {
     uniformityRatio: within / totalPixels,
     dominantColor: `#${hex(dr)}${hex(dg)}${hex(db)}`,
   };
+}
+
+/**
+ * Derives the canvas theme from rendered pixels (spec s4.1 grounding
+ * fallback). Pages that paint no computed background on `<body>`/`<html>`
+ * (fully transparent canvas) get their `tokens.canvas.backgroundColor`
+ * grounded in the dominant rendered frame color — a measured value, never a
+ * silent default to white. Returns undefined for empty frames.
+ */
+export function deriveRenderedCanvasTheme(screenshotBuffer: Buffer): CanvasTheme | undefined {
+  const { dominantColor } = analyzeUniformity(screenshotBuffer);
+  if (dominantColor === null || !/^#[0-9a-f]{6}$/.test(dominantColor)) return undefined;
+  return { backgroundColor: dominantColor, source: 'rendered-pixels' };
 }
 
 /**

@@ -13,7 +13,7 @@
 import type { Page } from 'playwright';
 import * as csstree from 'css-tree';
 import { validateNetworkUrl } from '../crawler/network-policy.js';
-import type { A11yNode, CanvasTheme, DesignTokens, DOMSnapshot, FontFaceRule, TextSpan, TextStyle } from '../types.js';
+import type { A11yNode, CanvasBackgroundSource, CanvasTheme, DesignTokens, DOMSnapshot, FontFaceRule, TextSpan, TextStyle } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // A11y tree extraction
@@ -120,13 +120,79 @@ function mapA11yNode(
 // Canvas theme extraction (spec s4.1)
 // ---------------------------------------------------------------------------
 
-/** In-page collector for the computed colors of `document.body`. */
-function collectBodyComputedStyle(): { backgroundColor: string; color: string } {
-  const style = getComputedStyle(document.body);
-  return {
-    backgroundColor: style.backgroundColor,
-    color: style.color,
+/**
+ * In-page collector for the effective canvas colors of the document.
+ *
+ * Resolves the background through a generic chain: the computed `body`
+ * background first (spec s4.1), then the root element's background, then the
+ * painted-surface chain under the frame corner (full-bleed wrapper divs on
+ * SPA shells). Pages that paint nothing (fully transparent canvas) report an
+ * empty background so the crawler can ground the color in the rendered
+ * pixels instead of silently defaulting to white.
+ *
+ * Serialized by `page.evaluate`: must stay fully self-contained (patch spec
+ * s2.1).
+ */
+function collectBodyComputedStyle(): {
+  backgroundColor: string;
+  color: string;
+  source: string;
+} {
+  /**
+   * Canonicalizes any CSS color the browser can parse (rgb()/rgba(), hex,
+   * hsl(), color(srgb ...), oklch()/oklab()/lab()) through the canvas
+   * context's fillStyle serialization: '#rrggbb' for opaque sRGB colors,
+   * 'rgba(r, g, b, a)' otherwise. Unparseable values pass through raw.
+   */
+  const canonical = (value: string): string => {
+    try {
+      const context = document.createElement('canvas').getContext('2d');
+      if (context !== null) {
+        context.fillStyle = '#010203';
+        context.fillStyle = value;
+        if (context.fillStyle !== '#010203') return context.fillStyle;
+      }
+    } catch {
+      // Fall through to the raw value.
+    }
+    return value;
   };
+  /** True for canonical colors that paint an opaque surface. */
+  const opaque = (value: string): boolean => {
+    const trimmed = value.trim();
+    const rgba = /^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*(?:,\s*([\d.]+)\s*)?\)$/.exec(
+      trimmed,
+    );
+    if (rgba !== null) return rgba[4] === undefined || Number(rgba[4]) > 0;
+    return /^#[0-9a-f]{3}$/.test(trimmed) || /^#[0-9a-f]{6}$/.test(trimmed);
+  };
+
+  const bodyStyle = getComputedStyle(document.body);
+  const color = canonical(bodyStyle.color);
+  const candidates: Array<{ value: string; source: string }> = [
+    { value: canonical(bodyStyle.backgroundColor), source: 'body' },
+    {
+      value: canonical(getComputedStyle(document.documentElement).backgroundColor),
+      source: 'root',
+    },
+  ];
+  // Painted-surface chain: when body and root stay transparent, the surface
+  // that paints under the frame corner is the effective canvas.
+  let surface: Element | null = document.elementFromPoint(1, 1);
+  while (surface !== null) {
+    candidates.push({
+      value: canonical(getComputedStyle(surface).backgroundColor),
+      source: 'painted-element',
+    });
+    surface = surface.parentElement;
+  }
+  for (const candidate of candidates) {
+    if (opaque(candidate.value)) {
+      return { backgroundColor: candidate.value, color, source: candidate.source };
+    }
+  }
+  // Fully transparent canvas: rendered-pixel grounding decides downstream.
+  return { backgroundColor: '', color, source: 'rendered-pixels' };
 }
 
 /**
@@ -166,13 +232,24 @@ export function normalizeColorToHex(value: string): string | null {
   return null;
 }
 
-/** Extracts the computed `document.body` canvas theme (spec s4.1). */
+/**
+ * Extracts the effective canvas theme (spec s4.1): the computed body
+ * background when it paints, otherwise the root/painted-surface fallback.
+ * Returns undefined for a fully transparent canvas — the crawler then
+ * grounds the color in the rendered pixels rather than defaulting to white.
+ */
 export async function extractCanvasTheme(page: Page): Promise<CanvasTheme | undefined> {
   const computed = await page.evaluate(collectBodyComputedStyle);
   const backgroundColor = normalizeColorToHex(computed.backgroundColor);
   if (backgroundColor === null) return undefined;
 
-  const canvas: CanvasTheme = { backgroundColor };
+  const source: CanvasBackgroundSource =
+    computed.source === 'root' ||
+    computed.source === 'painted-element' ||
+    computed.source === 'rendered-pixels'
+      ? computed.source
+      : 'body';
+  const canvas: CanvasTheme = { backgroundColor, source };
   const color = normalizeColorToHex(computed.color);
   if (color !== null) canvas.color = color;
   return canvas;
@@ -487,6 +564,8 @@ export interface RawTextSpan {
   boxHeight: number;
   tag: string;
   parentTag: string;
+  /** True when the text renders inside preformatted/code content. */
+  preformatted?: boolean;
   /** Computed `font-size` (e.g. `30px`); optional on legacy fixtures. */
   fontSize?: string;
   /** Computed `font-weight` (e.g. `900`). */
@@ -596,6 +675,9 @@ export function buildTextSpans(raw: RawTextSpan[]): TextSpan[] {
     if (isGradientText(entry)) span.gradient = entry.backgroundImage;
     const style = buildTextStyle(entry);
     if (style !== undefined) span.style = style;
+    // Preformatted/code provenance: documented value tokens (`undefined`,
+    // `${…}` interpolation) are genuine copy inside code content.
+    if (entry.preformatted === true) span.preformatted = true;
     // Link target replay: only spans actually rendered inside an anchor carry
     // an href — synthesizers must never invent one for plain text.
     if (entry.href !== undefined && entry.href.length > 0) span.href = entry.href;
@@ -651,6 +733,19 @@ function collectRawTextSpans(): RawTextSpan[] {
     return '';
   };
 
+  // Preformatted/code ancestor lookup (pre/code/kbd/samp/var/tt) — internal
+  // to this evaluated closure (patch spec s2.1 Rule 1). Marks spans whose
+  // text is documented code content rather than prose.
+  const preformattedAncestor = (el: Element | null): boolean => {
+    const CODE_TAGS = new Set(['pre', 'code', 'kbd', 'samp', 'var', 'tt']);
+    let current: Element | null = el;
+    while (current !== null) {
+      if (CODE_TAGS.has(current.tagName.toLowerCase())) return true;
+      current = current.parentElement;
+    }
+    return false;
+  };
+
   while (walker.nextNode()) {
     const textNode = walker.currentNode as Text;
     const text = textNode.textContent ?? '';
@@ -678,6 +773,7 @@ function collectRawTextSpans(): RawTextSpan[] {
       boxHeight: rect.height,
       tag,
       parentTag,
+      preformatted: preformattedAncestor(element),
       fontSize: style.fontSize,
       fontWeight: style.fontWeight,
       lineHeight: style.lineHeight,

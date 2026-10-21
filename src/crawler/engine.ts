@@ -46,6 +46,7 @@ import {
   BotBlockedError,
   checkCaptureHealth,
   classifyRedirect,
+  deriveRenderedCanvasTheme,
   detectBotBlock,
 } from './health.js';
 import type { CaptureHealth } from './health.js';
@@ -526,8 +527,11 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         skip(entry.url, readinessNote);
       }
 
-      // Viewport-gated full-page screenshots (patch spec s3.2). Captured at
-      // the top of the page; full-page mode records below-the-fold content.
+      // Screenshot capture contract (patch spec s3.2): the canonical evidence
+      // frames are the exact capture viewports (desktop 1280x800, mobile
+      // 390x844). Full-page frames are auxiliary below-fold evidence and the
+      // cropping source for visual-asset extraction. Everything is captured
+      // at the top of the page in fresh viewport state.
       const slug = slugForPath(path);
       const desktopScreenshot = captureDesktop
         ? join(screenshotsDir, `${slug}-desktop.png`)
@@ -535,20 +539,27 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
       const mobileScreenshot = captureMobile
         ? join(screenshotsDir, `${slug}-mobile.png`)
         : null;
+      const desktopFullPageScreenshot = captureDesktop
+        ? join(screenshotsDir, `${slug}-desktop-fullpage.png`)
+        : null;
+      const mobileFullPageScreenshot = captureMobile
+        ? join(screenshotsDir, `${slug}-mobile-fullpage.png`)
+        : null;
       // Per-viewport typography evidence: measured while the mobile layout is
       // active so the corpus carries the mobile type scale and wrapping.
       let mobileTextSpans: TextSpan[] | undefined;
 
       if (captureDesktop) {
         await ensureCaptureViewport(DESKTOP_VIEWPORT);
-        await page.screenshot({ path: desktopScreenshot as string, type: 'png', fullPage: true });
+        await page.screenshot({ path: desktopScreenshot as string, type: 'png' });
+        await page.screenshot({ path: desktopFullPageScreenshot as string, type: 'png', fullPage: true });
         // Visual bounding-box asset extraction (screenshot-to-code pattern):
         // crop background-image / canvas / svg / unmirrorable <img> surfaces —
         // which have no mirrored <img> source — out of the just-captured
         // full-page PNG. Generic wrapper divs are never cropped for size.
         const desktopVisuals = await extractVisualAssets(
           page,
-          desktopScreenshot as string,
+          desktopFullPageScreenshot as string,
           assetsDir,
           usedVisualNames,
         );
@@ -559,13 +570,14 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
       }
       if (captureMobile) {
         await ensureCaptureViewport(MOBILE_VIEWPORT);
-        await page.screenshot({ path: mobileScreenshot as string, type: 'png', fullPage: true });
+        await page.screenshot({ path: mobileScreenshot as string, type: 'png' });
+        await page.screenshot({ path: mobileFullPageScreenshot as string, type: 'png', fullPage: true });
         if (!captureDesktop) {
           // Mobile-only crawl: extract against the mobile screenshot while the
           // mobile layout (and therefore its bounding boxes) is active.
           const mobileVisuals = await extractVisualAssets(
             page,
-            mobileScreenshot as string,
+            mobileFullPageScreenshot as string,
             assetsDir,
             usedVisualNames,
           );
@@ -603,6 +615,19 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
       // DOM snapshot + a11y tree + design tokens + text corpus (shared
       // harvester logic), captured at rest at the top of the page.
       const snapshot = await captureDOMSnapshot(page, path);
+
+      // Canvas grounding (spec s4.1): when the page paints no computed
+      // background on <body>/<html> (fully transparent canvas), ground
+      // tokens.canvas.backgroundColor in the rendered pixels instead of
+      // letting downstream consumers default it to white.
+      if (snapshot.tokens.canvas === undefined) {
+        const groundingSource =
+          desktopFullPageScreenshot ?? desktopScreenshot ?? mobileFullPageScreenshot ?? mobileScreenshot;
+        if (groundingSource !== null) {
+          const rendered = deriveRenderedCanvasTheme(await readFile(groundingSource));
+          if (rendered !== undefined) snapshot.tokens.canvas = rendered;
+        }
+      }
 
       // SEO / OpenGraph metadata extraction.
       const metadata = await extractRouteMetadata(page, title);
@@ -662,6 +687,14 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
           mobileScreenshot === null
             ? null
             : toEvidenceRelativePath(evidenceDir, mobileScreenshot),
+        desktopFullPageScreenshot:
+          desktopFullPageScreenshot === null
+            ? null
+            : toEvidenceRelativePath(evidenceDir, desktopFullPageScreenshot),
+        mobileFullPageScreenshot:
+          mobileFullPageScreenshot === null
+            ? null
+            : toEvidenceRelativePath(evidenceDir, mobileFullPageScreenshot),
         metadata,
         a11yTree: snapshot.a11yTree,
         tokens: snapshot.tokens,
