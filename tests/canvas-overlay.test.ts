@@ -18,6 +18,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { decodeCanvasDataUrl } from '../dist/crawler/visual-assets.js';
+import { parseImageDimensions } from '../dist/synthesizer/vision.js';
 
 const SRC_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -64,4 +65,38 @@ test('canvas-overlay > synthesis annotates and honors viewport overlays', async 
   const types = await readFile(join(SRC_ROOT, 'src', 'types.ts'), 'utf8');
   assert.ok(types.includes('canvasOverlay?: CanvasOverlayMeta'));
   assert.ok(types.includes("source: 'element-buffer' | 'screenshot-crop'"));
+});
+
+// ---------------------------------------------------------------------------
+// Asset map image descriptors (screenshot <-> file mapping evidence)
+// ---------------------------------------------------------------------------
+
+test('image descriptors > parseImageDimensions reads PNG/JPEG/GIF/SVG headers', () => {
+  // PNG: signature + IHDR width/height.
+  const png = new Uint8Array(24);
+  png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
+  new DataView(png.buffer).setUint32(16, 1280);
+  new DataView(png.buffer).setUint32(20, 800);
+  assert.deepEqual(parseImageDimensions(png), { width: 1280, height: 800 });
+
+  // JPEG: SOI + SOF0 frame header (precision, height, width).
+  const jpeg = Uint8Array.from([
+    0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x01, 0x2c, 0x02, 0x80, 0x03,
+  ]);
+  assert.deepEqual(parseImageDimensions(jpeg), { width: 640, height: 300 });
+
+  // GIF: little-endian u16 dims.
+  const gif = new Uint8Array(10);
+  gif.set([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]);
+  new DataView(gif.buffer).setUint16(6, 48, true);
+  new DataView(gif.buffer).setUint16(8, 24, true);
+  assert.deepEqual(parseImageDimensions(gif), { width: 48, height: 24 });
+
+  // SVG: width/height attributes.
+  const svg = new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg" width="96" height="48"></svg>');
+  assert.deepEqual(parseImageDimensions(svg), { width: 96, height: 48 });
+
+  // Unrecognized headers yield null instead of guessing.
+  assert.equal(parseImageDimensions(new Uint8Array(32)), null);
+  assert.equal(parseImageDimensions(new TextEncoder().encode('plain text')), null);
 });

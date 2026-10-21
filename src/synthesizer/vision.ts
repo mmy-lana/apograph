@@ -177,31 +177,177 @@ export function formatTokensForVisionPrompt(tokens: DesignTokens): string {
   ].join('\n');
 }
 
-/** Serializes the mirrored-asset map for prompt embedding. */
-export function formatAssetMapForPrompt(
+/** Intrinsic pixel dimensions parsed from an image file header. */
+export interface ImageDimensions {
+  width: number;
+  height: number;
+}
+
+/**
+ * Parses intrinsic image dimensions from file-header bytes (PNG, JPEG, GIF,
+ * WebP, SVG) without decoding pixel data. Pure and synchronous; returns null
+ * for unrecognized headers.
+ */
+export function parseImageDimensions(head: Uint8Array): ImageDimensions | null {
+  const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
+  const ascii = (start: number, length: number): string =>
+    Array.from(head.subarray(start, start + length))
+      .map((byte) => String.fromCharCode(byte))
+      .join('');
+
+  // PNG: 8-byte signature, IHDR width/height at 16/20 (big-endian u32).
+  if (head.length >= 24 && ascii(1, 3) === 'PNG') {
+    return { width: view.getUint32(16), height: view.getUint32(20) };
+  }
+  // GIF: 'GIF87a'/'GIF89a', little-endian u16 dims at 6/8.
+  if (head.length >= 10 && ascii(0, 3) === 'GIF') {
+    return { width: view.getUint16(6, true), height: view.getUint16(8, true) };
+  }
+  // JPEG: walk segment markers to a SOF frame header.
+  if (head.length >= 4 && head[0] === 0xff && head[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 9 < head.length) {
+      if (head[offset] !== 0xff) {
+        offset += 1;
+        continue;
+      }
+      const marker = head[offset + 1];
+      if (
+        marker === undefined ||
+        marker === 0xd8 ||
+        marker === 0x01 ||
+        (marker >= 0xd0 && marker <= 0xd7)
+      ) {
+        offset += 2;
+        continue;
+      }
+      const isSof =
+        marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+      if (isSof) {
+        return { height: view.getUint16(offset + 5), width: view.getUint16(offset + 7) };
+      }
+      const length = view.getUint16(offset + 2);
+      if (length < 2) break;
+      offset += 2 + length;
+    }
+    return null;
+  }
+  // WebP: 'RIFF'....'WEBP' + VP8X / VP8L / VP8 chunk dimensions.
+  if (head.length >= 30 && ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') {
+    const chunk = ascii(12, 4);
+    if (chunk === 'VP8X') {
+      const width = 1 + (head[24] ?? 0) + ((head[25] ?? 0) << 8) + ((head[26] ?? 0) << 16);
+      const height = 1 + (head[27] ?? 0) + ((head[28] ?? 0) << 8) + ((head[29] ?? 0) << 16);
+      return { width, height };
+    }
+    if (chunk === 'VP8L' && head[20] === 0x2f) {
+      const bits = view.getUint32(21, true);
+      return { width: 1 + (bits & 0x3fff), height: 1 + ((bits >>> 14) & 0x3fff) };
+    }
+    if (chunk === 'VP8 ' && head[23] === 0x9d && head[24] === 0x01 && head[25] === 0x2a) {
+      return {
+        width: view.getUint16(26, true) & 0x3fff,
+        height: view.getUint16(28, true) & 0x3fff,
+      };
+    }
+    return null;
+  }
+  // SVG: width/height attributes, else the viewBox.
+  const text = new TextDecoder('latin1').decode(head.subarray(0, 8192));
+  if (/<svg[\s>]/i.test(text)) {
+    const size = /\bwidth\s*=\s*["']?([\d.]+)/i.exec(text);
+    const heightAttr = /\bheight\s*=\s*["']?([\d.]+)/i.exec(text);
+    if (size !== null && heightAttr !== null) {
+      return { width: Math.round(Number(size[1])), height: Math.round(Number(heightAttr[1])) };
+    }
+    const viewBox = /\bviewBox\s*=\s*["'][^"']*?\s([\d.]+)\s+([\d.]+)["']/i.exec(text);
+    if (viewBox !== null) {
+      return { width: Math.round(Number(viewBox[1])), height: Math.round(Number(viewBox[2])) };
+    }
+  }
+  return null;
+}
+
+/** Human-readable scale hint so the model can map files onto screenshot regions. */
+function scaleHint(dimensions: ImageDimensions | null, mimeType: string | undefined): string {
+  if (mimeType?.includes('svg')) return 'vector logo/icon';
+  if (dimensions === null) return 'image';
+  const area = dimensions.width * dimensions.height;
+  if (area >= 500_000) return 'hero/banner-scale surface';
+  if (area >= 50_000) return 'section-scale image';
+  return 'inline image/icon';
+}
+
+/** Bytes read from each asset file to parse its header (dimensions only). */
+const ASSET_HEADER_BYTES = 256 * 1024;
+
+/**
+ * Serializes the mirrored-asset map for prompt embedding.
+ *
+ * Each entry carries its intrinsic pixel dimensions and a scale hint so a
+ * vision model can map hash-named files onto the regions it sees in the
+ * route screenshots; captured-region crops (screenshot crops with a role
+ * name) are listed first — they are the rendered pixels of a known region —
+ * then entries are ordered largest-surface-first.
+ */
+export async function formatAssetMapForPrompt(
   assets: Array<{
     originalUrl: string;
     localPath: string | null;
     status: string;
+    mimeType?: string;
+    kind?: string;
+    suggestedName?: string;
     canvasOverlay?: { opacity: number; position: string; coversViewport: boolean };
   }>,
-): string {
+): Promise<string> {
   const downloaded = assets.filter(
     (asset) => asset.status === 'downloaded' && asset.localPath !== null,
   );
   if (downloaded.length === 0) return '(no mirrored assets)';
 
-  return downloaded
-    .map((asset) => {
-      const filename = asset.localPath?.split('/').pop() ?? '';
-      const overlay = asset.canvasOverlay;
-      const overlayNote =
-        overlay !== undefined && overlay.coversViewport
-          ? `  [viewport overlay — ${overlay.position} full-viewport layer at opacity ${overlay.opacity}]`
-          : '';
-      return `  /assets/${filename}  <-  ${asset.originalUrl}${overlayNote}`;
-    })
-    .join('\n');
+  const described = await Promise.all(
+    downloaded.map(async (asset) => {
+      let dimensions: ImageDimensions | null = null;
+      try {
+        const head = await readFile(asset.localPath as string);
+        dimensions = parseImageDimensions(
+          head.subarray(0, Math.min(head.length, ASSET_HEADER_BYTES)),
+        );
+      } catch {
+        // Unreadable file — emit the entry without dimensions.
+      }
+      return { asset, dimensions };
+    }),
+  );
+  described.sort((a, b) => {
+    const rankA = a.asset.suggestedName !== undefined && a.asset.suggestedName.length > 0 ? 1 : 0;
+    const rankB = b.asset.suggestedName !== undefined && b.asset.suggestedName.length > 0 ? 1 : 0;
+    if (rankA !== rankB) return rankB - rankA;
+    const areaA = a.dimensions === null ? 0 : a.dimensions.width * a.dimensions.height;
+    const areaB = b.dimensions === null ? 0 : b.dimensions.width * b.dimensions.height;
+    return areaB - areaA;
+  });
+
+  const lines = described.map(({ asset, dimensions }) => {
+    const filename = asset.localPath?.split('/').pop() ?? '';
+    const overlay = asset.canvasOverlay;
+    const overlayNote =
+      overlay !== undefined && overlay.coversViewport
+        ? `  [viewport overlay — ${overlay.position} full-viewport layer at opacity ${overlay.opacity}]`
+        : '';
+    const dims =
+      dimensions !== null ? `${dimensions.width}x${dimensions.height}` : 'size unknown';
+    const roleNote =
+      asset.suggestedName !== undefined && asset.suggestedName.length > 0
+        ? `; captured region "${asset.suggestedName}" — this crop IS the rendered pixels of that region, use it directly for it`
+        : '';
+    return `  /assets/${filename}  <-  ${asset.originalUrl}  [${dims} — ${scaleHint(dimensions, asset.mimeType)}${roleNote}]${overlayNote}`;
+  });
+  lines.unshift(
+    '  (captured-region crops and largest surfaces first; a captured region crop is the exact rendered pixels of that region — use it as that region\'s image/background; match other files to the screenshot regions by pixel size, aspect ratio, and content)',
+  );
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------------

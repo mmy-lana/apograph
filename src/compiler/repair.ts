@@ -162,6 +162,131 @@ export function selectRepairTargets(
 }
 
 // ---------------------------------------------------------------------------
+// Deterministic truncation healing
+// ---------------------------------------------------------------------------
+
+/** tsc syntax-error codes that mark where a truncated emission broke. */
+const TRUNCATION_SYNTAX_CODES = new Set([
+  'TS1002',
+  'TS1003',
+  'TS1005',
+  'TS1109',
+  'TS1127',
+  'TS1128',
+]);
+
+/** Safe single-token closers a `TS1005: '<x>' expected` can demand. */
+const EXPECTED_TOKEN_CLOSERS = new Map<string, string>([
+  ['}', '}'],
+  [')', ')'],
+  [']', ']'],
+  [';', ';'],
+  [',', ','],
+]);
+
+/**
+ * Minimum fraction of the file the parse must reach before a syntax error is
+ * treated as an end-of-emission break rather than a real mid-file bug.
+ */
+const TRUNCATION_TAIL_FRACTION = 0.75;
+
+/**
+ * Upper bound on deterministic truncation-healing rounds per repair loop:
+ * one round closes the JSX stack, follow-up rounds append closers that only
+ * surfaced after the previous reparse.
+ */
+const MAX_TRUNCATION_HEAL_ROUNDS = 3;
+
+/** Maps a 1-based (line, column) diagnostic position to a string offset. */
+function offsetAt(content: string, line: number, column: number): number {
+  const lines = content.split('\n');
+  const index = Math.min(Math.max(line, 1), lines.length) - 1;
+  let offset = 0;
+  for (let i = 0; i < index; i += 1) offset += (lines[i] as string).length + 1;
+  return offset + Math.max(column - 1, 0);
+}
+
+/**
+ * Deterministically completes an emission that was cut off mid-file.
+ *
+ * Truncation leaves a characteristic diagnostic shape: `TS17008` "JSX element
+ * '<x>' has no corresponding closing tag" for every still-open element, plus
+ * (sometimes) a syntax error where the parse ran off the end. The rewrite
+ * excises the partial tail at the break point, closes the open JSX elements
+ * in reverse opening order, and appends any explicitly expected closers
+ * (`')' expected`, `'}' expected`) — turning a dropped completion into a
+ * compilable file with its surviving content instead of abandoning the whole
+ * page to a template.
+ *
+ * Returns null when the diagnostics are not truncation-shaped: real syntax
+ * bugs in the middle of a file never trigger the rewrite.
+ */
+export function completeTruncatedSource(
+  content: string,
+  diagnostics: readonly CompilerDiagnostic[],
+): string | null {
+  const unclosed: Array<{ tag: string; offset: number }> = [];
+  const expectedClosers: string[] = [];
+  let breakOffset: number | null = null;
+
+  for (const diagnostic of diagnostics) {
+    const tagMatch = /JSX element '([^']+)' has no corresponding closing tag/.exec(
+      diagnostic.message,
+    );
+    if (diagnostic.code === 'TS17008' && tagMatch !== null) {
+      unclosed.push({
+        tag: tagMatch[1] as string,
+        offset: offsetAt(content, diagnostic.line, diagnostic.column),
+      });
+      continue;
+    }
+    if (!TRUNCATION_SYNTAX_CODES.has(diagnostic.code)) continue;
+    const offset = offsetAt(content, diagnostic.line, diagnostic.column);
+    if (breakOffset === null || offset < breakOffset) breakOffset = offset;
+    const expected = /TS\d+: '([^']*)' expected/.exec(diagnostic.message);
+    const closer = expected !== null ? EXPECTED_TOKEN_CLOSERS.get(expected[1] as string) : undefined;
+    if (closer !== undefined && !expectedClosers.includes(closer)) expectedClosers.push(closer);
+  }
+
+  if (unclosed.length === 0 && breakOffset === null) return null;
+
+  const lastUnclosedAt = unclosed.reduce((max, entry) => Math.max(max, entry.offset), 0);
+  const tailStart = Math.floor(content.length * TRUNCATION_TAIL_FRACTION);
+  if (unclosed.length === 0) {
+    // No open JSX stack: a tail syntax error alone only justifies appending
+    // explicitly expected closers — never cutting content away.
+    if (breakOffset === null || breakOffset < tailStart || expectedClosers.length === 0) {
+      return null;
+    }
+    return `${content.trimEnd()}\n${expectedClosers.join('\n')}`;
+  }
+
+  if (breakOffset !== null) {
+    // A break before the open elements or before the tail is a real syntax
+    // bug, not an end-of-emission cut — leave the file to the repair model.
+    if (breakOffset < lastUnclosedAt || breakOffset < tailStart) return null;
+  }
+
+  let kept = content;
+  if (breakOffset !== null) {
+    kept = kept.slice(0, breakOffset);
+    // Drop the partial line the break landed in.
+    const lastNewline = kept.lastIndexOf('\n');
+    kept = lastNewline === -1 ? '' : kept.slice(0, lastNewline + 1);
+    kept = kept.replace(/\s+$/, '');
+    if (kept.trim().length === 0) return null;
+  }
+
+  const closers = [...unclosed]
+    .sort((a, b) => b.offset - a.offset)
+    .map((entry) => `</${entry.tag}>`);
+  let healed = kept;
+  if (closers.length > 0) healed += `\n${closers.join('')}`;
+  for (const closer of expectedClosers) healed += `\n${closer}`;
+  return healed === content ? null : healed;
+}
+
+// ---------------------------------------------------------------------------
 // Dependency installation (shared order: pnpm, then npm)
 // ---------------------------------------------------------------------------
 
@@ -252,6 +377,37 @@ export async function runCompilerRepairLoop(
     ? Math.max(options.maxTurns ?? 0, 0)
     : 0;
   let turns = 0;
+
+  // Deterministic truncation healing (bounded fixpoint, zero LLM cost): an
+  // emission cut off mid-file is completed from its own diagnostics before a
+  // repair turn is spent on it. Never counted as a repair turn — it only
+  // rewrites files whose diagnostics are truncation-shaped.
+  for (let round = 0; round < MAX_TRUNCATION_HEAL_ROUNDS && !tsc.ok; round += 1) {
+    const byFile = new Map<string, CompilerDiagnostic[]>();
+    for (const diagnostic of parseTscDiagnostics(tsc.output)) {
+      const list = byFile.get(diagnostic.file) ?? [];
+      list.push(diagnostic);
+      byFile.set(diagnostic.file, list);
+    }
+    let healed = 0;
+    for (const [file, fileDiagnostics] of byFile) {
+      const filePath = join(root, file);
+      let content: string;
+      try {
+        content = await readFile(filePath, 'utf8');
+      } catch {
+        continue; // Diagnostic points at a missing file — skip it.
+      }
+      const completed = completeTruncatedSource(content, fileDiagnostics);
+      if (completed === null) continue;
+      await writeFile(filePath, completed, 'utf8');
+      if (!repairedFiles.includes(file)) repairedFiles.push(file);
+      errorsBefore.push(...fileDiagnostics.map((diagnostic) => diagnostic.message));
+      healed += 1;
+    }
+    if (healed === 0) break;
+    tsc = await options.run('npx', tscArgs, root);
+  }
 
   for (let turn = 0; turn < maxTurns && !tsc.ok; turn += 1) {
     const targets = selectRepairTargets(parseTscDiagnostics(tsc.output), {

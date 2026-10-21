@@ -21,6 +21,7 @@ import { dirname, join } from 'node:path';
 
 import { parseTscDiagnostics, runTier1Build } from '../dist/verifier/engine.js';
 import type { CommandResult, Tier1Deps } from '../dist/verifier/engine.js';
+import { completeTruncatedSource, runCompilerRepairLoop } from '../dist/compiler/repair.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures & harness
@@ -341,6 +342,137 @@ test('build repair > path traversal diagnostics are ignored', async () => {
     await runTier1Build(project, deps);
 
     assert.equal(repairs.length, 0, 'out-of-project files must never be repaired');
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Deterministic truncation healing
+// ---------------------------------------------------------------------------
+
+/** A page emission cut off mid-JSX at the end of the file. */
+const TRUNCATED_PAGE = [
+  'export function HomePage() {',
+  '  return (',
+  '    <main className="page">',
+  '      <section className="hero">',
+  '        <h1>Welcome to the page',
+].join('\n');
+
+/** tsc diagnostics for {@link TRUNCATED_PAGE} (unclosed stack + tail break). */
+const TRUNCATED_PAGE_ERRORS = [
+  'src/pages/HomePage.tsx(3,5): error TS17008: JSX element \'main\' has no corresponding closing tag.',
+  'src/pages/HomePage.tsx(4,7): error TS17008: JSX element \'section\' has no corresponding closing tag.',
+  'src/pages/HomePage.tsx(5,9): error TS17008: JSX element \'h1\' has no corresponding closing tag.',
+  "src/pages/HomePage.tsx(5,30): error TS1005: '</' expected.",
+].join('\n');
+
+test('truncation heal > closes the JSX stack of an emission cut off mid-file', () => {
+  const healed = completeTruncatedSource(
+    TRUNCATED_PAGE,
+    parseTscDiagnostics(TRUNCATED_PAGE_ERRORS),
+  );
+  assert.equal(
+    healed,
+    [
+      'export function HomePage() {',
+      '  return (',
+      '    <main className="page">',
+      '      <section className="hero">',
+      '</h1></section></main>',
+    ].join('\n'),
+  );
+});
+
+test('truncation heal > appends explicitly expected closers at EOF', () => {
+  const content = ['export function App() {', '  return (', '    <main />', '  );', ''].join('\n');
+  const healed = completeTruncatedSource(
+    content,
+    parseTscDiagnostics("src/App.tsx(5,1): error TS1005: '}' expected."),
+  );
+  assert.equal(healed, `${content.trimEnd()}\n}`);
+});
+
+test('truncation heal > only TS17008 (no break) appends closers without cutting', () => {
+  const content = ['export function App() {', '  return (', '    <main>'].join('\n');
+  const healed = completeTruncatedSource(
+    content,
+    parseTscDiagnostics(
+      "src/App.tsx(3,5): error TS17008: JSX element 'main' has no corresponding closing tag.",
+    ),
+  );
+  assert.equal(healed, `${content}\n</main>`);
+});
+
+test('truncation heal > real mid-file syntax bugs are never rewritten', () => {
+  // A syntax break in the first quarter of the file is a genuine bug, not an
+  // end-of-emission cut.
+  const content = [
+    'export function App() {',
+    '  return ( <main />',
+    '  );',
+    ...Array.from({ length: 12 }, (_, index) => `  const pad${index} = ${index};`),
+    '}',
+  ].join('\n');
+  const healed = completeTruncatedSource(
+    content,
+    parseTscDiagnostics("src/App.tsx(2,18): error TS1005: ')' expected."),
+  );
+  assert.equal(healed, null);
+
+  // Pure type errors are not truncation-shaped at all.
+  assert.equal(
+    completeTruncatedSource(content, parseTscDiagnostics(CLASSIC_TS2322)),
+    null,
+  );
+});
+
+test('truncation heal > repair loop completes truncated files without LLM turns', async () => {
+  const project = await makeProject({ 'src/pages/HomePage.tsx': `${TRUNCATED_PAGE}\n` });
+  try {
+    const tscQueue: CommandResult[] = [
+      { ok: false, output: TRUNCATED_PAGE_ERRORS },
+      {
+        ok: false,
+        output: [
+          "src/pages/HomePage.tsx(6,1): error TS1005: ')' expected.",
+          "src/pages/HomePage.tsx(6,2): error TS1005: '}' expected.",
+        ].join('\n'),
+      },
+      { ok: true, output: '' },
+    ];
+    const repairs: string[] = [];
+    const result = await runCompilerRepairLoop(project, {
+      run: async (_command, args) => {
+        assert.ok(args.includes('tsc'));
+        const next = tscQueue.shift();
+        assert.ok(next !== undefined, 'unexpected tsc invocation');
+        return next;
+      },
+      repairFile: async (filePath) => {
+        repairs.push(filePath);
+        return '';
+      },
+      maxTurns: 2,
+    });
+
+    assert.deepEqual(repairs, [], 'deterministic healing must not spend LLM turns');
+    assert.equal(result.turns, 0);
+    assert.ok(result.tsc.ok);
+    const healed = await readFile(join(project, 'src/pages/HomePage.tsx'), 'utf8');
+    assert.equal(
+      healed,
+      [
+        'export function HomePage() {',
+        '  return (',
+        '    <main className="page">',
+        '      <section className="hero">',
+        '</h1></section></main>',
+        ')',
+        '}',
+      ].join('\n'),
+    );
   } finally {
     await rm(project, { recursive: true, force: true });
   }

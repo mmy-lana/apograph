@@ -956,6 +956,7 @@ export async function synthesizeModularProject(
   const layoutScreenshots = layoutRoute
     ? await loadRouteScreenshots(layoutRoute, evidenceDir)
     : [];
+  const layoutAssetMap = await formatAssetMapForPrompt(manifest.assets);
 
   const layoutPrompt = [
     'Synthesize the shared layout components for this application.',
@@ -975,7 +976,7 @@ export async function synthesizeModularProject(
     formatTokensForVisionPrompt(layoutRoute?.tokens ?? plan.designSystem),
     '',
     'Mirrored image assets (reference as /assets/<filename>):',
-    formatAssetMapForPrompt(manifest.assets),
+    layoutAssetMap,
     '',
     'Accessibility tree of the reference homepage:',
     layoutRoute ? formatA11yTreeForVisionPrompt(layoutRoute.a11yTree) : '(not captured)',
@@ -1100,6 +1101,9 @@ export async function synthesizeModularProject(
     const screenshots = [...routeScreenshots, ...modalScreenshots];
 
     const routeCanvas = manifestRoute?.tokens.canvas?.backgroundColor ?? canvasColor;
+    const routeAssetMap = await formatAssetMapForPrompt(
+      routeScopedAssets(manifest.assets, route.path),
+    );
     const siblingRoutes = included
       .filter((r) => r.path !== route.path)
       .map((r) => `- ${r.path} ("${r.title.length > 0 ? r.title : r.componentName}")`)
@@ -1132,7 +1136,7 @@ export async function synthesizeModularProject(
       formatTokensForVisionPrompt(manifestRoute?.tokens ?? plan.designSystem),
       '',
       'Mirrored image assets (reference as /assets/<filename>):',
-      formatAssetMapForPrompt(routeScopedAssets(manifest.assets, route.path)),
+      routeAssetMap,
       '',
       'Accessibility tree of the reference page:',
       manifestRoute ? formatA11yTreeForVisionPrompt(manifestRoute.a11yTree) : '(not captured)',

@@ -52,6 +52,7 @@ export const FILE_EMISSION_CONTRACT = [
   '```tsx',
   '<complete file content>',
   '```',
+  'Start your response immediately with the first `### File:` section — no preamble.',
   'Emit one section per file. Keep every file complete and compile-ready.',
   'Do not wrap file contents in a JSON object or JSON string fields.',
 ].join('\n');
@@ -64,23 +65,35 @@ const FILE_EXTRACTION_TURN_CONTRACT = [
   '```tsx',
   '<complete file content>',
   '```',
-  'One section per file. No JSON, no commentary, no truncation.',
+  'Start immediately with the first `### File:` section. One section per file.',
+  'No JSON, no commentary, no preamble, no truncation.',
 ].join('\n');
 
 /**
- * Hard per-stage timeout cap for one model request (180 s). An upstream
- * model that hangs or streams slower than acceptable aborts the stage
- * cleanly instead of holding the pipeline for 15+ minutes. Override via
+ * Hard per-stage timeout cap for one model request (600 s). Large route-page
+ * files streamed through slow gateways need headroom: a cap below the model's
+ * emission time aborts healthy mid-stream generations. An upstream model
+ * that hangs or streams slower than acceptable still aborts the stage
+ * cleanly instead of holding the pipeline unbounded. Override via
  * `APOGRAPH_LLM_TIMEOUT_MS` for slower local models — still capped.
  */
-export const MAX_STAGE_TIMEOUT_MS = 180_000;
+export const MAX_STAGE_TIMEOUT_MS = 600_000;
 
-/** Default per-stage timeout when no override is configured (180 s). */
+/**
+ * Output-token ceiling for one generation call. Providers that leave
+ * `max_tokens` unset often default to a small completion window, which
+ * truncates large route-page files mid-fence; requesting a generous ceiling
+ * keeps whole files within one reply. Providers clamp to their own model
+ * limits.
+ */
+export const GENERATION_MAX_OUTPUT_TOKENS = 32_768;
+
+/** Default per-stage timeout when no override is configured (600 s). */
 const DEFAULT_LLM_TIMEOUT_MS = MAX_STAGE_TIMEOUT_MS;
 
 /**
  * Resolves the effective per-stage generation timeout: the configured
- * `APOGRAPH_LLM_TIMEOUT_MS` (or the 180 s default) clamped to
+ * `APOGRAPH_LLM_TIMEOUT_MS` (or the 600 s default) clamped to
  * {@link MAX_STAGE_TIMEOUT_MS}. Exported for tests.
  */
 export function resolveLlmTimeoutMs(): number {
@@ -393,16 +406,18 @@ function isStructuredOutputUnsupported(error: unknown): boolean {
 }
 
 /**
- * True when the provider's response body failed JSON parsing
- * (`@ai-sdk/provider-utils` throws `APICallError("Invalid JSON response")`
- * when a gateway returns a body its response schema cannot read — e.g. an
- * error payload masked behind HTTP 200, or a large completion truncated
- * mid-body). Distinct from model-output parse failures; the retry policy
- * treats 2xx instances as transient provider faults.
+ * True when the provider's response body failed provider-utils processing
+ * (`@ai-sdk/provider-utils` wraps 2xx postprocessing faults in
+ * `APICallError("Failed to process successful response")` and body-schema
+ * faults in `APICallError("Invalid JSON response")` — e.g. an error payload
+ * masked behind HTTP 200, an SSE stream cut mid-body, or a large completion
+ * truncated before the response schema could read it). Distinct from
+ * model-output parse failures; the retry policy treats 2xx instances as
+ * transient provider faults.
  */
 function isProviderBodyParseFailure(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
-  return /invalid json response/i.test(error.message);
+  return /invalid json response|failed to process successful response/i.test(error.message);
 }
 
 /**
@@ -503,6 +518,30 @@ const FILE_SECTION_HEADER_RE =
 const FENCED_FILE_BODY_RE =
   /```[a-zA-Z0-9_+.-]*[ \t]*\r?\n([\s\S]*?)\r?\n?[ \t]*`{3,}[ \t]*(?=\r?\n|$)/;
 
+/**
+ * A truncated fenced code block: an opening fence with no closing fence
+ * before the end of the text. Used to salvage the last file of a response
+ * that the provider's output cap cut off mid-file.
+ */
+const FENCED_FILE_DANGLING_RE = /```[a-zA-Z0-9_+.-]*[ \t]*\r?\n([\s\S]*)$/;
+
+/**
+ * Truncation-tolerant body salvage for one file-section region: when the
+ * strict fence match fails (response cut off before the closing fence),
+ * keep the partial body instead of dropping the whole file — a
+ * mostly-complete file is more useful than none. A dangling fragment of the
+ * closing fence itself is stripped from the tail.
+ */
+function extractFencedBody(region: string): string | undefined {
+  const strict = FENCED_FILE_BODY_RE.exec(region);
+  const strictContent = strict?.[1]?.replace(/\s+$/, '');
+  if (strictContent !== undefined) return strictContent.length > 0 ? strictContent : undefined;
+
+  const dangling = FENCED_FILE_DANGLING_RE.exec(region);
+  const partial = dangling?.[1]?.replace(/\s+$/, '')?.replace(/\r?\n?[ \t]*`{1,2}[ \t]*$/, '');
+  return partial !== undefined && partial.length > 0 ? partial : undefined;
+}
+
 /** Strips wrapping bold markers / backticks / quotes from a captured path. */
 function cleanFilePath(raw: string): string {
   return raw
@@ -535,9 +574,8 @@ export function parseFileSections(text: string): ProjectFile[] {
     const current = headers[i] as { path: string; index: number; bodyStart: number };
     const next = headers[i + 1];
     const region = text.slice(current.bodyStart, next !== undefined ? next.index : text.length);
-    const body = FENCED_FILE_BODY_RE.exec(region);
-    const content = body?.[1]?.replace(/\s+$/, '');
-    if (content === undefined || content.length === 0) continue;
+    const content = extractFencedBody(region);
+    if (content === undefined) continue;
     if (content.length > MAX_FILE_CONTENT_LENGTH) continue;
     files.push({ path: current.path, content });
   }
@@ -658,6 +696,7 @@ export async function generateStructuredFilesFromParts(
     generateText({
       model,
       maxRetries: 0,
+      maxTokens: GENERATION_MAX_OUTPUT_TOKENS,
       abortSignal: llmTimeoutSignal(),
       ...(systemPrompt !== undefined ? { system: systemPrompt } : {}),
       messages: [
@@ -730,6 +769,7 @@ export async function repairCodeFile(
     const result = await generateText({
       model,
       maxRetries: 0,
+      maxTokens: GENERATION_MAX_OUTPUT_TOKENS,
       abortSignal: llmTimeoutSignal(),
       system:
         'You are a code repair agent. You receive one source file and a list of ' +

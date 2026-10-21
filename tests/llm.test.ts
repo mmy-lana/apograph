@@ -556,6 +556,13 @@ function invalidJsonResponse(extra: { statusCode?: number; responseBody?: string
   });
 }
 
+/** APICallError-shaped 2xx response-processing failure (provider-utils style). */
+function failedProcessingResponse(extra: { statusCode?: number } = {}): Error {
+  return Object.assign(new Error('Failed to process successful response'), {
+    statusCode: extra.statusCode ?? 200,
+  });
+}
+
 describe('classifyProviderError (provider body-parse failures)', () => {
   test('2xx Invalid JSON response is a bounded transient provider fault', () => {
     assert.equal(classifyProviderError(invalidJsonResponse({ statusCode: 200 })), 'retry');
@@ -566,6 +573,14 @@ describe('classifyProviderError (provider body-parse failures)', () => {
   test('4xx Invalid JSON response still raises immediately (no retry)', () => {
     assert.equal(classifyProviderError(invalidJsonResponse({ statusCode: 400 })), 'raise');
     assert.equal(classifyProviderError(invalidJsonResponse({ statusCode: 404 })), 'raise');
+  });
+
+  test('2xx response-processing failure is a bounded transient provider fault', () => {
+    assert.equal(classifyProviderError(failedProcessingResponse({ statusCode: 200 })), 'retry');
+    assert.equal(classifyProviderError(failedProcessingResponse({})), 'retry', 'absent status counts as provider fault');
+    assert.equal(classifyProviderError(failedProcessingResponse({ statusCode: 503 })), 'retry');
+    // 4xx semantics unchanged.
+    assert.equal(classifyProviderError(failedProcessingResponse({ statusCode: 400 })), 'raise');
   });
 });
 
@@ -711,6 +726,38 @@ describe('parseFileSections / parseGeneratedFiles (robust file extraction)', () 
     assert.equal(files[0]?.content, 'export const answer = 42;');
   });
 
+  test('salvages a truncated final section (response cut off mid-fence)', () => {
+    const text = [
+      '### File: src/components/Navbar.tsx',
+      '```tsx',
+      'export function Navbar() { return <nav />; }',
+      '```',
+      '',
+      '### File: src/pages/HomePage.tsx',
+      '```tsx',
+      'export function HomePage() {',
+      '  return <main className="flex min-h-screen w-full flex-col"',
+    ].join('\n');
+    const files = parseFileSections(text);
+    assert.equal(files.length, 2);
+    assert.equal(files[0]?.content, 'export function Navbar() { return <nav />; }');
+    assert.equal(files[1]?.path, 'src/pages/HomePage.tsx');
+    assert.ok(files[1]?.content.includes('min-h-screen'), 'partial body is kept');
+    assert.ok(files[1]?.content.endsWith('flex-col"'), 'partial body ends where the response was cut');
+  });
+
+  test('a dangling fragment of the closing fence is stripped from truncated bodies', () => {
+    const text = ['### File: src/lib/util.ts', '```ts', 'export const answer = 42;', '``'].join('\n');
+    const files = parseFileSections(text);
+    assert.equal(files.length, 1);
+    assert.equal(files[0]?.content, 'export const answer = 42;');
+  });
+
+  test('an empty truncated body is still skipped', () => {
+    const text = ['### File: src/lib/util.ts', '```ts'].join('\n');
+    assert.deepEqual(parseFileSections(text), []);
+  });
+
   test('file content is never JSON-unescaped — backslashes survive verbatim', () => {
     const text = [
       '### File: src/lib/patterns.ts',
@@ -814,21 +861,21 @@ describe('parseFileSections / parseGeneratedFiles (robust file extraction)', () 
 // ---------------------------------------------------------------------------
 
 describe('resolveLlmTimeoutMs (per-stage timeout cap)', () => {
-  test('defaults to 180s and clamps any override to the 180s cap', () => {
+  test('defaults to 600s and clamps any override to the 600s cap', () => {
     const previous = process.env.APOGRAPH_LLM_TIMEOUT_MS;
     try {
       delete process.env.APOGRAPH_LLM_TIMEOUT_MS;
-      assert.equal(resolveLlmTimeoutMs(), 180_000);
-      assert.equal(MAX_STAGE_TIMEOUT_MS, 180_000);
+      assert.equal(resolveLlmTimeoutMs(), 600_000);
+      assert.equal(MAX_STAGE_TIMEOUT_MS, 600_000);
 
       process.env.APOGRAPH_LLM_TIMEOUT_MS = '900000';
-      assert.equal(resolveLlmTimeoutMs(), 180_000, 'a 15-minute override is clamped to 180s');
+      assert.equal(resolveLlmTimeoutMs(), 600_000, 'a 15-minute override is clamped to 600s');
 
       process.env.APOGRAPH_LLM_TIMEOUT_MS = '30000';
       assert.equal(resolveLlmTimeoutMs(), 30_000, 'smaller overrides are honored');
 
       process.env.APOGRAPH_LLM_TIMEOUT_MS = 'not-a-number';
-      assert.equal(resolveLlmTimeoutMs(), 180_000, 'invalid overrides fall back to the default');
+      assert.equal(resolveLlmTimeoutMs(), 600_000, 'invalid overrides fall back to the default');
     } finally {
       if (previous === undefined) delete process.env.APOGRAPH_LLM_TIMEOUT_MS;
       else process.env.APOGRAPH_LLM_TIMEOUT_MS = previous;
