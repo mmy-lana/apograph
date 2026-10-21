@@ -14,6 +14,11 @@
  *   apograph doctor               Check environment health (Node, Chromium, LLM, Ollama).
  *   apograph setup                Install the apograph MCP server into your coding agent.
  *   apograph mcp                  Start the apograph MCP server over stdio.
+ *
+ * `clone` and `crawl` accept `--dry-run`: a pre-flight inspection that runs
+ * the crawl, asset mirror, and evidence extraction, prints an evidence
+ * summary table (including the bot-check verdict), and exits 0 without
+ * calling the LLM.
  */
 
 import { Command } from 'commander';
@@ -24,7 +29,13 @@ import * as p from '@clack/prompts';
 import type { CrawlScope, EvidenceManifest, ViewportMode } from './types.js';
 import type { ApographPlan } from './plan/schema.js';
 import { crawlEvidence } from './crawler/engine.js';
+import { BotBlockedError } from './crawler/health.js';
 import { urlHasSubpath } from './crawler/urls.js';
+import {
+  buildEvidenceSummaryRows,
+  blockedSummaryRow,
+  formatEvidenceSummaryTable,
+} from './commands/evidenceSummary.js';
 import {
   synthesizeModularProject,
   copyMirroredAssets,
@@ -126,6 +137,44 @@ function parseScopeOption(value: string | undefined): CrawlScope | undefined {
 /** True when prompts can be shown (TTY attached and not suppressed). */
 function isInteractive(nonInteractive: boolean): boolean {
   return !nonInteractive && process.stdout.isTTY === true && process.stdin.isTTY === true;
+}
+
+/**
+ * Prints the pre-flight evidence summary for `--dry-run` runs: the evidence
+ * table (title, text spans, images, screenshot, bot-check verdict) and a
+ * closing note. A `blocked` abort renders the block verdict instead. No LLM
+ * is ever called from this path — the dry run ends here (exit 0).
+ */
+function printDryRunSummary(
+  manifest: EvidenceManifest | null,
+  blocked?: BotBlockedError,
+): void {
+  const rows =
+    manifest !== null
+      ? buildEvidenceSummaryRows(manifest)
+      : blocked !== undefined
+        ? [blockedSummaryRow(blocked.url, blocked.verdict)]
+        : [];
+
+  console.log('');
+  console.log('Evidence summary (pre-flight inspection):');
+  console.log(formatEvidenceSummaryTable(rows));
+
+  if (blocked !== undefined) {
+    console.log('');
+    console.log(`✖ ${blocked.message}`);
+    console.log(`  Detected: ${blocked.verdict.detail}`);
+  } else if (manifest !== null) {
+    const spans = rows.reduce((sum, row) => sum + row.textSpans, 0);
+    const images = rows.reduce((sum, row) => sum + row.imageAssets, 0);
+    console.log('');
+    console.log(
+      `  ${rows.length} route(s), ${spans} text span(s), ${images} image asset(s) mirrored.`,
+    );
+  }
+
+  console.log('');
+  console.log('✔ Dry run complete — crawl, asset mirror, and evidence extraction only; no LLM calls were made.');
 }
 
 /**
@@ -503,6 +552,8 @@ interface ClonePipelineOptions {
   liveThreshold?: number;
   /** Perform at most one evidence-based repair retry after live failure. */
   liveRetry?: boolean;
+  /** Pre-flight inspection: crawl + evidence summary only, no LLM. */
+  dryRun?: boolean;
   /** Checkpoint to resume from (skips crawl + approval gate). */
   resumeFrom?: CloneCheckpoint;
 }
@@ -577,17 +628,40 @@ async function runClonePipeline(options: ClonePipelineOptions): Promise<void> {
       );
       activeLabel = 'Crawl in progress';
       activeSpinner = startProgress(activeLabel);
-      manifest = await crawlEvidence({
-        rootUrl: url,
-        evidenceDir,
-        maxDepth,
-        maxPages: maxPagesCap ?? maxPages,
-        viewport,
-        scope,
-      });
+      try {
+        manifest = await crawlEvidence({
+          rootUrl: url,
+          evidenceDir,
+          maxDepth,
+          maxPages: maxPagesCap ?? maxPages,
+          viewport,
+          scope,
+        });
+      } catch (cause) {
+        activeSpinner.stop(
+          cause instanceof BotBlockedError
+            ? 'Crawl aborted — bot challenge detected'
+            : 'Crawl failed',
+        );
+        activeSpinner = null;
+        activeLabel = null;
+        // Dry runs report the block verdict in the summary table and end
+        // cleanly (exit 0) — that verdict is exactly what pre-flight is for.
+        if (options.dryRun === true && cause instanceof BotBlockedError) {
+          printDryRunSummary(null, cause);
+          return;
+        }
+        throw cause;
+      }
       activeSpinner.stop(`Crawled ${manifest.stats.pagesCrawled} page(s)`);
       activeSpinner = null;
       activeLabel = null;
+    }
+
+    // --- Dry run: pre-flight inspection only (no plan gate, no LLM) --------
+    if (options.dryRun === true) {
+      printDryRunSummary(manifest);
+      return;
     }
 
     // --- Step 2: Gate 1 evidence review + plan generation + approval gate --
@@ -704,6 +778,7 @@ interface CloneOptions {
   liveVerify?: boolean;
   liveThreshold: string;
   liveRetry?: boolean;
+  dryRun?: boolean;
 }
 
 /** Options for the `crawl` command. */
@@ -713,6 +788,7 @@ interface CrawlCliOptions {
   maxPages: string;
   viewport: string;
   scope?: string;
+  dryRun?: boolean;
 }
 
 /** Options for the `plan` command. */
@@ -815,6 +891,7 @@ program
   .option('--max-pages <number>', 'max pages to crawl', '10')
   .option('--viewport <mode>', 'viewports to screenshot: both, desktop, or mobile', 'both')
   .option('--scope <mode>', 'crawl scope for subpath URLs: single, subtree, or site')
+  .option('--dry-run', 'pre-flight inspection: crawl, mirror assets, extract evidence, print a summary table, and exit without synthesis')
   .action(async (url: string, options: CrawlCliOptions) => {
     const viewport = parseViewportOption(options.viewport);
     const requestedScope = parseScopeOption(options.scope);
@@ -828,7 +905,8 @@ program
     }
 
     const progress = startProgress('Crawl in progress');
-    let manifest;
+    let manifest: EvidenceManifest | null = null;
+    let blocked: BotBlockedError | null = null;
     try {
       manifest = await crawlEvidence({
         rootUrl: url,
@@ -838,9 +916,23 @@ program
         viewport,
         scope,
       });
+    } catch (cause) {
+      if (options.dryRun === true && cause instanceof BotBlockedError) {
+        blocked = cause;
+      } else {
+        throw cause;
+      }
     } finally {
-      progress.stop('Crawl finished');
+      progress.stop(
+        blocked !== null ? 'Crawl aborted — bot challenge detected' : 'Crawl finished',
+      );
     }
+
+    if (options.dryRun === true) {
+      printDryRunSummary(manifest, blocked ?? undefined);
+      return;
+    }
+    if (manifest === null) return;
 
     console.log('');
     console.log('✔ Crawl complete.');
@@ -867,6 +959,7 @@ program
   .option('--no-verify', 'skip the 3-tier verification pass')
   .option('--model <id>', 'override the active model ID for this run')
   .option('--allow-degraded', 'exit 0 even when synthesis used fallback templates')
+  .option('--dry-run', 'pre-flight inspection: crawl, mirror assets, extract evidence, print a summary table, and exit without plan gate or synthesis')
    .option('--live-verify', 'run final live original-vs-clone comparison')
    .option('--live-threshold <number>', 'minimum live pixel similarity per route', '70')
    .option('--live-retry', 'retry live comparison once when routes fail')
@@ -876,7 +969,8 @@ program
     const interactive = isInteractive(options.yes);
 
     // Checkpoint resumption: a saved run for this URL can be continued.
-    const checkpoint = await loadCheckpoint('.');
+    // Dry runs are fresh pre-flight inspections and never resume.
+    const checkpoint = options.dryRun === true ? null : await loadCheckpoint('.');
     let resumeFrom: CloneCheckpoint | undefined;
 
     if (checkpoint !== null && checkpoint.targetUrl === url) {
@@ -918,6 +1012,7 @@ program
       liveVerify: options.liveVerify,
       liveThreshold: parseNumber(options.liveThreshold, 70),
       liveRetry: options.liveRetry,
+      dryRun: options.dryRun,
       resumeFrom,
     });
   });

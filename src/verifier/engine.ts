@@ -39,6 +39,16 @@ import { loadEvidenceManifest, validatePlan } from '../plan/generator.js';
 import { repairCodeFile } from '../synthesizer/llm.js';
 import { repairComponentWithVisualDiff } from '../synthesizer/vision.js';
 import { assertNoSymlinkComponents, resolveContainedPath } from '../utils/fs-safe.js';
+import {
+  ensureProjectDependencies,
+  runCompilerRepairLoop,
+} from '../compiler/repair.js';
+import type { CommandResult } from '../compiler/repair.js';
+
+// Public re-exports (test seams): the tsc diagnostics parser is shared with
+// the synthesis-time compile healer (`src/compiler/repair.ts`).
+export { parseTscDiagnostics } from '../compiler/repair.js';
+export type { CommandResult, CompilerDiagnostic } from '../compiler/repair.js';
 
 /** Promisified execFile for async child-process execution. */
 const execFileAsync = promisify(execFile);
@@ -165,12 +175,6 @@ export async function startSiteServer(distDir: string): Promise<SiteHandle> {
 // Tier 1 — build verification
 // ---------------------------------------------------------------------------
 
-/** Result of one build command run. */
-export interface CommandResult {
-  ok: boolean;
-  output: string;
-}
-
 /** Runs a command in `cwd`, capturing combined stdout/stderr. */
 async function runCommand(
   command: string,
@@ -212,107 +216,19 @@ async function nodeModulesExists(cwd: string): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
-// Tier 1 — compiler diagnostics & auto-repair
+// Tier 1 — compiler diagnostics & shared bounded repair loop
 // ---------------------------------------------------------------------------
 
-/** One parsed `tsc` error diagnostic. */
-export interface CompilerDiagnostic {
-  /** File path as printed by tsc (e.g. 'src/components/Hero.tsx'). */
-  file: string;
-  /** 1-based line of the error. */
-  line: number;
-  /** 1-based column of the error. */
-  column: number;
-  /** Diagnostic code, e.g. 'TS2322'. */
-  code: string;
-  /** Full diagnostic block text, including continuation lines. */
-  message: string;
-}
-
-/** Classic tsc format: `src/A.tsx(12,18): error TS2322: ...`. */
-const TSC_ERROR_CLASSIC = /^(.+?)\((\d+),(\d+)\):\s+error\s+(TS\d+):\s+(.*)$/;
-
-/** Pretty tsc format: `src/A.tsx:12:18 - error TS2322: ...`. */
-const TSC_ERROR_PRETTY = /^(.+?):(\d+):(\d+)\s+-\s+error\s+(TS\d+):\s+(.*)$/;
-
 /**
- * Parses `tsc --noEmit` output into diagnostics, supporting both the classic
- * `file(line,col): error TSxxxx:` format and the pretty
- * `file:line:col - error TSxxxx:` format. Continuation lines (indented
- * message detail / code frames) fold into the owning diagnostic until the
- * next diagnostic or a blank line. File-less diagnostics (config-level
- * TS5xxx / TS6053) produce no entries and are therefore never repair targets.
+ * Max files sent through one repair turn (token bound). The tsc diagnostics
+ * parser and the bounded repair loop live in `src/compiler/repair.ts`, shared
+ * with the synthesis-time compile healer (`synthesizer/compileHeal.ts`) so
+ * both self-healing passes can never drift apart.
  */
-export function parseTscDiagnostics(output: string): CompilerDiagnostic[] {
-  const diagnostics: CompilerDiagnostic[] = [];
-  let current: CompilerDiagnostic | null = null;
-
-  for (const rawLine of output.split('\n')) {
-    const line = rawLine.trimEnd();
-    const match = line.match(TSC_ERROR_CLASSIC) ?? line.match(TSC_ERROR_PRETTY);
-
-    if (match !== null) {
-      if (current !== null) diagnostics.push(current);
-      current = {
-        file: match[1] as string,
-        line: Number.parseInt(match[2] as string, 10),
-        column: Number.parseInt(match[3] as string, 10),
-        code: match[4] as string,
-        message: line,
-      };
-      continue;
-    }
-
-    if (current === null) continue;
-
-    if (line.trim().length === 0) {
-      diagnostics.push(current);
-      current = null;
-      continue;
-    }
-
-    current.message += `\n${line}`;
-  }
-
-  if (current !== null) diagnostics.push(current);
-  return diagnostics;
-}
-
-/** One file queued for a targeted compiler-repair turn. */
-interface RepairTarget {
-  file: string;
-  errors: string[];
-}
-
-/** Max files sent through one repair turn (token bound). */
 const MAX_REPAIR_FILES = 3;
 
 /** Max diagnostic lines forwarded per file. */
 const MAX_REPAIR_ERRORS = 20;
-
-/** True when a diagnostic file is a safe in-project repair candidate. */
-function isRepairTarget(cwd: string, file: string): boolean {
-  if (!file.startsWith('src/')) return false;
-  if (file.includes('node_modules')) return false;
-  const root = resolve(cwd);
-  return resolve(cwd, file).startsWith(root + sep);
-}
-
-/** Groups parseable diagnostics into per-file repair targets (bounded). */
-function selectRepairTargets(cwd: string, tscOutput: string): RepairTarget[] {
-  const byFile = new Map<string, string[]>();
-
-  for (const diagnostic of parseTscDiagnostics(tscOutput)) {
-    if (!isRepairTarget(cwd, diagnostic.file)) continue;
-    const errors = byFile.get(diagnostic.file) ?? [];
-    errors.push(diagnostic.message);
-    byFile.set(diagnostic.file, errors);
-  }
-
-  return [...byFile.entries()]
-    .slice(0, MAX_REPAIR_FILES)
-    .map(([file, errors]) => ({ file, errors: errors.slice(0, MAX_REPAIR_ERRORS) }));
-}
 
 /** Error lines from a failed command, falling back to raw output when unparseable. */
 function failureLines(output: string): string[] {
@@ -332,10 +248,12 @@ export interface Tier1Deps {
 }
 
 /**
- * Tier 1 core: dependency install, `tsc --noEmit` with a bounded compiler
- * auto-repair loop (default: one targeted turn over up to three files), then
- * `vite build` — always attempted so `dist/` artifacts exist for tiers 2/3
- * even when residual type errors remain.
+ * Tier 1 core: dependency install (shared pnpm -> npm order), `tsc --noEmit`
+ * with the shared bounded compiler auto-repair loop (default: one targeted
+ * turn over up to three files), then `vite build` — always attempted so
+ * `dist/` artifacts exist for tiers 2/3 even when residual type errors
+ * remain. The repair loop itself lives in `src/compiler/repair.ts` and is
+ * shared with the synthesis-time compile healer.
  */
 export async function runTier1Build(
   cwd: string,
@@ -347,75 +265,32 @@ export async function runTier1Build(
     ? Math.min(maxRepairTurns, 3)
     : 0;
 
-  const hasModules = await nodeModulesExists(root);
-
-  if (!hasModules) {
-    // Install dependencies. A non-zero exit is tolerated when node_modules
-    // was still materialized — pnpm may exit non-zero on unapproved build
-    // scripts or lockfile conflicts while having installed everything the
-    // build needs. Only escalate to npm when pnpm produced nothing.
-    const install = await deps.run('pnpm', ['install', '--prefer-offline', '--ignore-scripts'], root);
-
-    let modulesReady = await nodeModulesExists(root);
-
-    if (!modulesReady) {
-      // pnpm may refuse on a conflicting lockfile (e.g. one written by npm);
-      // fall back to npm before giving up.
-      const fallback = await deps.run('npm', ['install', '--prefer-offline', '--ignore-scripts'], root);
-      modulesReady = await nodeModulesExists(root);
-
-      if (!modulesReady) {
-        return {
-          success: false,
-          tscPassed: false,
-          vitePassed: false,
-          errors: [
-            'Failed to install dependencies in emitted project:',
-            ...errorLines(install.output),
-            ...errorLines(fallback.output),
-          ],
-        };
-      }
-    }
+  // Install dependencies. A non-zero exit is tolerated when node_modules
+  // was still materialized — pnpm may exit non-zero on unapproved build
+  // scripts or lockfile conflicts while having installed everything the
+  // build needs. Only escalate to npm when pnpm produced nothing.
+  const install = await ensureProjectDependencies(root, deps.run, nodeModulesExists);
+  if (!install.ok) {
+    return {
+      success: false,
+      tscPassed: false,
+      vitePassed: false,
+      errors: [
+        'Failed to install dependencies in emitted project:',
+        ...install.attempts.flatMap((attempt) => errorLines(attempt.output)),
+      ],
+    };
   }
-
-  const tscArgs = ['--no-install', 'tsc', '--noEmit'];
-  let tsc = await deps.run('npx', tscArgs, root);
 
   // Bounded compiler auto-repair loop (default: one targeted turn).
-  const repairedFiles: string[] = [];
-  const errorsBefore: string[] = [];
-  let repairRan = false;
-
-  if (!tsc.ok) {
-    for (let turn = 0; turn < repairTurns && !tsc.ok; turn += 1) {
-      const targets = selectRepairTargets(root, tsc.output);
-      if (targets.length === 0) break;
-
-      repairRan = true;
-      for (const target of targets) {
-        const filePath = join(root, target.file);
-        let content: string;
-        try {
-          content = await readFile(filePath, 'utf8');
-        } catch {
-          continue; // Diagnostic points at a missing file — skip it.
-        }
-
-        try {
-          const repaired = await deps.repairFile(target.file, content, target.errors);
-          if (repaired.length === 0 || repaired.length > 1_000_000) throw new Error('repair output size invalid');
-          await writeFile(filePath, repaired, 'utf8');
-          repairedFiles.push(target.file);
-          errorsBefore.push(...target.errors);
-        } catch {
-          // A failed repair turn leaves the file untouched.
-        }
-      }
-
-      tsc = await deps.run('npx', tscArgs, root);
-    }
-  }
+  const healed = await runCompilerRepairLoop(root, {
+    run: deps.run,
+    repairFile: deps.repairFile,
+    maxTurns: repairTurns,
+    maxFilesPerTurn: MAX_REPAIR_FILES,
+    maxErrorsPerFile: MAX_REPAIR_ERRORS,
+  });
+  const tsc = healed.tsc;
 
   // Always attempt `vite build`, even with residual type errors: esbuild
   // transpiles without typechecking, so dist/index.html is produced and the
@@ -427,9 +302,14 @@ export async function runTier1Build(
   if (!tsc.ok) errors.push(...failureLines(tsc.output));
   if (!vite.ok) errors.push(...failureLines(vite.output));
 
-  const repair: CompilerRepairRecord | undefined = repairRan
-    ? { repairedFiles, fixed: tsc.ok, errorsBefore }
-    : undefined;
+  const repair: CompilerRepairRecord | undefined =
+    healed.turns > 0
+      ? {
+          repairedFiles: healed.repairedFiles,
+          fixed: tsc.ok,
+          errorsBefore: healed.errorsBefore,
+        }
+      : undefined;
 
   return {
     success: tsc.ok && vite.ok,

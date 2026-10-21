@@ -3,18 +3,18 @@
  * self-healing).
  *
  * Vision synthesis occasionally emits code that does not typecheck (e.g. a
- * malformed nested data literal passed inline into a typed JSX prop). The
- * 3-tier verifier's build tier has its own bounded repair turn, but a
+ * malformed nested data literal passed inline into a typed JSX prop). A
  * generator that ships invalid TypeScript has already failed the emitted
  * project before verification starts — and residual type errors correlate
  * with runtime crashes the pixel score cannot reveal.
  *
  * This module closes the loop INSIDE the generation pipeline: after emit,
- * the project is typechecked (`tsc --noEmit`) and failing source files are
- * sent through the existing `repairCodeFile` primitive in bounded turns
- * until the project compiles or the budget is exhausted. Everything it
- * touches is generated output; the verifier, its thresholds, and its
- * repair budget are never involved.
+ * the project is typechecked and failing source files are repaired in
+ * bounded turns until the project compiles or the budget is exhausted. The
+ * tsc diagnostics parsing and the bounded repair loop itself are shared
+ * with the verifier's tier-1 build repair (`src/compiler/repair.ts`) — this
+ * module is the synthesis-time policy layer: execution gate, dependency
+ * install, turn budget, and honest residual reporting.
  *
  * Policy: running generated-project tooling (dependency install, tsc)
  * requires `APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION=1`, mirroring the
@@ -23,9 +23,18 @@
  */
 
 import { execFile } from 'node:child_process';
-import { readFile, writeFile, access } from 'node:fs/promises';
+import { access } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { repairCodeFile } from './llm.js';
+import {
+  ensureProjectDependencies,
+  groupDiagnosticsByFile as groupDiagnosticsByFileCore,
+  parseTscDiagnostics as parseTscDiagnosticsCore,
+  runCompilerRepairLoop,
+} from '../compiler/repair.js';
+import type { CommandResult, CompilerDiagnostic, RepairTarget } from '../compiler/repair.js';
+
+export type { CommandResult, CompilerDiagnostic } from '../compiler/repair.js';
 
 /** Default bounded repair turns (the loop is always finite). */
 const DEFAULT_MAX_TURNS = 2;
@@ -36,12 +45,6 @@ const DEFAULT_MAX_FILES_PER_TURN = 3;
 /** Hard cap on diagnostics considered per file (token bound). */
 const MAX_ERRORS_PER_FILE = 8;
 
-/** One process run result (stdout+stderr merged by the default runner). */
-export interface CommandResult {
-  ok: boolean;
-  output: string;
-}
-
 /** Injectable collaborators (tests use deterministic fakes). */
 export interface CompileHealDeps {
   /** Runs a command in the emitted project (defaults to execFile). */
@@ -50,8 +53,6 @@ export interface CompileHealDeps {
   repairFile?: (filePath: string, content: string, errors: string[]) => Promise<string>;
   /** Checks whether node_modules exists (defaults to fs access). */
   hasModules?: (root: string) => Promise<boolean>;
-  /** Sleep primitive for install pacing (defaults to setTimeout). */
-  sleep?: (ms: number) => Promise<void>;
 }
 
 /** Options for {@link healProjectCompilation}. */
@@ -78,7 +79,7 @@ export interface CompileHealResult {
   turns: number;
 }
 
-/** One parsed TypeScript compiler diagnostic. */
+/** One parsed TypeScript compiler diagnostic (file + message subset). */
 export interface TscDiagnostic {
   /** Project-relative file path (e.g. `src/pages/Home.tsx`). */
   file: string;
@@ -88,20 +89,13 @@ export interface TscDiagnostic {
 
 /**
  * Parses `tsc` output lines of the form
- * `src/pages/Home.tsx(54,48): error TS2322: …` into per-file diagnostics.
- * Non-file lines (global errors, npm noise) are ignored; only safe
- * project-relative paths (`src/…`) become repair targets.
+ * `src/pages/Home.tsx(54,48): error TS2322: …` into per-file diagnostics
+ * via the shared parser (`src/compiler/repair.ts`): classic and pretty tsc
+ * formats both fold into per-file entries, and only safe project-relative
+ * `src/…` paths survive.
  */
 export function parseTscDiagnostics(output: string): TscDiagnostic[] {
-  const diagnostics: TscDiagnostic[] = [];
-  for (const line of output.split('\n')) {
-    const match = /^([^\s(][^()]*)\(\d+,\d+\):\s+error\s+(TS\d+):\s+(.*)$/.exec(line.trim());
-    if (match === null) continue;
-    const file = (match[1] ?? '').trim().replaceAll('\\', '/');
-    if (!file.startsWith('src/') || file.includes('..')) continue;
-    diagnostics.push({ file, message: line.trim() });
-  }
-  return diagnostics;
+  return parseTscDiagnosticsCore(output).map(({ file, message }) => ({ file, message }));
 }
 
 /** Groups diagnostics per file, keeping at most `maxErrors` per file. */
@@ -109,14 +103,7 @@ export function groupDiagnosticsByFile(
   diagnostics: readonly TscDiagnostic[],
   maxErrors: number = MAX_ERRORS_PER_FILE,
 ): Map<string, string[]> {
-  const grouped = new Map<string, string[]>();
-  for (const diagnostic of diagnostics) {
-    const existing = grouped.get(diagnostic.file) ?? [];
-    if (existing.length >= maxErrors) continue;
-    existing.push(diagnostic.message);
-    grouped.set(diagnostic.file, existing);
-  }
-  return grouped;
+  return groupDiagnosticsByFileCore(diagnostics, maxErrors);
 }
 
 /** Default command runner: execFile with merged stdout/stderr. */
@@ -142,7 +129,7 @@ async function defaultHasModules(root: string): Promise<boolean> {
  * Runs the bounded compile-convergence loop over an emitted project.
  *
  * 1. Installs dependencies when `node_modules` is absent (pnpm, npm
- *    fallback — same order the verifier uses).
+ *    fallback — the shared install order the verifier also uses).
  * 2. Runs `tsc --noEmit`; on failure, repairs up to `maxFilesPerTurn`
  *    files per turn for at most `maxTurns` turns via `repairFile`.
  * 3. Stops early when the project typechecks cleanly.
@@ -174,74 +161,48 @@ export async function healProjectCompilation(
 
   if (process.env.APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION !== '1') return empty;
 
-  // Dependency install (mirrors the verifier's install order).
-  if (!(await hasModules(root))) {
-    onStatus('compile-heal: installing emitted-project dependencies');
-    let ready = false;
-    const install = await run('pnpm', ['install', '--prefer-offline', '--ignore-scripts'], root);
-    ready = await hasModules(root);
-    if (!ready) {
-      const fallback = await run('npm', ['install', '--prefer-offline', '--ignore-scripts'], root);
-      ready = await hasModules(root);
-      if (!ready) {
-        return {
-          clean: false,
-          skipped: false,
-          repairedFiles: [],
-          residualErrors: [
-            'compile-heal could not install emitted-project dependencies:',
-            install.output.trim().slice(-400),
-            fallback.output.trim().slice(-400),
-          ].filter((line) => line.length > 0),
-          turns: 0,
-        };
-      }
+  // Dependency install (shared order: pnpm, then npm). Announce the first
+  // missing-modules probe so the live spinner reflects the install.
+  let announcedInstall = false;
+  const trackedHasModules = async (probeRoot: string): Promise<boolean> => {
+    const ready = await hasModules(probeRoot);
+    if (!ready && !announcedInstall) {
+      announcedInstall = true;
+      onStatus('compile-heal: installing emitted-project dependencies');
     }
+    return ready;
+  };
+  const install = await ensureProjectDependencies(root, run, trackedHasModules);
+  if (!install.ok) {
+    return {
+      clean: false,
+      skipped: false,
+      repairedFiles: [],
+      residualErrors: [
+        'compile-heal could not install emitted-project dependencies:',
+        ...install.attempts.map((attempt) => attempt.output.trim().slice(-400)),
+      ].filter((line) => line.length > 0),
+      turns: 0,
+    };
   }
 
-  const tscArgs = ['--no-install', 'tsc', '--noEmit'];
-  let tsc = await run('npx', tscArgs, root);
-  if (tsc.ok) return { ...empty, skipped: false };
+  const healed = await runCompilerRepairLoop(root, {
+    run,
+    repairFile,
+    maxTurns,
+    maxFilesPerTurn,
+    maxErrorsPerFile: MAX_ERRORS_PER_FILE,
+    onTurn: (turn: number, targets: RepairTarget[]) => {
+      onStatus(`compile-heal: repair turn ${turn} (${targets.length} file(s))`);
+    },
+  });
 
-  const repairedFiles: string[] = [];
-  let turns = 0;
-
-  for (let turn = 0; turn < maxTurns && !tsc.ok; turn += 1) {
-    const grouped = groupDiagnosticsByFile(parseTscDiagnostics(tsc.output));
-    if (grouped.size === 0) break; // Unparseable output — never guess repair targets.
-    turns += 1;
-    onStatus(`compile-heal: repair turn ${turn + 1} (${grouped.size} file(s))`);
-
-    let repairedThisTurn = 0;
-    for (const [file, errors] of grouped) {
-      if (repairedThisTurn >= maxFilesPerTurn) break;
-      let content: string;
-      try {
-        content = await readFile(join(root, file), 'utf8');
-      } catch {
-        continue; // Diagnostic points at a missing file — skip.
-      }
-      try {
-        const repaired = await repairFile(file, content, errors);
-        if (repaired.length === 0 || repaired.length > 1_000_000) continue;
-        await writeFile(join(root, file), repaired, 'utf8');
-        if (!repairedFiles.includes(file)) repairedFiles.push(file);
-        repairedThisTurn += 1;
-      } catch {
-        // A failed repair turn leaves the file untouched.
-      }
-    }
-    if (repairedThisTurn === 0) break;
-
-    tsc = await run('npx', tscArgs, root);
-  }
-
-  const residual = parseTscDiagnostics(tsc.output).map((diagnostic) => diagnostic.message);
+  const residual = parseTscDiagnostics(healed.tsc.output).map((diagnostic) => diagnostic.message);
   return {
-    clean: tsc.ok,
+    clean: healed.tsc.ok,
     skipped: false,
-    repairedFiles,
-    residualErrors: tsc.ok ? [] : residual,
-    turns,
+    repairedFiles: healed.repairedFiles,
+    residualErrors: healed.tsc.ok ? [] : residual,
+    turns: healed.turns,
   };
 }

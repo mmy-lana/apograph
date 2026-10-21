@@ -95,6 +95,29 @@ export interface ModalCapture {
   mobileScreenshot: string | null;
 }
 
+/**
+ * Which pre-flight bot / WAF challenge signature fired (null on clean pages).
+ */
+export type BotBlockSignature =
+  | 'challenge-title'
+  | 'access-restriction-title'
+  | 'blocked-http-status'
+  | 'sparse-dom';
+
+/**
+ * Pre-flight bot / WAF challenge verdict recorded for a crawled page. The
+ * crawl aborts before synthesis whenever a verdict is `blocked`; `clean`
+ * verdicts ride on the route record so tooling can report them.
+ */
+export interface RouteBotCheck {
+  /** Overall verdict. */
+  verdict: 'clean' | 'blocked';
+  /** Challenge signature that fired (null when clean). */
+  signature: BotBlockSignature | null;
+  /** Human-readable evidence (title / HTTP status / text-node count). */
+  detail: string;
+}
+
 /** One crawled page's recorded evidence. */
 export interface CrawlRoute {
   /** The normalized URL of the page. */
@@ -109,6 +132,11 @@ export interface CrawlRoute {
   mobileScreenshot: string | null;
   /** SEO / OpenGraph metadata extracted from the page head. */
   metadata?: RouteMetadata;
+  /**
+   * Pre-flight bot / WAF challenge verdict captured right after navigation.
+   * Optional: older evidence bundles predate the bot-block detector.
+   */
+  botCheck?: RouteBotCheck;
   /** Accessibility tree extracted at capture time. */
   a11yTree: A11yNode;
   /** Design tokens extracted at capture time. */

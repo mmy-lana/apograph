@@ -1,49 +1,98 @@
 /**
  * apograph — LLM synthesis primitives (Layer 5: Orchestration).
  *
- * Structured file generation via `generateObject` with a graceful
- * `generateText` fallback for models that lack native json_schema support,
- * plus a token-frugal code repair helper. Prompts may carry image parts for
- * multimodal (vision) synthesis — see `src/synthesizer/vision.ts`.
+ * File generation uses a markdown file-section contract (`### File: <path>`
+ * followed by a fenced code block) extracted with a robust regex parser —
+ * never JSON string fields, whose escaping corrupts multi-thousand-line
+ * React sources ("Bad escaped character in JSON at position X"). A lenient,
+ * escape-repaired JSON extraction remains only as a legacy fallback for
+ * models that still answer in the old shape. Prompts may carry image parts
+ * for multimodal (vision) synthesis — see `src/synthesizer/vision.ts`.
  */
 
-import { generateObject, generateText } from 'ai';
-import { z } from 'zod';
+import { generateText } from 'ai';
 import type { ImagePart, LanguageModel, TextPart } from 'ai';
 import type { ProjectFile } from '../types.js';
 import { getSynthesizerModel, getFastParserModel } from '../config/models.js';
 import { redactSecrets } from '../config/validate.js';
 
 // ---------------------------------------------------------------------------
-// Schema
+// File emission contract
 // ---------------------------------------------------------------------------
 
-/** Contract for LLM-emitted project files. */
-const GeneratedProjectSchema = z.object({
-  files: z.array(
-    z.object({
-      path: z.string().min(1).max(240).regex(/^(?![\\/])(?!.*(?:^|[\\/])\.\.(?:[\\/]|$))[^\x00\r\n]+$/),
-      content: z.string().max(1000000),
-    }),
-  ).max(200),
-});
+/** Maximum length of an emitted file path (mirrors the old schema bound). */
+const MAX_FILE_PATH_LENGTH = 240;
 
-/** The parsed payload of {@link GeneratedProjectSchema}. */
-type GeneratedProject = z.infer<typeof GeneratedProjectSchema>;
+/** Maximum length of an emitted file's content (mirrors the old schema bound). */
+const MAX_FILE_CONTENT_LENGTH = 1_000_000;
+
+/** Maximum number of files accepted from one generation response. */
+const MAX_FILES_PER_RESPONSE = 200;
+
+/** The schema-safe project-relative path rule (no absolute paths, no `..`). */
+const SAFE_FILE_PATH_RE = /^(?![\\/])(?!.*(?:^|[\\/])\.\.(?:[\\/]|$))[^\x00\r\n]+$/;
+
+/** True when `path` is a safe, project-relative file path. */
+export function isSafeProjectFilePath(path: string): boolean {
+  return (
+    path.length > 0 &&
+    path.length <= MAX_FILE_PATH_LENGTH &&
+    SAFE_FILE_PATH_RE.test(path)
+  );
+}
 
 /**
- * Hard upper bound for one model request. The previous implementation had no
- * abort signal, so a stalled gateway could hold a paid request indefinitely.
- * Override for slower local models, but keep the bound finite.
+ * Prompt contract appended to every generation turn: files travel as
+ * markdown file sections with fenced code blocks, never inside JSON string
+ * fields.
  */
-const DEFAULT_LLM_TIMEOUT_MS = 10 * 60 * 1000;
+export const FILE_EMISSION_CONTRACT = [
+  'Respond with the generated files as markdown file sections in exactly this format:',
+  '### File: <project-relative/path>',
+  '```tsx',
+  '<complete file content>',
+  '```',
+  'Emit one section per file. Keep every file complete and compile-ready.',
+  'Do not wrap file contents in a JSON object or JSON string fields.',
+].join('\n');
 
-function llmTimeoutSignal(): AbortSignal {
+/** Stricter one-shot re-extraction instruction for unparseable first replies. */
+const FILE_EXTRACTION_TURN_CONTRACT = [
+  'Your previous response could not be used: it contained no files in the required format.',
+  'Return ONLY the generated files as markdown file sections in exactly this format:',
+  '### File: <project-relative/path>',
+  '```tsx',
+  '<complete file content>',
+  '```',
+  'One section per file. No JSON, no commentary, no truncation.',
+].join('\n');
+
+/**
+ * Hard per-stage timeout cap for one model request (180 s). An upstream
+ * model that hangs or streams slower than acceptable aborts the stage
+ * cleanly instead of holding the pipeline for 15+ minutes. Override via
+ * `APOGRAPH_LLM_TIMEOUT_MS` for slower local models — still capped.
+ */
+export const MAX_STAGE_TIMEOUT_MS = 180_000;
+
+/** Default per-stage timeout when no override is configured (180 s). */
+const DEFAULT_LLM_TIMEOUT_MS = MAX_STAGE_TIMEOUT_MS;
+
+/**
+ * Resolves the effective per-stage generation timeout: the configured
+ * `APOGRAPH_LLM_TIMEOUT_MS` (or the 180 s default) clamped to
+ * {@link MAX_STAGE_TIMEOUT_MS}. Exported for tests.
+ */
+export function resolveLlmTimeoutMs(): number {
   const configured = Number.parseInt(process.env.APOGRAPH_LLM_TIMEOUT_MS ?? '', 10);
   const timeout = Number.isFinite(configured) && configured > 0
-    ? Math.min(configured, 30 * 60 * 1000)
+    ? configured
     : DEFAULT_LLM_TIMEOUT_MS;
-  return AbortSignal.timeout(timeout);
+  return Math.min(timeout, MAX_STAGE_TIMEOUT_MS);
+}
+
+function llmTimeoutSignal(): AbortSignal {
+  return AbortSignal.timeout(resolveLlmTimeoutMs());
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +293,12 @@ export interface TransientRetryOptions {
 export interface SynthesisCallOptions extends TransientRetryOptions {
   /** Model override (tests inject a deterministic mock). */
   model?: LanguageModel;
+  /**
+   * Single-file fallback path: when a reply carries no parseable file
+   * sections (e.g. a repair turn answering with raw corrected content), the
+   * whole reply is taken as this file. Multi-file generation leaves it unset.
+   */
+  defaultFilePath?: string;
 }
 
 /**
@@ -351,13 +406,13 @@ function isProviderBodyParseFailure(error: unknown): boolean {
 }
 
 /**
- * True when a structured generation failed at the protocol level — the
- * model answered but no usable structured object came back:
- * `NoObjectGeneratedError` ("the tool was not called"), an AI SDK
- * `JSONParseError` / `TypeValidationError`, or a provider body-parse
- * failure. These are capability/protocol failures, not fatal errors: the
- * pipeline must salvage the returned text or fall back to raw-text JSON
- * extraction instead of abandoning the stage.
+ * True when a generation failed at the protocol level — the model (or its
+ * gateway) answered but no usable payload came back: a structured-output
+ * rejection (`NoObjectGeneratedError`, AI SDK `JSONParseError` /
+ * `TypeValidationError`), or a provider body-parse failure. These are
+ * capability/protocol failures, not fatal errors: the pipeline must salvage
+ * the returned text or spend one bounded extraction turn instead of
+ * abandoning the stage.
  */
 function isStructuredProtocolFailure(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
@@ -376,25 +431,20 @@ function isStructuredProtocolFailure(error: unknown): boolean {
 }
 
 /**
- * Attempts to salvage generated files from the raw text a failed structured
- * generation already produced: the AI SDK attaches model output to
+ * Attempts to salvage generated files from the raw text a failed generation
+ * already produced: the AI SDK attaches model output to
  * `NoObjectGeneratedError.text` / `JSONParseError.text`, and provider body
- * parse failures carry the raw `responseBody`. Returns null when no usable
- * payload exists; callers then fall back to a fresh `generateText`
- * extraction.
+ * parse failures carry the raw `responseBody`. Salvage is deliberately
+ * conservative — the same robust extractor runs, but without the bare-text
+ * single-file fallback. Returns null when no usable payload exists; callers
+ * then spend one bounded extraction turn.
  */
 function salvageGeneratedFiles(cause: unknown): ProjectFile[] | null {
   const source = cause as { text?: unknown; responseBody?: unknown };
   for (const candidate of [source.text, source.responseBody]) {
     if (typeof candidate !== 'string' || candidate.trim().length === 0) continue;
-    try {
-      const parsed: GeneratedProject = GeneratedProjectSchema.parse(
-        JSON.parse(extractJsonBlock(candidate)),
-      );
-      if (parsed.files.length > 0) return parsed.files;
-    } catch {
-      // Try the next salvage source.
-    }
+    const files = parseGeneratedFiles(candidate);
+    if (files.length > 0) return files;
   }
   return null;
 }
@@ -434,20 +484,162 @@ function extractJsonBlock(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Structured file generation
+// Robust file extraction (markdown file sections, legacy JSON fallback)
+// ---------------------------------------------------------------------------
+
+/**
+ * A file section header line, e.g. `### File: src/pages/HomePage.tsx`.
+ * Tolerates heading depth 0–6, an optional `File`/`File path` label, bold
+ * markers, and trailing punctuation-free paths.
+ */
+const FILE_SECTION_HEADER_RE =
+  /^#{0,6}[ \t]*(?:\*\*)?[Ff]ile(?:[ \t]+path)?[ \t]*:?[ \t]+(\S[^\n]*?)[ \t]*$/gm;
+
+/**
+ * A fenced code block whose closing fence is at least three backticks
+ * (tolerates models that close a ``` fence with ````). The content is the
+ * raw file body — no JSON escaping involved.
+ */
+const FENCED_FILE_BODY_RE =
+  /```[a-zA-Z0-9_+.-]*[ \t]*\r?\n([\s\S]*?)\r?\n?[ \t]*`{3,}[ \t]*(?=\r?\n|$)/;
+
+/** Strips wrapping bold markers / backticks / quotes from a captured path. */
+function cleanFilePath(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^\*+|\*+$/g, '')
+    .replace(/^`+|`+$/g, '')
+    .replace(/^["']|["']$/g, '')
+    .trim();
+}
+
+/**
+ * Extracts files from the markdown file-section contract: each
+ * `### File: <path>` header followed by a fenced code block. Sections with
+ * unsafe paths or missing bodies are skipped; never throws.
+ */
+export function parseFileSections(text: string): ProjectFile[] {
+  const headerRe = new RegExp(FILE_SECTION_HEADER_RE.source, 'gm');
+  const headers: Array<{ path: string; index: number; bodyStart: number }> = [];
+
+  let match: RegExpExecArray | null;
+  while ((match = headerRe.exec(text)) !== null) {
+    const path = cleanFilePath(match[1] ?? '');
+    if (isSafeProjectFilePath(path)) {
+      headers.push({ path, index: match.index, bodyStart: match.index + match[0].length });
+    }
+  }
+
+  const files: ProjectFile[] = [];
+  for (let i = 0; i < headers.length && files.length < MAX_FILES_PER_RESPONSE; i += 1) {
+    const current = headers[i] as { path: string; index: number; bodyStart: number };
+    const next = headers[i + 1];
+    const region = text.slice(current.bodyStart, next !== undefined ? next.index : text.length);
+    const body = FENCED_FILE_BODY_RE.exec(region);
+    const content = body?.[1]?.replace(/\s+$/, '');
+    if (content === undefined || content.length === 0) continue;
+    if (content.length > MAX_FILE_CONTENT_LENGTH) continue;
+    files.push({ path: current.path, content });
+  }
+  return files;
+}
+
+/**
+ * Repairs invalid JSON string escapes (`\d`, `\x`, lone backslashes) so a
+ * legacy model response can still be parsed instead of crashing with
+ * "Bad escaped character in JSON at position X". Valid escapes are kept.
+ */
+function repairJsonEscapes(raw: string): string {
+  return raw.replace(/\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})/g, '\\\\');
+}
+
+/** Parses a JSON payload leniently (strict parse first, then escape repair). */
+function lenientJsonParse(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return JSON.parse(repairJsonEscapes(raw));
+  }
+}
+
+/**
+ * Legacy fallback: extracts `{"files": [{"path", "content"}]}` payloads from
+ * models that still answer with JSON. Parsing is lenient (invalid string
+ * escapes are repaired first), never throws, and enforces the same path and
+ * size bounds as the markdown contract.
+ */
+function parseLegacyJsonFiles(text: string): ProjectFile[] {
+  let payload: unknown;
+  try {
+    payload = lenientJsonParse(extractJsonBlock(text));
+  } catch {
+    return [];
+  }
+
+  const record = payload as { files?: unknown } | unknown[];
+  const rawFiles = Array.isArray(record) ? record : record.files;
+  if (!Array.isArray(rawFiles)) return [];
+
+  const files: ProjectFile[] = [];
+  for (const entry of rawFiles.slice(0, MAX_FILES_PER_RESPONSE)) {
+    const candidate = entry as { path?: unknown; content?: unknown };
+    if (typeof candidate.path !== 'string' || typeof candidate.content !== 'string') continue;
+    const path = cleanFilePath(candidate.path);
+    if (!isSafeProjectFilePath(path)) continue;
+    if (candidate.content.length > MAX_FILE_CONTENT_LENGTH) continue;
+    files.push({ path, content: candidate.content });
+  }
+  return files;
+}
+
+/**
+ * Extracts generated project files from raw model output. Order:
+ *
+ * 1. Markdown file sections (`### File: <path>` + fenced code block) — the
+ *    primary contract; raw content, zero JSON escaping.
+ * 2. Legacy `{"files": [...]}` JSON payloads (lenient, escape-repaired).
+ * 3. When `defaultPath` is set and nothing above matched, the whole
+ *    response (fences stripped) is taken as that single file — used by
+ *    single-file repair turns.
+ *
+ * Never throws: unusable output yields an empty list.
+ */
+export function parseGeneratedFiles(
+  text: string,
+  options: { defaultPath?: string } = {},
+): ProjectFile[] {
+  const sections = parseFileSections(text);
+  if (sections.length > 0) return sections;
+
+  const legacy = parseLegacyJsonFiles(text);
+  if (legacy.length > 0) return legacy;
+
+  const fallbackPath = options.defaultPath;
+  if (fallbackPath !== undefined && isSafeProjectFilePath(fallbackPath)) {
+    const content = stripFences(text);
+    if (content.length > 0 && content.length <= MAX_FILE_CONTENT_LENGTH) {
+      return [{ path: fallbackPath, content }];
+    }
+  }
+  return [];
+}
+
+// ---------------------------------------------------------------------------
+// Markdown-contract file generation
 // ---------------------------------------------------------------------------
 
 /**
  * Generates a set of project files from a prompt (with optional image parts)
- * using structured output.
+ * using the markdown file-section contract (see
+ * {@link FILE_EMISSION_CONTRACT}): one `### File: <path>` header plus a
+ * fenced code block per file — never JSON string fields.
  *
- * Prefers `generateObject` with the `project_files` schema. When the model
- * rejects native `json_schema` structured output (400 / unsupported
- * parameter — typical of local SLMs and OpenAI-compatible proxies), answers
- * without invoking the structured tool (`NoObjectGeneratedError`), or the
- * provider returns an unparseable/truncated response body, falls back to
- * salvaging the returned text/body, then to `generateText` with JSON block
- * extraction out of the raw response.
+ * Responses are extracted with the robust regex parser
+ * ({@link parseGeneratedFiles}); a legacy `{"files": [...]}` payload is
+ * still accepted leniently. When the first reply is unusable, one bounded
+ * extraction turn re-asks with a stricter instruction; a second unusable
+ * reply raises. Protocol failures (unsupported structured output, provider
+ * body-parse faults) first attempt salvage from the raw response text/body.
  * The whole call runs inside the single bounded transient retry policy
  * (429/502/503/408 and transient 2xx body-parse faults retried, 401/403
  * abort the run, everything else raises).
@@ -458,46 +650,12 @@ export async function generateStructuredFilesFromParts(
   options: SynthesisCallOptions = {},
 ): Promise<ProjectFile[]> {
   const model = options.model ?? getSynthesizerModel();
-  let structuredUnsupported = false;
+  const parseOptions =
+    options.defaultFilePath !== undefined ? { defaultPath: options.defaultFilePath } : {};
+  let extractionTurnUsed = false;
 
-  return withTransientRetry(async () => {
-    if (!structuredUnsupported) {
-      try {
-        const result = await generateObject({
-          model,
-          schema: GeneratedProjectSchema,
-          schemaName: 'project_files',
-          maxRetries: 0,
-          abortSignal: llmTimeoutSignal(),
-          ...(systemPrompt !== undefined ? { system: systemPrompt } : {}),
-          messages: [{ role: 'user', content: parts }],
-        });
-
-        return result.object.files;
-      } catch (cause) {
-        // Salvage files the failed structured call already produced before
-        // paying for a second generation round-trip.
-        const salvaged = isStructuredProtocolFailure(cause) ? salvageGeneratedFiles(cause) : null;
-        if (salvaged !== null) return salvaged;
-
-        const unsupported = isStructuredOutputUnsupported(cause);
-        const protocolFailure = isStructuredProtocolFailure(cause);
-        if (!unsupported && !protocolFailure) throw cause;
-
-        // Protocol capability fallback — not a fatal failure; subsequent
-        // retry attempts skip straight to the generateText path.
-        structuredUnsupported = true;
-        console.warn(
-          unsupported
-            ? '[apograph] structured output unsupported by model; ' +
-                'falling back to generateText JSON extraction.'
-            : '[apograph] structured response unusable; ' +
-                'falling back to generateText JSON extraction.',
-        );
-      }
-    }
-
-    const textResult = await generateText({
+  const request = (instruction: string): Promise<{ text: string }> =>
+    generateText({
       model,
       maxRetries: 0,
       abortSignal: llmTimeoutSignal(),
@@ -505,42 +663,45 @@ export async function generateStructuredFilesFromParts(
       messages: [
         {
           role: 'user',
-          content: [
-            ...parts,
-            {
-              type: 'text' as const,
-              text:
-                '\n\nRespond with ONLY a JSON object of the form ' +
-                '{"files": [{"path": "<file path>", "content": "<full file content>"}]}. ' +
-                'No markdown fences, no commentary, no extra keys.',
-            },
-          ],
+          content: [...parts, { type: 'text' as const, text: `\n\n${instruction}` }],
         },
       ],
     });
 
-    const parsed: GeneratedProject = GeneratedProjectSchema.parse(
-      JSON.parse(extractJsonBlock(textResult.text)),
+  return withTransientRetry(async () => {
+    try {
+      const result = await request(FILE_EMISSION_CONTRACT);
+      const files = parseGeneratedFiles(result.text, parseOptions);
+      if (files.length > 0) return files;
+    } catch (cause) {
+      // Salvage files the failed call already produced before paying for a
+      // second generation round-trip.
+      const salvaged = salvageGeneratedFiles(cause);
+      if (salvaged !== null) return salvaged;
+
+      const recoverable =
+        isStructuredOutputUnsupported(cause) || isStructuredProtocolFailure(cause);
+      if (!recoverable || extractionTurnUsed) throw cause;
+    }
+
+    // The reply carried no usable files: one bounded extraction turn per
+    // call, then the stage fails explicitly.
+    if (extractionTurnUsed) {
+      throw new Error(
+        'model response contained no usable project files ' +
+          '(expected `### File: <path>` markdown sections with fenced code blocks)',
+      );
+    }
+    extractionTurnUsed = true;
+
+    const retry = await request(FILE_EXTRACTION_TURN_CONTRACT);
+    const files = parseGeneratedFiles(retry.text, parseOptions);
+    if (files.length > 0) return files;
+    throw new Error(
+      'model response contained no usable project files ' +
+        '(expected `### File: <path>` markdown sections with fenced code blocks)',
     );
-
-    return parsed.files;
   }, options);
-}
-
-/**
- * Generates a set of project files from a plain text prompt. See
- * {@link generateStructuredFilesFromParts} for the multimodal variant.
- */
-export async function generateStructuredFiles(
-  prompt: string,
-  systemPrompt?: string,
-  options: SynthesisCallOptions = {},
-): Promise<ProjectFile[]> {
-  return generateStructuredFilesFromParts(
-    [{ type: 'text', text: prompt }],
-    systemPrompt,
-    options,
-  );
 }
 
 // ---------------------------------------------------------------------------

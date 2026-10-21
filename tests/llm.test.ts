@@ -15,8 +15,13 @@ import {
   isNetworkResetError,
   computeBackoffMs,
   withTransientRetry,
+  parseGeneratedFiles,
+  parseFileSections,
+  resolveLlmTimeoutMs,
+  FILE_EMISSION_CONTRACT,
   ProviderAuthError,
   MAX_ATTEMPTS,
+  MAX_STAGE_TIMEOUT_MS,
   BACKOFF_BUDGET_MS,
   BACKOFF_SCHEDULE,
 } from '../dist/synthesizer/llm.js';
@@ -342,7 +347,7 @@ describe('generateStructuredFilesFromParts (retry integration)', () => {
     assert.deepEqual(clock.sleeps, []);
   });
 
-  test('unsupported structured output falls back to generateText JSON extraction', async () => {
+  test('unsupported structured output falls back to a text extraction turn', async () => {
     const clock = fakeClock();
     let calls = 0;
     const files = await generateStructuredFilesFromParts(
@@ -363,7 +368,7 @@ describe('generateStructuredFilesFromParts (retry integration)', () => {
       },
     );
     assert.equal(files[0]?.path, 'src/b.ts');
-    assert.equal(calls, 2, 'one generateObject probe + one generateText fallback');
+    assert.equal(calls, 2, 'one failed call + one bounded extraction turn');
     assert.deepEqual(clock.sleeps, [], 'protocol fallback is not a transient retry');
   });
 
@@ -453,9 +458,9 @@ describe('network/socket dropouts (transient reconnects)', () => {
 // ---------------------------------------------------------------------------
 
 /**
- * Builds an AI SDK `NoObjectGeneratedError`-shaped failure: the model
- * answered but never invoked the structured-output tool. Optionally carries
- * the raw response text the SDK attaches for salvage.
+ * Builds an AI SDK `NoObjectGeneratedError`-shaped protocol failure (the
+ * model answered but no usable payload came back). Optionally carries the
+ * raw response text the SDK attaches for salvage.
  */
 function noObjectGenerated(text?: string, message = 'No object generated: the tool was not called.'): Error {
   return Object.assign(new Error(message), {
@@ -464,8 +469,8 @@ function noObjectGenerated(text?: string, message = 'No object generated: the to
   });
 }
 
-describe('generateStructuredFilesFromParts (no-object-generated fallback)', () => {
-  test('salvages project JSON from the failed structured call without a second LLM round-trip', async () => {
+describe('generateStructuredFilesFromParts (protocol-failure salvage)', () => {
+  test('salvages project files from the failed call text without a second LLM round-trip', async () => {
     const clock = fakeClock();
     let calls = 0;
     const files = await generateStructuredFilesFromParts(
@@ -484,7 +489,7 @@ describe('generateStructuredFilesFromParts (no-object-generated fallback)', () =
     assert.deepEqual(clock.sleeps, []);
   });
 
-  test('falls back to generateText JSON extraction when the response text is not salvageable', async () => {
+  test('spends one bounded extraction turn when the response text is not salvageable', async () => {
     const clock = fakeClock();
     let calls = 0;
     const files = await generateStructuredFilesFromParts(
@@ -505,7 +510,7 @@ describe('generateStructuredFilesFromParts (no-object-generated fallback)', () =
       },
     );
     assert.equal(files[0]?.path, 'src/fallback.ts');
-    assert.equal(calls, 2, 'one failed structured call + one generateText fallback');
+    assert.equal(calls, 2, 'one failed call + one bounded extraction turn');
     assert.deepEqual(clock.sleeps, [], 'protocol fallback is not a transient retry');
   });
 
@@ -586,7 +591,7 @@ describe('generateStructuredFilesFromParts (invalid-JSON-response fallback)', ()
     assert.deepEqual(clock.sleeps, []);
   });
 
-  test('un-salvageable invalid-JSON falls back to generateText JSON extraction', async () => {
+  test('un-salvageable invalid-JSON falls back to a text extraction turn', async () => {
     const clock = fakeClock();
     let calls = 0;
     const files = await generateStructuredFilesFromParts(
@@ -607,7 +612,7 @@ describe('generateStructuredFilesFromParts (invalid-JSON-response fallback)', ()
       },
     );
     assert.equal(files[0]?.path, 'src/recovered.ts');
-    assert.equal(calls, 2, 'one failed structured call + one generateText fallback');
+    assert.equal(calls, 2, 'one failed call + one bounded extraction turn');
     assert.deepEqual(clock.sleeps, [], 'protocol fallback itself is not a retry');
   });
 
@@ -638,8 +643,8 @@ describe('generateStructuredFilesFromParts (invalid-JSON-response fallback)', ()
         }) as never,
       },
     );
-    // generateObject parses the first text and fails; salvage recovers the
-    // embedded project JSON without a second call.
+    // The first reply is un-parseable as file sections; the lenient legacy
+    // extractor recovers the embedded project files without a second call.
     assert.equal(files[0]?.path, 'src/mid.ts');
     assert.equal(calls, 1);
     assert.deepEqual(clock.sleeps, []);
@@ -658,7 +663,175 @@ describe('generateStructuredFilesFromParts (invalid-JSON-response fallback)', ()
       }),
       /Invalid JSON response/,
     );
-    assert.equal(calls, 4, '1 structured + 1 text on attempt 1, then text-only attempts 2-3');
+    assert.equal(calls, 4, 'call + extraction turn on attempt 1, then single calls on attempts 2-3');
     assert.deepEqual(clock.sleeps, [3000, 7000], 'bounded transient backoff between attempts');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Markdown file-section extraction (regression: JSON-in-JSON parse crashes)
+// ---------------------------------------------------------------------------
+
+describe('parseFileSections / parseGeneratedFiles (robust file extraction)', () => {
+  test('extracts multi-file responses from ### File: sections with fenced bodies', () => {
+    const text = [
+      'Here are the synthesized files.',
+      '',
+      '### File: src/components/Navbar.tsx',
+      '```tsx',
+      'export function Navbar() { return <nav />; }',
+      '```',
+      '',
+      '### File: src/pages/HomePage.tsx',
+      '```tsx',
+      'export function HomePage() {',
+      '  return <main className="flex min-h-screen w-full flex-col" />;',
+      '}',
+      '```',
+    ].join('\n');
+
+    const files = parseGeneratedFiles(text);
+    assert.equal(files.length, 2);
+    assert.equal(files[0]?.path, 'src/components/Navbar.tsx');
+    assert.equal(files[0]?.content, 'export function Navbar() { return <nav />; }');
+    assert.equal(files[1]?.path, 'src/pages/HomePage.tsx');
+    assert.ok(files[1]?.content.includes('min-h-screen'));
+  });
+
+  test('tolerates bold headers, language tags, and long closing fences', () => {
+    const text = [
+      '**File: src/lib/util.ts**',
+      '```ts',
+      'export const answer = 42;',
+      '````',
+    ].join('\n');
+    const files = parseFileSections(text);
+    assert.equal(files.length, 1);
+    assert.equal(files[0]?.path, 'src/lib/util.ts');
+    assert.equal(files[0]?.content, 'export const answer = 42;');
+  });
+
+  test('file content is never JSON-unescaped — backslashes survive verbatim', () => {
+    const text = [
+      '### File: src/lib/patterns.ts',
+      '```ts',
+      'export const DIGIT = /\\d+/g; // a classic bad JSON escape',
+      'export const QUOTED = "she said \\"hi\\"";',
+      '```',
+    ].join('\n');
+    const files = parseGeneratedFiles(text);
+    assert.equal(files[0]?.content, [
+      'export const DIGIT = /\\d+/g; // a classic bad JSON escape',
+      'export const QUOTED = "she said \\"hi\\"";',
+    ].join('\n'));
+  });
+
+  test('rejects unsafe paths and empty bodies instead of emitting broken files', () => {
+    const text = [
+      '### File: /etc/passwd',
+      '```',
+      'root:x:0:0',
+      '```',
+      '### File: src/../../escape.ts',
+      '```',
+      'evil',
+      '```',
+      '### File: src/empty.ts',
+      '```',
+      '```',
+      '### File: src/ok.ts',
+      '```',
+      'export {};',
+      '```',
+    ].join('\n');
+    const files = parseGeneratedFiles(text);
+    assert.deepEqual(files.map((file) => file.path), ['src/ok.ts']);
+  });
+
+  test('legacy {"files": [...]} payloads still parse leniently', () => {
+    const files = parseGeneratedFiles('{"files":[{"path":"src/a.ts","content":"x"}]}');
+    assert.equal(files.length, 1);
+    assert.equal(files[0]?.path, 'src/a.ts');
+  });
+
+  test('legacy JSON with invalid string escapes is repaired, never thrown', () => {
+    // The exact regression: `\\d` (and friends) inside content strings used
+    // to crash with "Bad escaped character in JSON at position X".
+    const raw =
+      '{"files":[{"path":"src/re.ts","content":"const re = /\\d+/; const win = C:\\\\tmp"}]}';
+    const files = parseGeneratedFiles(raw);
+    assert.equal(files.length, 1);
+    assert.equal(files[0]?.content, 'const re = /\\d+/; const win = C:\\tmp');
+  });
+
+  test('defaultPath accepts a raw or single-fenced reply for repair turns', () => {
+    const raw = parseGeneratedFiles('export const fixed = true;', {
+      defaultPath: 'src/pages/Home.tsx',
+    });
+    assert.deepEqual(raw, [{ path: 'src/pages/Home.tsx', content: 'export const fixed = true;' }]);
+
+    const fenced = parseGeneratedFiles('```\nexport const fixed = true;\n```', {
+      defaultPath: 'src/pages/Home.tsx',
+    });
+    assert.deepEqual(fenced, [{ path: 'src/pages/Home.tsx', content: 'export const fixed = true;' }]);
+  });
+
+  test('unusable output yields an empty list instead of throwing', () => {
+    assert.deepEqual(parseGeneratedFiles('I would rather describe it in prose.'), []);
+    assert.deepEqual(parseGeneratedFiles(''), []);
+    assert.deepEqual(parseGeneratedFiles('{"error":"upstream unavailable"}'), []);
+    assert.deepEqual(parseGeneratedFiles('<html><body>challenge</body></html>'), []);
+  });
+
+  test('generation turns carry the markdown file-section contract', () => {
+    assert.ok(FILE_EMISSION_CONTRACT.includes('### File: <project-relative/path>'));
+    assert.ok(FILE_EMISSION_CONTRACT.includes('Do not wrap file contents in a JSON object'));
+  });
+
+  test('generateStructuredFilesFromParts extracts fenced replies end to end', async () => {
+    const clock = fakeClock();
+    const files = await generateStructuredFilesFromParts(
+      [{ type: 'text', text: 'build the page' }],
+      undefined,
+      {
+        ...clock,
+        model: mockModel(async () => ({
+          finishReason: 'stop',
+          usage: { promptTokens: 1, completionTokens: 1 },
+          text: '### File: src/pages/HomePage.tsx\n```tsx\nexport function HomePage() {}\n```',
+          rawCall: { rawPrompt: null, rawSettings: {} },
+        })) as never,
+      },
+    );
+    assert.equal(files.length, 1);
+    assert.equal(files[0]?.path, 'src/pages/HomePage.tsx');
+    assert.equal(files[0]?.content, 'export function HomePage() {}');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-stage generation timeout bound
+// ---------------------------------------------------------------------------
+
+describe('resolveLlmTimeoutMs (per-stage timeout cap)', () => {
+  test('defaults to 180s and clamps any override to the 180s cap', () => {
+    const previous = process.env.APOGRAPH_LLM_TIMEOUT_MS;
+    try {
+      delete process.env.APOGRAPH_LLM_TIMEOUT_MS;
+      assert.equal(resolveLlmTimeoutMs(), 180_000);
+      assert.equal(MAX_STAGE_TIMEOUT_MS, 180_000);
+
+      process.env.APOGRAPH_LLM_TIMEOUT_MS = '900000';
+      assert.equal(resolveLlmTimeoutMs(), 180_000, 'a 15-minute override is clamped to 180s');
+
+      process.env.APOGRAPH_LLM_TIMEOUT_MS = '30000';
+      assert.equal(resolveLlmTimeoutMs(), 30_000, 'smaller overrides are honored');
+
+      process.env.APOGRAPH_LLM_TIMEOUT_MS = 'not-a-number';
+      assert.equal(resolveLlmTimeoutMs(), 180_000, 'invalid overrides fall back to the default');
+    } finally {
+      if (previous === undefined) delete process.env.APOGRAPH_LLM_TIMEOUT_MS;
+      else process.env.APOGRAPH_LLM_TIMEOUT_MS = previous;
+    }
   });
 });

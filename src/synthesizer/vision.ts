@@ -430,16 +430,21 @@ export function buildVisualRepairPrompt(
     'spacing, and element sizing all count), not cosmetic one-line tweaks.',
     '',
     `Emit exactly one file — ${componentPath} — with the complete,`,
-    'compile-ready corrected content.',
+    'compile-ready corrected content, as one markdown file section:',
+    `### File: ${componentPath}`,
+    '```',
+    '<complete corrected file content>',
+    '```',
   ].join('\n');
 
   const systemPrompt = [
     'You are a surgical frontend repair agent. You receive one React',
     'component and a pixelmatch diff overlay against the reference site.',
     'Apply the minimum targeted styling corrections indicated by the diff.',
-    'Respond with the complete corrected file content only: no markdown',
-    'fences, no commentary, no truncation. Preserve everything the diff does',
-    'not implicate.',
+    'Respond with the corrected file as a single `### File: <path>` markdown',
+    'section wrapping the complete corrected content in a fenced code block,',
+    'no commentary and no truncation. Preserve everything the diff does not',
+    'implicate.',
   ].join(' ');
 
   return { text, systemPrompt };
@@ -470,7 +475,11 @@ export async function repairComponentWithVisualDiff(
     ],
   );
 
-  const files = await generateStructuredFilesFromParts(parts, systemPrompt);
+  const files = await generateStructuredFilesFromParts(parts, systemPrompt, {
+    // Single-file repair: a raw (unfenced) corrected reply is accepted as
+    // this file instead of failing extraction.
+    defaultFilePath: promptPath,
+  });
   const repaired = selectRepairedFile(files, componentPath, promptPath);
   if (repaired === undefined || repaired.content.trim().length === 0) {
     throw new Error(`Visual repair for ${promptPath} returned no file content.`);

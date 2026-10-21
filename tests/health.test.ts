@@ -12,6 +12,10 @@ import {
   analyzeUniformity,
   checkCaptureHealth,
   classifyRedirect,
+  detectBotBlock,
+  BotBlockedError,
+  BOT_BLOCK_MESSAGE,
+  MIN_VISIBLE_TEXT_NODES,
   UNIFORMITY_THRESHOLD,
 } from '../dist/crawler/health.js';
 import type { CaptureHealth } from '../dist/crawler/health.js';
@@ -215,4 +219,80 @@ test('analyzeUniformity > reports dominant color and ratio', () => {
   assert.equal(analysis.dominantColor, '#080f1c');
   assert.ok(analysis.uniformityRatio >= 0.9);
   assert.ok(analysis.uniformityRatio <= 1);
+});
+
+// ---------------------------------------------------------------------------
+// Pre-flight bot / WAF challenge detection
+// ---------------------------------------------------------------------------
+
+test('bot-check > challenge and restriction titles are blocked', () => {
+  const cases: Array<[string, string]> = [
+    ['Just a moment...', 'challenge-title'],
+    ['Attention Required! | Cloudflare', 'challenge-title'],
+    ['Checking your browser before accessing example.com', 'challenge-title'],
+    ['Access Denied', 'access-restriction-title'],
+  ];
+  for (const [title, signature] of cases) {
+    const verdict = detectBotBlock({ title, httpStatus: 200, visibleTextNodeCount: 120 });
+    assert.equal(verdict.verdict, 'blocked', `title "${title}" must block`);
+    assert.equal(verdict.signature, signature, `title "${title}" signature`);
+  }
+});
+
+test('bot-check > HTTP 403/404 responses are blocked', () => {
+  for (const status of [403, 404]) {
+    const verdict = detectBotBlock({ title: 'Some page', httpStatus: status, visibleTextNodeCount: 80 });
+    assert.equal(verdict.verdict, 'blocked', `HTTP ${status} must block`);
+    assert.equal(verdict.signature, 'blocked-http-status');
+    assert.ok(verdict.detail.includes(String(status)));
+  }
+  // Other statuses never block on their own.
+  for (const status of [200, 301, 401, 500]) {
+    const verdict = detectBotBlock({ title: 'Some page', httpStatus: status, visibleTextNodeCount: 80 });
+    assert.equal(verdict.verdict, 'clean', `HTTP ${status} alone must not block`);
+  }
+});
+
+test('bot-check > near-empty DOMs are blocked', () => {
+  const verdict = detectBotBlock({
+    title: 'Example',
+    httpStatus: 200,
+    visibleTextNodeCount: MIN_VISIBLE_TEXT_NODES - 1,
+  });
+  assert.equal(verdict.verdict, 'blocked');
+  assert.equal(verdict.signature, 'sparse-dom');
+
+  const atThreshold = detectBotBlock({
+    title: 'Example',
+    httpStatus: 200,
+    visibleTextNodeCount: MIN_VISIBLE_TEXT_NODES,
+  });
+  assert.equal(atThreshold.verdict, 'clean', 'threshold itself is a real page');
+});
+
+test('bot-check > unknown DOM evidence is never treated as blocked', () => {
+  const verdict = detectBotBlock({ title: 'Example', httpStatus: 200, visibleTextNodeCount: null });
+  assert.equal(verdict.verdict, 'clean');
+  assert.ok(verdict.detail.includes('unavailable'));
+});
+
+test('bot-check > clean pages pass and record evidence detail', () => {
+  const verdict = detectBotBlock({ title: 'Example Domain', httpStatus: 200, visibleTextNodeCount: 42 });
+  assert.equal(verdict.verdict, 'clean');
+  assert.equal(verdict.signature, null);
+  assert.ok(verdict.detail.includes('Example Domain'));
+  assert.ok(verdict.detail.includes('42'));
+});
+
+test('bot-check > BotBlockedError aborts with the exact message', () => {
+  const verdict = detectBotBlock({ title: 'Just a moment...', httpStatus: 403, visibleTextNodeCount: 1 });
+  const error = new BotBlockedError(verdict, 'https://example.com/');
+  assert.equal(
+    error.message,
+    '[BLOCKED] Bot challenge or access restriction detected on target URL. Crawl aborted before synthesis.',
+  );
+  assert.equal(error.message, BOT_BLOCK_MESSAGE);
+  assert.equal(error.name, 'BotBlockedError');
+  assert.equal(error.url, 'https://example.com/');
+  assert.equal(error.verdict, verdict);
 });

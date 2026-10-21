@@ -239,24 +239,24 @@ test('scaffold > dev script uses Vite default host', () => {
   assert.equal(parsed.scripts.dev, 'vite');
 });
 
-test('source > system guidelines forbid mixed icon name/component properties', async () => {
+test('source > system guidelines spell out icon properties, footer, and card images', async () => {
   const modularSource = await readFile(
     join(fileURLToPath(new URL('../src/synthesizer/modular.ts', import.meta.url))),
     'utf8',
   );
   assert.ok(
     modularSource.includes(
-      'Never assign string names and component references to the same property',
+      'store string names and component references in separate properties',
     ),
     'lucide-react icon handling must be spelled out (TS2322 icon/ReactNode quirk)',
   );
   assert.ok(
-    modularSource.includes('FOOTER CONTRACT'),
-    'Footer contract must ban fixed/sticky/absolute positioning',
+    modularSource.includes('static block container at the bottom of the page'),
+    'Footer rule must keep the static block container contract (no fixed/sticky/absolute)',
   );
   assert.ok(
-    modularSource.includes('CARD IMAGES'),
-    'Card images rule must ban assigning background crops or logos to cards',
+    modularSource.includes('Card images use the dedicated visual assets'),
+    'Card images rule must prefer dedicated visual assets over background crops or logos',
   );
 });
 

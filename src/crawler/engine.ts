@@ -12,6 +12,11 @@
  * - the a11y tree and CSSTree design tokens (reusing `harvester/dom.ts`);
  * - image asset references, mirrored into the evidence bundle afterwards.
  *
+ * Immediately after each navigation a pre-flight bot / WAF challenge check
+ * runs (see `crawler/health.ts`); a detected challenge or access restriction
+ * aborts the whole crawl with `[BLOCKED]` before any capture — and long
+ * before synthesis.
+ *
  * Everything is recorded in `.apograph/evidence/manifest.json`.
  */
 
@@ -19,7 +24,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { chromium } from 'playwright';
 import { validateNetworkUrl, type NetworkPolicyOptions } from './network-policy.js';
-import type { Browser, Frame, Page } from 'playwright';
+import type { Browser, Frame, Page, Response as PageResponse } from 'playwright';
 import type {
   AssetEntry,
   CrawlRoute,
@@ -38,8 +43,10 @@ import { slugForPath, toEvidenceRelativePath } from '../utils/fs-safe.js';
 import { discoverImageAssets, mirrorAssets } from './assets.js';
 import { gotoWithReadiness, reloadWithReadiness, type NavigationOutcome } from './navigation.js';
 import {
+  BotBlockedError,
   checkCaptureHealth,
   classifyRedirect,
+  detectBotBlock,
 } from './health.js';
 import type { CaptureHealth } from './health.js';
 import { discoverInteractiveStates } from './interactions.js';
@@ -429,6 +436,15 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         if (frame === page.mainFrame()) lastNavTime = Date.now();
       };
       page.on('framenavigated', onNavigated);
+      // HTTP status of the final main-frame document response, for the
+      // pre-flight bot/WAF challenge check (403/404 = access restriction).
+      let lastDocumentStatus: number | null = null;
+      const onDocumentResponse = (response: PageResponse): void => {
+        if (response.frame() !== page.mainFrame()) return;
+        if (response.request().resourceType() !== 'document') return;
+        lastDocumentStatus = response.status();
+      };
+      page.on('response', onDocumentResponse);
       let navOutcome: NavigationOutcome;
       try {
         await page.evaluate(() => {
@@ -446,11 +462,33 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         continue;
       } finally {
         page.off('framenavigated', onNavigated);
+        page.off('response', onDocumentResponse);
       }
       if (!navOutcome.settled && navOutcome.note !== undefined) {
         skip(entry.url, navOutcome.note);
       }
       const settleTimeMs = lastNavTime - gotoStart;
+
+      // Pre-flight bot / WAF challenge detection: runs immediately after
+      // navigation, before any capture or evidence pass. A challenge
+      // interstitial, an access restriction (403/404), or a near-empty DOM
+      // aborts the whole crawl with an explicit error so a blocked target
+      // can never reach evidence capture — or synthesis.
+      let visibleTextNodeCount: number | null = null;
+      try {
+        visibleTextNodeCount = await countVisibleTextNodes(page);
+      } catch {
+        // DOM unavailable (crashed/navigating context): the title and HTTP
+        // status checks still decide.
+      }
+      const botCheck = detectBotBlock({
+        title,
+        httpStatus: lastDocumentStatus,
+        visibleTextNodeCount,
+      });
+      if (botCheck.verdict === 'blocked') {
+        throw new BotBlockedError(botCheck, entry.url);
+      }
 
       // Record the post-redirect URL as the canonical root when the initial
       // request was redirected (e.g. /faq -> /frequently-asked-questions).
@@ -615,6 +653,7 @@ export async function crawlEvidence(options: CrawlOptions): Promise<EvidenceMani
         url: entry.url,
         path,
         title,
+        botCheck,
         desktopScreenshot:
           desktopScreenshot === null
             ? null
@@ -792,6 +831,33 @@ function countVisibleNodesInPage(): number {
 /** Counts visible DOM nodes on the current page (spec s2.1 DOM emptiness). */
 async function countVisibleNodes(page: Page): Promise<number> {
   return page.evaluate(countVisibleNodesInPage);
+}
+
+/** In-page collector counting visible (non-whitespace) text nodes under <body>. */
+function countVisibleTextNodesInPage(): number {
+  if (document.body === null) return 0;
+  let count = 0;
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    if ((node.textContent ?? '').trim().length === 0) continue;
+    const parent = node.parentElement;
+    if (parent === null) continue;
+    const style = getComputedStyle(parent);
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    // No client rects => hidden by an ancestor (display:none) or zero-sized.
+    if (parent.getClientRects().length === 0) continue;
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * Counts visible text nodes on the current page (pre-flight bot check: a
+ * challenge shell has fewer than {@link MIN_VISIBLE_TEXT_NODES}).
+ */
+async function countVisibleTextNodes(page: Page): Promise<number> {
+  return page.evaluate(countVisibleTextNodesInPage);
 }
 
 // ---------------------------------------------------------------------------
