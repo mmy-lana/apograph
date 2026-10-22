@@ -18,6 +18,12 @@ import { dirname, join, resolve } from 'node:path';
 import * as p from '@clack/prompts';
 import type { ProjectFile, RouteMetadata } from '../types.js';
 import { assertNoSymlinkComponents, assertSafeRelativePath, resolveContainedPath } from '../utils/fs-safe.js';
+import { escapeSingleQuotedApostrophes } from './sanitize.js';
+
+/** True for generated TypeScript/JavaScript source files (sanitizer targets). */
+function isSourceFile(path: string): boolean {
+  return /\.(?:[cm]?[jt]sx?)$/.test(path);
+}
 
 // ---------------------------------------------------------------------------
 // Fixed target stack versions
@@ -361,7 +367,12 @@ export async function emitProject(
     const filePath = resolveContainedPath(projectDir, safePath);
     await mkdir(dirname(filePath), { recursive: true });
     await assertNoSymlinkComponents(projectDir, filePath);
-    await writeFile(filePath, file.content, 'utf8');
+    // Deterministically sanitize generated code before it reaches the compiler:
+    // vision synthesis can emit prose with unescaped apostrophes inside
+    // single-quoted string literals, which breaks parsing (TS1005). This is a
+    // generic, target-agnostic normalization applied to every source file.
+    const content = isSourceFile(safePath) ? escapeSingleQuotedApostrophes(file.content) : file.content;
+    await writeFile(filePath, content, 'utf8');
     writtenFiles.push(safePath);
   }
 
