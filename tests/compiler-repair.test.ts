@@ -21,7 +21,7 @@ import { dirname, join } from 'node:path';
 
 import { parseTscDiagnostics, runTier1Build } from '../dist/verifier/engine.js';
 import type { CommandResult, Tier1Deps } from '../dist/verifier/engine.js';
-import { completeTruncatedSource, runCompilerRepairLoop } from '../dist/compiler/repair.js';
+import { completeTruncatedSource, runCompilerRepairLoop, parseImportClauseForSpecifier, buildMissingModuleStub } from '../dist/compiler/repair.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures & harness
@@ -473,6 +473,71 @@ test('truncation heal > repair loop completes truncated files without LLM turns'
         '}',
       ].join('\n'),
     );
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Missing relative-module stubs
+// ---------------------------------------------------------------------------
+
+test('module stubs > parseImportClauseForSpecifier extracts default and named bindings', () => {
+  const content = [
+    "import type { FooterLink, Brand as BrandModel } from './types';",
+    "import Icon from './types';",
+    "import { Other } from './elsewhere';",
+  ].join('\n');
+  const imports = parseImportClauseForSpecifier(content, './types');
+  assert.ok(imports !== null);
+  assert.equal(imports.defaultName, 'Icon');
+  assert.deepEqual(imports.named, ['FooterLink', 'BrandModel'], 'aliases resolve to local names');
+  assert.equal(parseImportClauseForSpecifier(content, './missing'), null);
+});
+
+test('module stubs > buildMissingModuleStub emits class stubs for every binding', () => {
+  const stub = buildMissingModuleStub({ defaultName: 'Icon', named: ['FooterLink'] });
+  assert.equal(stub, 'export class FooterLink {}\nexport default class Icon {}\n');
+  assert.equal(buildMissingModuleStub({ named: [] }), null);
+});
+
+test('module stubs > repair loop creates the missing module without LLM turns', async () => {
+  const project = await makeProject({
+    'src/components/Footer.tsx': [
+      "import type { FooterLink } from './types';",
+      "import Icon from './types';",
+      'export function Footer(links: FooterLink[]): null {',
+      '  void links; void Icon; return null;',
+      '}',
+    ].join('\n'),
+  });
+  try {
+    const tscQueue: CommandResult[] = [
+      {
+        ok: false,
+        output: "src/components/Footer.tsx(1,24): error TS2307: Cannot find module './types' or its corresponding type declarations.",
+      },
+      { ok: true, output: '' },
+    ];
+    const repairs: string[] = [];
+    const result = await runCompilerRepairLoop(project, {
+      run: async (_command, args) => {
+        assert.ok(args.includes('tsc'));
+        const next = tscQueue.shift();
+        assert.ok(next !== undefined, 'unexpected tsc invocation');
+        return next;
+      },
+      repairFile: async (filePath) => {
+        repairs.push(filePath);
+        return '';
+      },
+      maxTurns: 2,
+    });
+
+    assert.deepEqual(repairs, [], 'stub creation must not spend LLM turns');
+    assert.ok(result.tsc.ok);
+    const stub = await readFile(join(project, 'src/components/types.ts'), 'utf8');
+    assert.equal(stub, 'export class FooterLink {}\nexport default class Icon {}\n');
   } finally {
     await rm(project, { recursive: true, force: true });
   }

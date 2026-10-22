@@ -18,7 +18,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { mirrorAssets, isTransientAssetError } from '../dist/crawler/assets.js';
+import { mirrorAssets, isTransientAssetError, isMirrorableImageUrl } from '../dist/crawler/assets.js';
 import type { NetworkPolicyOptions } from '../dist/crawler/network-policy.js';
 
 const PUBLIC_RESOLVE: NetworkPolicyOptions['resolve'] = async () => [
@@ -308,4 +308,18 @@ test('asset-mirror > gives up after bounded attempts on persistent transients', 
     assert.ok(sleeps[2] >= 8000 && sleeps[2] < 10000, `third backoff ${sleeps[2]}ms`);
     assert.ok(uncaptured[0]?.reason.includes('fetch failed'));
   });
+});
+
+test('asset-mirror > font URLs are excluded from image mirroring', () => {
+  // Webfont references are webfont-replay evidence; queueing them as images
+  // only produces deterministic non-image failures in the mirror.
+  assert.equal(isMirrorableImageUrl('https://fonts.gstatic.com/s/calsans/v2/x.woff2'), false);
+  assert.equal(isMirrorableImageUrl('https://cdn.example.com/fonts/mono.WOFF'), false);
+  assert.equal(isMirrorableImageUrl('https://framerusercontent.com/assets/a.woff2?x=1'), false);
+  assert.equal(isMirrorableImageUrl('https://cdn.example.com/face.ttf'), false);
+  // Image and extension-less URLs stay eligible.
+  assert.equal(isMirrorableImageUrl('https://cdn.example.com/hero.jpg'), true);
+  assert.equal(isMirrorableImageUrl('https://cdn.example.com/logo.SVG'), true);
+  assert.equal(isMirrorableImageUrl('https://imagedelivery.net/abc/f=auto,width=256'), true);
+  assert.equal(isMirrorableImageUrl('not a url'), false);
 });

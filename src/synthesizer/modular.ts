@@ -19,7 +19,7 @@
 
 import { copyFile, mkdir, readdir } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
-import type { AssetEntry, CrawlRoute, DesignTokens, EvidenceManifest, FontFaceRule, ProjectFile } from '../types.js';
+import type { AssetEntry, CrawlRoute, DesignTokens, EvidenceManifest, FontFaceRule, ProjectFile, TextSpan } from '../types.js';
 import { assertNoSymlinkComponents, resolveContainedPath } from '../utils/fs-safe.js';
 import type { ApographPlan, PlanRoute } from '../plan/schema.js';
 import { loadRouteEvidence } from '../plan/generator.js';
@@ -773,6 +773,207 @@ export async function copyMirroredAssets(
 // Vision stage helpers
 // ---------------------------------------------------------------------------
 
+/** Rendered-corpus size (chars) beyond which one reply cannot hold a page. */
+const SINGLE_FILE_CORPUS_LIMIT = 24_000;
+
+/** Target rendered-corpus size (chars) per synthesized content section. */
+const SECTION_CORPUS_CHARS = 8_000;
+
+/** Bounded delivery attempts per synthesized content section. */
+const SECTION_DELIVERY_ATTEMPTS = 4;
+
+/** Cool-off between section delivery attempts (provider body faults). */
+const SECTION_RETRY_COOL_OFF_MS = 20_000;
+
+/**
+ * Splits a text corpus into ordered chunks of roughly `chars` rendered text.
+ * Pure and deterministic: spans keep their document order and no span is
+ * dropped. Used to decompose oversized route pages into bounded synthesis
+ * calls.
+ */
+export function chunkSpansBySize(spans: readonly TextSpan[], chars: number): TextSpan[][] {
+  const chunks: TextSpan[][] = [];
+  let current: TextSpan[] = [];
+  let size = 0;
+  for (const span of spans) {
+    current.push(span);
+    size += span.text.length;
+    if (size >= chars && current.length > 0) {
+      chunks.push(current);
+      current = [];
+      size = 0;
+    }
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+/**
+ * Deterministic composition page for an oversized route: imports the
+ * synthesized content sections and stacks them in document order on the
+ * captured canvas. The same kind of structural glue as the stage-4 router.
+ */
+/**
+ * Guarantees a synthesized content section exports its composed name: models
+ * sometimes emit `export default` or a differently-named export. Whatever the
+ * file exports is aliased under the composed name (pure string rewrite — the
+ * file's own content is otherwise untouched), so the composed page always
+ * compiles against `import { <name> } from './<name>'`.
+ */
+export function ensureNamedSectionExport(content: string, name: string): string {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (new RegExp(`export\\s+(?:async\\s+)?function\\s+${escaped}\\b`).test(content)) return content;
+  if (new RegExp(`export\\s+(?:const|let|var|class)\\s+${escaped}\\b`).test(content)) return content;
+
+  const defaultNamed =
+    /export\s+default\s+(?:async\s+)?(?:function|class)\s+([A-Za-z_$][\w$]*)/.exec(content);
+  const namedExport =
+    /export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/.exec(content) ??
+    /export\s+const\s+([A-Za-z_$][\w$]*)/.exec(content);
+  const local = defaultNamed?.[1] ?? namedExport?.[1];
+  if (local !== undefined) {
+    return `${content.trimEnd()}\nexport { ${local} as ${name} };\n`;
+  }
+  if (/export\s+default/.test(content)) {
+    return `${content.trimEnd()}\nexport { default as ${name} };\n`;
+  }
+  return content;
+}
+
+function generateSectionPage(route: PlanRoute, sectionNames: string[], canvas: string): string {
+  return [
+    ...sectionNames.map((name) => `import { ${name} } from './${name}';`),
+    '',
+    `export function ${route.componentName}() {`,
+    '  return (',
+    `    <main className="min-h-screen w-full bg-[${canvas}]">`,
+    ...sectionNames.map((name) => `      <${name} />`),
+    '    </main>',
+    '  );',
+    '}',
+  ].join('\n');
+}
+
+/**
+ * Synthesizes an oversized route page as composed content sections: one
+ * bounded vision call per corpus chunk, then deterministic composition —
+ * the same honest accounting as {@link runVisionStage}: every section must
+ * synthesize or the whole page falls back to the deterministic template with
+ * a `degraded-fallback` outcome. Generic — driven purely by corpus size.
+ */
+async function runSectionedPageStage(
+  stage: string,
+  label: string,
+  route: PlanRoute,
+  chunks: TextSpan[][],
+  mobileSpans: readonly TextSpan[] | undefined,
+  routeCanvas: string,
+  design: DesignTokens,
+  screenshots: ScreenshotImage[],
+  result: ModularSynthesisResult,
+  startProgressFn: (label: string) => ProgressHandle,
+): Promise<ProjectFile[]> {
+  const progress = startProgressFn(label);
+  const sectionFiles: ProjectFile[] = [];
+  const sectionNames: string[] = [];
+  try {
+    for (const [index, chunk] of chunks.entries()) {
+      progress.message(`${label} — section ${index + 1}/${chunks.length}`);
+      const name = `${route.componentName}Section${index + 1}`;
+      const chunkTexts = new Set(chunk.map((span) => span.text.trim()));
+      const mobileChunk = mobileSpans?.filter((span) => chunkTexts.has(span.text.trim()));
+      const sectionPrompt = [
+        `Synthesize content section ${index + 1} of ${chunks.length} for route ${route.path} (${route.componentName}).`,
+        '',
+        `Page title: ${route.title.length > 0 ? route.title : route.componentName}`,
+        'This component renders ONLY the section corpus below. The page composes',
+        'the sections in document order; do not add page chrome, navigation, or',
+        'content that is not in this section.',
+        '',
+        `Canvas background for this route: ${routeCanvas}.`,
+        'Reduced color palette (use these, or arbitrary Tailwind hex utilities —',
+        'do NOT use --color-apograph-N variables):',
+        formatTokensForVisionPrompt(design),
+        '',
+        'SECTION TEXT CORPUS (render verbatim, in document order):',
+        formatTextSpansForPrompt(chunk, mobileChunk),
+        '',
+        'TEXT FIDELITY (critical): every span above must appear verbatim as DOM',
+        'text with its rendered casing preserved; measured metrics are ground',
+        'truth — reproduce the measured type scale exactly.',
+        '',
+        `Emit exactly one file: src/pages/${name}.tsx with`,
+        `export function ${name}(). Import nothing from the project except`,
+        'lucide-react. Build with semantic containers and standard Tailwind',
+        'utilities that wrap correctly at both 1280px and 390px widths.',
+      ].join('\n');
+
+      // Bounded delivery: first attempt with the route screenshots for style
+      // context; later attempts lean out (the measured geometry and palette
+      // fully specify the section) with the single-file fallback path enabled
+      // — any usable body IS this section file. Cool-offs between attempts
+      // ride out transient provider body faults. All attempts are bounded.
+      let sectionFile: ProjectFile | undefined;
+      let lastError: unknown = new Error(
+        `section ${index + 1}/${chunks.length} returned no usable file`,
+      );
+      for (let attempt = 0; attempt < SECTION_DELIVERY_ATTEMPTS && sectionFile === undefined; attempt += 1) {
+        if (attempt > 0) {
+          await new Promise((done) => setTimeout(done, SECTION_RETRY_COOL_OFF_MS));
+        }
+        try {
+          const files = await generateFilesWithVision(
+            sectionPrompt,
+            SYSTEM_GUIDELINES,
+            attempt === 0 ? screenshots : [],
+            { defaultFilePath: `src/pages/${name}.tsx` },
+          );
+          const found = files.find(
+            (file) => file.path === `src/pages/${name}.tsx` && file.content.trim().length > 0,
+          );
+          if (found !== undefined) {
+            sectionFile = found;
+            break;
+          }
+        } catch (cause) {
+          if (cause instanceof ProviderAuthError) throw cause;
+          lastError = cause;
+        }
+      }
+      if (sectionFile === undefined) throw lastError;
+      sectionFiles.push({
+        ...sectionFile,
+        content: ensureNamedSectionExport(sectionFile.content, name),
+      });
+      sectionNames.push(name);
+    }
+
+    const page: ProjectFile = {
+      path: `src/pages/${route.componentName}.tsx`,
+      content: generateSectionPage(route, sectionNames, routeCanvas),
+    };
+    result.visionStages.push(stage);
+    result.stageOutcomes.push({ stage, status: 'synthesized' });
+    progress.stop(`${label} — done (${chunks.length} sections)`);
+    return [page, ...sectionFiles];
+  } catch (cause) {
+    if (cause instanceof ProviderAuthError) throw cause;
+    const reason = redactSecrets(cause instanceof Error ? cause.message : String(cause));
+    console.warn(
+      `[apograph] ${stage}: section synthesis unavailable (${reason}); using deterministic template.`,
+    );
+    result.fallbackStages.push(stage);
+    result.stageOutcomes.push({ stage, status: 'degraded-fallback', reason });
+    progress.stop(`${label} — fallback`);
+    return [
+      {
+        path: `src/pages/${route.componentName}.tsx`,
+        content: generatePageTemplate(route),
+      },
+    ];
+  }
+}
+
 /** Finds the manifest route backing a plan route (by path). */
 function manifestRouteFor(planRoute: PlanRoute, manifest: EvidenceManifest): CrawlRoute | undefined {
   return manifest.routes.find((route) => route.path === planRoute.path);
@@ -1194,20 +1395,47 @@ export async function synthesizeModularProject(
       'except lucide-react; the route page owns all layout chrome shown in its screenshot.',
     ].join('\n');
 
-    let files = await runVisionStage(
-      `stage-3: route ${route.path}`,
-      `Synthesizing page ${route.path} ${formatModelRouteLabel(provider, modelId)}`,
-      pagePrompt,
-      screenshots,
-      () => [
-        {
-          path: `src/pages/${route.componentName}.tsx`,
-          content: generatePageTemplate(route),
-        },
-      ],
-      result,
-      callbacks?.startProgress ?? (() => NULL_PROGRESS),
+    // Oversized-route decomposition (generic): when the rendered corpus is
+    // too large for a single model reply, synthesize the page as bounded
+    // composed content sections instead of burning retries on replies the
+    // provider cannot deliver.
+    const corpusChars = (manifestRoute?.textSpans ?? []).reduce(
+      (total, span) => total + span.text.length,
+      0,
     );
+    const sectionChunks =
+      corpusChars > SINGLE_FILE_CORPUS_LIMIT && manifestRoute?.textSpans !== undefined
+        ? chunkSpansBySize(manifestRoute.textSpans, SECTION_CORPUS_CHARS)
+        : null;
+
+    let files =
+      sectionChunks !== null && sectionChunks.length > 1
+        ? await runSectionedPageStage(
+            `stage-3: route ${route.path}`,
+            `Synthesizing page ${route.path} as ${sectionChunks.length} sections ${formatModelRouteLabel(provider, modelId)}`,
+            route,
+            sectionChunks,
+            manifestRoute?.mobileTextSpans,
+            routeCanvas,
+            manifestRoute?.tokens ?? plan.designSystem,
+            screenshots,
+            result,
+            callbacks?.startProgress ?? (() => NULL_PROGRESS),
+          )
+        : await runVisionStage(
+            `stage-3: route ${route.path}`,
+            `Synthesizing page ${route.path} ${formatModelRouteLabel(provider, modelId)}`,
+            pagePrompt,
+            screenshots,
+            () => [
+              {
+                path: `src/pages/${route.componentName}.tsx`,
+                content: generatePageTemplate(route),
+              },
+            ],
+            result,
+            callbacks?.startProgress ?? (() => NULL_PROGRESS),
+          );
 
     // Generic post-generation canvas guard: a light reference must not ship a
     // page whose initial source is unmistakably a dark-theme composition. When

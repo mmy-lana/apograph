@@ -57,4 +57,4 @@ blob-report/
 *.pem
 *.key
 *.p12
-*.pfx
+.benchmark-history.md

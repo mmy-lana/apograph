@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { assertSafeRelativePath, resolveContainedPath } from '../dist/utils/fs-safe.js';
 import { validateNetworkUrl } from '../dist/crawler/network-policy.js';
 import { runTier1Build, verifyBuild } from '../dist/verifier/engine.js';
-import { loadEvidenceManifest } from '../dist/plan/generator.js';
+import { loadEvidenceManifest, uniqueComponentNames, createPlanFromEvidence } from '../dist/plan/generator.js';
 import { recrawlRoute } from '../dist/plan/evidenceGate.js';
 import { ApographPlanSchema } from '../dist/plan/schema.js';
 import { resolveCloneOutputDir, resolveCrawlEvidenceDir } from '../dist/mcp/server.js';
@@ -117,6 +117,31 @@ test('security > plans reject duplicate route and unsafe component identifiers',
   const route = { path: '/', title: 'Home', componentName: 'HomePage', included: true, inferredInteractions: ['none'] as const };
   assert.throws(() => ApographPlanSchema.parse({ ...base, routes: [route, route] }));
   assert.throws(() => ApographPlanSchema.parse({ ...base, routes: [{ ...route, componentName: '../Escape' }] }));
+});
+
+test('security > colliding route paths derive unique component names', () => {
+  // `/` and `/home` both derive `HomePage` — dedupe must keep them distinct,
+  // deterministic, and schema-safe (`...Page` suffix preserved).
+  const names = uniqueComponentNames(['/', '/home', '/pricing', '/pricing/']);
+  assert.deepEqual(names, ['HomePage', 'Home2Page', 'PricingPage', 'Pricing2Page']);
+  assert.equal(new Set(names).size, names.length, 'names must be unique');
+  for (const name of names) assert.match(name, /^[A-Z][A-Za-z0-9]*Page$/, 'schema-safe identifiers');
+
+  // The derived plan passes schema validation end to end.
+  const manifest = {
+    targetUrl: 'https://example.com',
+    crawledAt: new Date().toISOString(),
+    stats: { pagesCrawled: 2, linksDiscovered: 2, assetsDownloaded: 0, assetsFailed: 0, externalAssets: 0, durationMs: 1 },
+    routes: [
+      { url: 'https://example.com/', path: '/', title: 'Home', desktopScreenshot: null, mobileScreenshot: null, a11yTree: { role: 'root' }, tokens: { colors: {}, fonts: [], spacing: [], radii: [] } },
+      { url: 'https://example.com/home', path: '/home', title: 'Home', desktopScreenshot: null, mobileScreenshot: null, a11yTree: { role: 'root' }, tokens: { colors: {}, fonts: [], spacing: [], radii: [] } },
+    ],
+    assets: [],
+    diagnostics: { skippedUrls: [], failedNavigations: [], uncapturedResources: [], redirectAliases: [] },
+  } as unknown as Parameters<typeof createPlanFromEvidence>[0];
+  const plan = createPlanFromEvidence(manifest);
+  assert.deepEqual(plan.routes.map((route) => route.componentName), ['HomePage', 'Home2Page']);
+  ApographPlanSchema.parse(plan);
 });
 
 test('security > verifier treats residual type errors as failed build', async () => {

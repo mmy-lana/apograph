@@ -235,6 +235,25 @@ export function componentNameForPath(path: string): string {
   return `${segments.join('')}Page`;
 }
 
+/**
+ * Derives unique PascalCase component names for a set of URL paths: base
+ * names from {@link componentNameForPath}, with deterministic numeric
+ * suffixes in the stem for collisions (`/` + `/home` -> `HomePage`,
+ * `Home2Page`). Names stay schema-safe identifiers (`...Page`), and the same
+ * path list always yields the same names.
+ */
+export function uniqueComponentNames(paths: readonly string[]): string[] {
+  const used = new Map<string, number>();
+  return paths.map((path) => {
+    const base = componentNameForPath(path);
+    const count = (used.get(base) ?? 0) + 1;
+    used.set(base, count);
+    if (count === 1) return base;
+    const stem = base.endsWith('Page') ? base.slice(0, -'Page'.length) : base;
+    return `${stem}${count}Page`;
+  });
+}
+
 /** Flattens an a11y tree into a node list. */
 function flattenA11yTree(node: A11yNode): A11yNode[] {
   const nodes: A11yNode[] = [node];
@@ -366,10 +385,11 @@ function deriveUnknowns(manifest: EvidenceManifest): string[] {
  * the interactive gate.
  */
 export function createPlanFromEvidence(manifest: EvidenceManifest): ApographPlan {
-  const routes: PlanRoute[] = manifest.routes.map((route) => ({
+  const componentNames = uniqueComponentNames(manifest.routes.map((route) => route.path));
+  const routes: PlanRoute[] = manifest.routes.map((route, index) => ({
     path: route.path,
     title: route.title,
-    componentName: componentNameForPath(route.path),
+    componentName: componentNames[index] as string,
     included: true,
     inferredInteractions: inferInteractions(route.a11yTree),
   }));

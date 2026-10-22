@@ -15,7 +15,7 @@
  */
 
 import { readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -196,6 +196,71 @@ const TRUNCATION_TAIL_FRACTION = 0.75;
  * surfaced after the previous reparse.
  */
 const MAX_TRUNCATION_HEAL_ROUNDS = 3;
+
+// ---------------------------------------------------------------------------
+// Missing relative-module stubs
+// ---------------------------------------------------------------------------
+
+const IDENTIFIER_RE = /^[A-Za-z_$][\w$]*$/;
+
+/** Parsed import clause names bound by one relative import statement. */
+export interface MissingModuleImports {
+  /** Default-import binding, when present. */
+  defaultName?: string;
+  /** Named-import local bindings (aliases already resolved). */
+  named: string[];
+}
+
+/**
+ * Extracts the local bindings a file imports from one relative specifier
+ * (e.g. `import { FooterLink } from './types'`). Pure; returns null when the
+ * file has no import from that specifier.
+ */
+export function parseImportClauseForSpecifier(
+  content: string,
+  specifier: string,
+): MissingModuleImports | null {
+  const escaped = specifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(
+    `import\\s+(?:type\\s+)?([\\s\\S]*?)\\s+from\\s+['"]${escaped}['"]\\s*;`,
+    'g',
+  );
+  const result: MissingModuleImports = { named: [] };
+  let found = false;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(content)) !== null) {
+    found = true;
+    const clause = (match[1] ?? '').trim();
+    const braceStart = clause.indexOf('{');
+    const before = (braceStart === -1 ? clause : clause.slice(0, braceStart)).replace(/,/g, '').trim();
+    if (before.length > 0 && IDENTIFIER_RE.test(before)) result.defaultName = before;
+    if (braceStart !== -1) {
+      const braceEnd = clause.lastIndexOf('}');
+      const named = clause.slice(braceStart + 1, braceEnd === -1 ? undefined : braceEnd);
+      for (const entry of named.split(',')) {
+        const local = entry.trim().split(/\s+as\s+/).pop()?.trim() ?? '';
+        if (local.length > 0 && IDENTIFIER_RE.test(local) && !result.named.includes(local)) {
+          result.named.push(local);
+        }
+      }
+    }
+  }
+  return found ? result : null;
+}
+
+/**
+ * Builds the stub source that makes a never-emitted relative module compile:
+ * every imported binding becomes an `export class`, which satisfies value,
+ * JSX, and type positions alike. Returns null when nothing can be stubbed.
+ */
+export function buildMissingModuleStub(imports: MissingModuleImports): string | null {
+  const lines: string[] = [];
+  for (const name of imports.named) lines.push(`export class ${name} {}`);
+  if (imports.defaultName !== undefined) {
+    lines.push(`export default class ${imports.defaultName} {}`);
+  }
+  return lines.length > 0 ? `${lines.join('\n')}\n` : null;
+}
 
 /** Maps a 1-based (line, column) diagnostic position to a string offset. */
 function offsetAt(content: string, line: number, column: number): number {
@@ -378,10 +443,11 @@ export async function runCompilerRepairLoop(
     : 0;
   let turns = 0;
 
-  // Deterministic truncation healing (bounded fixpoint, zero LLM cost): an
-  // emission cut off mid-file is completed from its own diagnostics before a
-  // repair turn is spent on it. Never counted as a repair turn — it only
-  // rewrites files whose diagnostics are truncation-shaped.
+  // Deterministic healing (bounded fixpoint, zero LLM cost) before any repair
+  // turn is spent: truncated emissions are completed from their own
+  // diagnostics, and never-emitted relative imports get class-stub modules so
+  // the file can compile. Only rewrite files whose diagnostics are
+  // truncation- or missing-module-shaped.
   for (let round = 0; round < MAX_TRUNCATION_HEAL_ROUNDS && !tsc.ok; round += 1) {
     const byFile = new Map<string, CompilerDiagnostic[]>();
     for (const diagnostic of parseTscDiagnostics(tsc.output)) {
@@ -398,12 +464,48 @@ export async function runCompilerRepairLoop(
       } catch {
         continue; // Diagnostic points at a missing file — skip it.
       }
+
       const completed = completeTruncatedSource(content, fileDiagnostics);
-      if (completed === null) continue;
-      await writeFile(filePath, completed, 'utf8');
-      if (!repairedFiles.includes(file)) repairedFiles.push(file);
-      errorsBefore.push(...fileDiagnostics.map((diagnostic) => diagnostic.message));
-      healed += 1;
+      if (completed !== null) {
+        await writeFile(filePath, completed, 'utf8');
+        if (!repairedFiles.includes(file)) repairedFiles.push(file);
+        errorsBefore.push(...fileDiagnostics.map((diagnostic) => diagnostic.message));
+        healed += 1;
+        continue;
+      }
+
+      // Missing relative-module stubs: a generated file importing './x' that
+      // was never emitted cannot compile and no repair can fix the importer
+      // without the module. Create a class-stub module binding exactly the
+      // names the importer needs (`export class X {}` satisfies value, JSX,
+      // and type positions alike).
+      for (const diagnostic of fileDiagnostics) {
+        if (diagnostic.code !== 'TS2307') continue;
+        const specMatch = /Cannot find module '(\.[^']+)'/.exec(diagnostic.message);
+        if (specMatch === null) continue;
+        const specifier = specMatch[1] as string;
+        const imports = parseImportClauseForSpecifier(content, specifier);
+        if (imports === null) continue;
+        const stub = buildMissingModuleStub(imports);
+        if (stub === null) continue;
+
+        const base = specifier.replace(/\.(js|jsx)$/, '');
+        const stubPath = base.endsWith('.ts') || base.endsWith('.tsx') ? base : `${base}.ts`;
+        const target = resolve(root, dirname(file), stubPath);
+        const srcRoot = resolve(root, 'src');
+        if (!target.startsWith(srcRoot + sep) && target !== srcRoot) continue; // containment
+        try {
+          await readFile(target, 'utf8');
+          continue; // Already exists — never clobber a real file.
+        } catch {
+          // Absent: create the stub below.
+        }
+        await writeFile(target, stub, 'utf8');
+        const rel = relative(root, target).replaceAll('\\', '/');
+        if (!repairedFiles.includes(rel)) repairedFiles.push(rel);
+        errorsBefore.push(diagnostic.message);
+        healed += 1;
+      }
     }
     if (healed === 0) break;
     tsc = await options.run('npx', tscArgs, root);

@@ -8,12 +8,15 @@ import assert from 'node:assert/strict';
 
 import {
   generatePageTemplate,
+  chunkSpansBySize,
+  ensureNamedSectionExport,
   computeRunStatus,
   exitCodeForRunStatus,
   upsertStageOutcome,
 } from '../dist/synthesizer/modular.js';
 import type { StageOutcome } from '../dist/synthesizer/modular.js';
 import type { PlanRoute } from '../dist/plan/schema.js';
+import type { TextSpan } from '../dist/types.js';
 
 function minimalRoute(overrides: Partial<PlanRoute> = {}): PlanRoute {
   return {
@@ -160,4 +163,58 @@ test('backfill > a failed stage keeps its failed status after backfill', () => {
   assert.equal(outcomes[0]?.status, 'failed');
   assert.equal(computeRunStatus(outcomes), 'failed');
   assert.equal(exitCodeForRunStatus('failed', true), 1);
+});
+
+// ---------------------------------------------------------------------------
+// Oversized-route decomposition (bounded section synthesis)
+// ---------------------------------------------------------------------------
+
+function span(text: string): TextSpan {
+  return { text, color: 'rgb(0, 0, 0)', tag: 'p', parentTag: 'main' };
+}
+
+test('sections > chunkSpansBySize keeps order and drops nothing', () => {
+  const spans = [span('aaaa'), span('bbbb'), span('cccc'), span('dddd'), span('ee')];
+  const chunks = chunkSpansBySize(spans, 8);
+  assert.deepEqual(
+    chunks.map((chunk) => chunk.map((entry) => entry.text)),
+    [
+      ['aaaa', 'bbbb'],
+      ['cccc', 'dddd'],
+      ['ee'],
+    ],
+  );
+  // Round-trip: every span survives exactly once, in document order.
+  assert.deepEqual(chunks.flat(), spans);
+});
+
+test('sections > chunkSpansBySize never splits below one span and handles empty input', () => {
+  // A single span larger than the budget still forms its own chunk.
+  const huge = span('x'.repeat(50));
+  assert.deepEqual(chunkSpansBySize([huge, span('y')], 10), [[huge], [span('y')]]);
+  assert.deepEqual(chunkSpansBySize([], 10), []);
+});
+
+test('sections > ensureNamedSectionExport aliases whatever the file exports', () => {
+  // Already correct: untouched.
+  const good = 'export function HomeSection1() { return null; }';
+  assert.equal(ensureNamedSectionExport(good, 'HomeSection1'), good);
+
+  // export default function with a local name -> alias under the composed name.
+  const defaulted = ensureNamedSectionExport(
+    'export default function RandomName() { return null; }',
+    'HomeSection1',
+  );
+  assert.ok(defaulted.includes('export { RandomName as HomeSection1 };'));
+
+  // Named export with a different name -> alias; const exports too.
+  const differently = ensureNamedSectionExport(
+    'const Body = () => null;\nexport const SectionBody = Body;',
+    'HomeSection2',
+  );
+  assert.ok(differently.includes('export { SectionBody as HomeSection2 };'));
+
+  // Anonymous default -> default alias.
+  const anonymous = ensureNamedSectionExport('export default () => null;', 'HomeSection3');
+  assert.ok(anonymous.includes('export { default as HomeSection3 };'));
 });

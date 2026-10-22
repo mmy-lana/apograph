@@ -125,8 +125,34 @@ function collectImageUrlsInPage(): string[] {
 }
 
 /**
+ * Font-file URL extensions excluded from image-asset mirroring: webfont
+ * references (e.g. `@font-face src: url(...woff2)` picked up by the
+ * stylesheet `url(...)` scan) are webfont-replay evidence, not mirrorable
+ * images — queueing them only produces deterministic non-image failures.
+ */
+const NON_IMAGE_URL_EXTENSIONS = new Set(['woff2', 'woff', 'ttf', 'otf', 'eot']);
+
+/**
+ * True when a discovered URL is a candidate for image mirroring. Font-file
+ * extensions are excluded; extension-less URLs stay eligible and are
+ * classified by the download's MIME type at mirror time.
+ */
+export function isMirrorableImageUrl(rawUrl: string): boolean {
+  let pathname: string;
+  try {
+    pathname = new URL(rawUrl).pathname;
+  } catch {
+    return false;
+  }
+  const match = pathname.match(/\.([a-zA-Z0-9]{1,5})$/);
+  const extension = match?.[1]?.toLowerCase();
+  if (extension === undefined) return true;
+  return !NON_IMAGE_URL_EXTENSIONS.has(extension);
+}
+
+/**
  * Discovers image asset URLs on the current page, resolved to absolute URLs.
- * `data:` URIs and unresolvable values are dropped.
+ * `data:` URIs, font-file URLs, and unresolvable values are dropped.
  */
 export async function discoverImageAssets(page: Page): Promise<string[]> {
   const raw = await page.evaluate(collectImageUrlsInPage);
@@ -136,7 +162,8 @@ export async function discoverImageAssets(page: Page): Promise<string[]> {
   for (const candidate of raw) {
     if (candidate.startsWith('data:')) continue;
     try {
-      resolved.push(new URL(candidate, pageUrl).href);
+      const absolute = new URL(candidate, pageUrl).href;
+      if (isMirrorableImageUrl(absolute)) resolved.push(absolute);
     } catch {
       // Malformed URL — ignore.
     }
