@@ -373,6 +373,9 @@ export async function ensureProjectDependencies(
   run: CommandRunner,
   hasModules: (root: string) => Promise<boolean>,
 ): Promise<DependencyInstallResult> {
+  if (process.env.APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION !== '1') {
+    return { ok: false, attempts: [] };
+  }
   if (await hasModules(root)) return { ok: true, attempts: [] };
 
   const attempts: CommandResult[] = [];
@@ -433,6 +436,17 @@ export async function runCompilerRepairLoop(
   root: string,
   options: CompilerRepairLoopOptions,
 ): Promise<CompilerRepairLoopResult> {
+  if (process.env.APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION !== '1') {
+    return {
+      tsc: {
+        ok: false,
+        output: 'Generated-project execution disabled without APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION=1.',
+      },
+      repairedFiles: [],
+      errorsBefore: [],
+      turns: 0,
+    };
+  }
   const tscArgs = ['--no-install', 'tsc', '--noEmit'];
   let tsc = await options.run('npx', tscArgs, root);
 

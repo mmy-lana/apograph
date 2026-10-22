@@ -53,6 +53,9 @@ interface HarnessOptions {
   repair?: (filePath: string, currentContent: string, errors: string[]) => string;
 }
 
+// Enable sandbox gate so mock-runner tests can execute synthetic pipeline flows.
+process.env.APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION = '1';
+
 /** Builds mocked Tier1Deps recording every command and repair call. */
 function makeDeps(options: HarnessOptions): {
   deps: Tier1Deps;
@@ -344,6 +347,23 @@ test('build repair > path traversal diagnostics are ignored', async () => {
     assert.equal(repairs.length, 0, 'out-of-project files must never be repaired');
   } finally {
     await rm(project, { recursive: true, force: true });
+  }
+});
+
+test('build repair > fails closed without APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION', async () => {
+  const project = await makeProject({ 'src/App.tsx': 'export {};\n' });
+  const previous = process.env.APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION;
+  delete process.env.APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION;
+  try {
+    const result = await runCompilerRepairLoop(project, {
+      run: async () => ({ ok: true, output: '' }),
+      repairFile: async () => '',
+    });
+    assert.equal(result.tsc.ok, false);
+    assert.match(result.tsc.output, /disabled without APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION=1/);
+    assert.equal(result.turns, 0);
+  } finally {
+    if (previous !== undefined) process.env.APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION = previous;
   }
 });
 

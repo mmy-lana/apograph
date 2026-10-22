@@ -145,6 +145,8 @@ test('security > colliding route paths derive unique component names', () => {
 });
 
 test('security > verifier treats residual type errors as failed build', async () => {
+  const previous = process.env.APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION;
+  process.env.APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION = '1';
   const root = await mkdtemp(join(tmpdir(), 'apograph-security-'));
   await mkdir(join(root, 'src'), { recursive: true });
   await mkdir(join(root, 'node_modules'), { recursive: true });
@@ -162,6 +164,8 @@ test('security > verifier treats residual type errors as failed build', async ()
     assert.equal(result.tscPassed, false);
     assert.equal(result.success, false);
   } finally {
+    if (previous === undefined) delete process.env.APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION;
+    else process.env.APOGRAPH_ALLOW_UNSANDBOXED_EXECUTION = previous;
     await rm(root, { recursive: true, force: true });
   }
 });

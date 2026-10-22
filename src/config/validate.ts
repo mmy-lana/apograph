@@ -66,8 +66,9 @@ export interface ValidateOptions {
 // Secret redaction
 // ---------------------------------------------------------------------------
 
-/** Matches common secret token shapes (sk-…, bearer headers, long api keys). */
-const SECRET_SHAPE_RE = /\b(sk|pk|rk)-[A-Za-z0-9_-]{6,}\b/g;
+/** Matches secret token shapes (sk/pk/rk keys, bearer tokens, JWTs, vendor tokens). */
+const SECRET_SHAPE_RE =
+  /\b(?:sk|pk|rk)-[A-Za-z0-9_-]{6,}\b|Bearer\s+[A-Za-z0-9._~+/=-]{8,}|\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9._~+/=-]{10,}|\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{6,}\b|\bxox[a-z]-[A-Za-z0-9-]{6,}\b/gi;
 
 /**
  * Masks a single secret for display: keeps the first 4 and last 2

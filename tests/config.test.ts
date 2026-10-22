@@ -213,6 +213,15 @@ describe('secret redaction', () => {
     const redacted = redactSecrets(`auth failed for token my-custom-token-value`, secret);
     assert.ok(!redacted.includes(secret));
   });
+
+  test('redactSecrets scrubs bearer tokens, JWTs, and vendor tokens', () => {
+    const sample = 'Authorization: Bearer secret-auth-token-123456; jwt: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.s; gh: ghp_1234567890abcdef; slack: xoxb-12345-67890';
+    const redacted = redactSecrets(sample);
+    assert.ok(!redacted.includes('secret-auth-token-123456'));
+    assert.ok(!redacted.includes('eyJzdWIiOiIxMjM0NTY3ODkwIn0'));
+    assert.ok(!redacted.includes('ghp_1234567890abcdef'));
+    assert.ok(!redacted.includes('xoxb-12345-67890'));
+  });
 });
 
 describe('probeModelCapabilities (MODEL-03)', () => {
