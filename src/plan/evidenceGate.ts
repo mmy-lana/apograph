@@ -532,6 +532,10 @@ export async function recrawlRoute(
     ? join(evidenceDir, 'screenshots', 'recrawl-mobile.png')
     : resolveEvidenceReference(evidenceDir, route.mobileScreenshot);
 
+  // Security gate runs before any browser work: restricted destinations
+  // (loopback, private ranges, link-local) are rejected before Chromium is
+  // launched — never merely before navigation.
+  await validateNetworkUrl(route.url);
   const browser = await launchHeadlessChromium();
   try {
     const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
@@ -548,7 +552,6 @@ export async function recrawlRoute(
         await requestRoute.abort('blockedbyclient');
       }
     });
-    await validateNetworkUrl(route.url);
     const page = await context.newPage();
     await gotoWithReadiness(page, route.url, { timeoutMs: 30_000 });
     const title = await page.title();
